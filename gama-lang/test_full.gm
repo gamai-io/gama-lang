@@ -1,0 +1,7 @@
+# GAMA-L POTPUN END-TO-END (SQL + pipe + memorija + AI, bez HITL/notify)
+t := sql("SELECT TOP 3 konto, naziv FROM kupdob WHERE naziv <> '' ")
+iz := t | select konto, naziv
+n := iz | broj
+misli := ask local "Ukratko: sto su povuceni kupci? Jedna recenica. "
+remember "gamal_e2e" = "pun tok radi"
+pokaz := recall "gamal_e2e"

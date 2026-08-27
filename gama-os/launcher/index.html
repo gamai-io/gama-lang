@@ -1,0 +1,51 @@
+<!doctype html><html lang="bs"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GAMA-OS</title>
+<style>
+:root{--bg:#0b0e14;--card:#151b28;--acc:#00d4ff;--txt:#e8eef7;--dim:#7d8aa3}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--txt);font-family:Segoe UI,system-ui,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.wrap{width:100%;max-width:760px}
+.splash{text-align:center;margin-bottom:28px}
+.splash h1{font-size:2.6rem;letter-spacing:3px;font-weight:800}
+.splash h1 span{color:var(--acc)}
+.splash p{color:var(--dim);margin-top:6px;font-size:.95rem}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px}
+.tile{background:var(--card);border:1px solid #20293b;border-radius:18px;padding:18px;text-align:center;cursor:pointer;transition:.2s;min-height:110px;display:flex;flex-direction:column;justify-content:center}
+.tile:hover{transform:translateY(-3px);border-color:var(--acc)}
+.tile .ico{font-size:1.9rem;margin-bottom:8px}
+.tile .lbl{font-size:.98rem;font-weight:600}
+.tile .sub{color:var(--dim);font-size:.72rem;margin-top:4px}
+.foot{color:var(--dim);text-align:center;margin-top:26px;font-size:.78rem}
+.pill{display:inline-block;background:#10243c;color:var(--acc);border:1px solid #0d3b5e;padding:2px 10px;border-radius:20px;font-size:.72rem;margin-top:10px}
+@media(max-width:420px){.splash h1{font-size:2rem}}
+</style></head><body>
+<div class="wrap">
+ <div class="splash">
+  <h1>GAMA<span>-OS</span></h1>
+  <p>Lak. Brz. Nas.</p>
+  <p class="pill">● Online · povezan na GAMA-flotu</p>
+ </div>
+ <div class="grid" id="grid"></div>
+ <div class="foot">GAMA TRADE · AI-native sistem · v0.1</div>
+</div>
+<script>
+const APP={
+ "ponuda":{ico:"🧾",sub:"Kreiraj ponudu"},
+ "baza":{ico:"🗃️",sub:"vp2026 podaci"},
+ "ai":{ico:"🤖",sub:"GAMA-L ask"},
+ "posta":{ico:"📮",sub:"PostIS/naljepnice"},
+ "kasa":{ico:"🖨️",sub:"RDP/KASA"},
+ "cloud":{ico:"☁️",sub:"Google/Oracle"},
+ "dok":{ico:"📄",sub:"Računi/otpremnice"},
+ "podesi":{ico:"⚙️",sub:"Postavke"}
+};
+const grid=document.getElementById('grid');
+for(const[k,v]of Object.entries(APP)){
+ const t=document.createElement('div');t.className='tile';
+ t.innerHTML=`<div class="ico">${v.ico}</div><div class="lbl">${k}</div><div class="sub">${v.sub}</div>`;
+ t.onclick=()=>{t.style.opacity=.6;console.log('GAMA-OS app:',k)};
+ grid.appendChild(t);
+}
+</script>
+</body></html>
