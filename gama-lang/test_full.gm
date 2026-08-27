@@ -1,7 +1,7 @@
-# GAMA-L POTPUN END-TO-END (SQL + pipe + memorija + AI, bez HITL/notify)
+# GAMA-L full end-to-end (SQL + pipe + memory + AI, without HITL/notify)
 t := sql("SELECT TOP 3 konto, naziv FROM kupdob WHERE naziv <> '' ")
-iz := t | select konto, naziv
-n := iz | broj
-misli := ask local "Ukratko: sto su povuceni kupci? Jedna recenica. "
-remember "gamal_e2e" = "pun tok radi"
-pokaz := recall "gamal_e2e"
+fl := t | select konto, naziv
+n := fl | count
+thought := ask local "In short: what customers were pulled? One sentence. "
+remember "gamal_e2e" = "full flow works"
+got := recall "gamal_e2e"

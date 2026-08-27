@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# GAMA-OS BUILDER — jedna jezgra, sve role
-# usage: sudo ./gama-os build <role> [--brand "IME"] [--url http://...]
+# GAMA-OS BUILDER - one kernel, all roles
+# usage: sudo ./gama-os build <role> [--brand "NAME"] [--url http://...]
 # role: kiosk | terminal | pro | node
 set -e
 
 ROLE="${1:-kiosk}"
 BRAND="${GAMA_BRAND:-GAMA TRADE}"
 URL="${GAMA_URL:-http://100.104.130.34:9443}"
-TELNET_BRAND=true
 
 log()  { echo -e "\033[1;32m[GAMA-OS] $*\033[0m"; }
 err()  { echo -e "\033[1;31m[GAMA-OS][ERR] $*\033[0m" >&2; exit 1; }
@@ -29,11 +28,11 @@ install_debian_basics() {
 provision_tailscale() {
   command -v tailscale >/dev/null || return 0
   tailscale up --accept-routes=false --shields-up=false --operator=$USER 2>/dev/null \
-    || log "tailscale up nije automatski — uradi rucno: sudo tailscale up"
+    || log "tailscale up is not automatic - do it manually: sudo tailscale up"
 }
 
 kiosk_setup() {
-  log "Kiosk setup — zakljucavam na: $URL"
+  log "Kiosk setup - locking onto: $URL"
   cat > /tmp/gama_kiosk.sh <<EOF
 #!/bin/sh
 # GAMA-OS KIOSK launcher
@@ -44,7 +43,7 @@ done
 EOF
   mv /tmp/gama_kiosk.sh /usr/local/bin/gama-kiosk
   chmod +x /usr/local/bin/gama-kiosk
-  # autostart (Alpine OpenRC ili systemd)
+  # autostart (Alpine OpenRC or systemd)
   if command -v rc-service >/dev/null; then
     cat > /etc/init.d/gama-kiosk <<'SVC'
 #!/sbin/openrc-run
@@ -64,24 +63,21 @@ SVC
 }
 
 terminal_setup() {
-  log "Terminal setup — web UI + stanka GUI"
-  # Firefox bez kiosk, ali home = nas UI; SSH klijent
+  log "Terminal setup - web UI + secured GUI"
   kiosk_setup
 }
 
 pro_setup() {
-  log "PRO setup — razvija nas pun sistem (poput Linux3)"
-  # gama-deploy.sh na Oracle de odmahuje rollout; ovdje base:
+  log "PRO setup - full system (like our Linux3)"
   install_debian_basics
   install_alpine_basics
   provision_tailscale
 }
 
 node_setup() {
-  log "NODE setup — servisni cvor (beszel, bus, semanti-mosta)"
+  log "NODE setup - service node (beszel, bus, semantic bridge)"
   provision_tailscale
   command -v curl >/dev/null || install_alpine_basics
-  # beszel agent (rollout od Oracle-a u pravom okruzenju)
   mkdir -p /opt/beszel-agent
 }
 
@@ -90,8 +86,8 @@ case "$ROLE" in
   terminal)  install_alpine_basics; provision_tailscale; terminal_setup ;;
   pro)       pro_setup ;;
   node)      node_setup ;;
-  *) err "nepoznata rola: $ROLE" ;;
+  *) err "unknown role: $ROLE" ;;
 esac
 
-log "GAMA-OS ($ROLE) build GOTOV. Brand: $BRAND"
-log "Dodaj: gama-lang runtime i licencu na masini."
+log "GAMA-OS ($ROLE) build DONE. Brand: $BRAND"
+log "Add: gama-lang runtime and license on the machine."

@@ -1,6 +1,6 @@
-# GAMA-L samo SQL+pipe
+# GAMA-L only SQL+pipe
 t := sql("SELECT TOP 3 konto, naziv, mjesto FROM kupdob WHERE konto LIKE '2%'")
-iz := t | select konto, naziv
-n := iz | broj
-remember "gamal_test" = "probao end-to-end"
-pokaz := recall "gamal_test"
+fl := t | select konto, naziv
+n := fl | count
+remember "gamal_test" = "tried end-to-end"
+got := recall "gamal_test"

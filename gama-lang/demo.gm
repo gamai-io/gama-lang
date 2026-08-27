@@ -1,22 +1,22 @@
-# GAMA-L demonstracija — povuci prave kupce iz vp2026, filtrirq, memorisi
+# GAMA-L demonstration - pull real customers from vp2026, filter, remember
 
-# 1) SQL upit (nasa baza) -> tabela
+# 1) SQL query (our sales database) -> table
 t := sql("SELECT TOP 5 konto, naziv, mjesto FROM kupdob WHERE konto LIKE '2%'")
 
-# 2) pipe: filtriraj (imaju naziv) pa select polja
-iz := t | filt naziv | select konto, naziv
+# 2) pipe: filter (have a name) then select fields
+fl := t | filter naziv | select konto, naziv
 
-# 3) broj redova
-n := iz | broj
+# 3) count rows
+n := fl | count
 
-# 4) AI govori o tome
-misli := ask local "Imas li neku zanimljivost o kupcima iz GAMA TRADE baze? Ukratko izbroji " 
+# 4) AI says something about it
+thought := ask local "Anything interesting about customers from the GAMA TRADE database? Briefly count "
 
-# 5) memorija — zapamti sta smo radili
-remember "gamal_izvjestaj" = "povuceno N redova kupaca iz vp2026"
+# 5) memory - remember what we did
+remember "gamal_report" = "pulled N customer rows from vp2026"
 
-# 6) HITL — pitaj korisnika prije zavrsetka
-potvrda := wait user "De prikazem izvjestaj? (da/ne)"
+# 6) HITL - ask the user before finishing
+confirm := wait user "Show the report? (yes/no)"
 
 # 7) notify
-notify email to: "renato.schuster@gmail.com" subject: "GAMA-L demo" "GAMA-L transpajler radi: N=..."
+notify email to: "renato.schuster@gmail.com" subject: "GAMA-L demo" "GAMA-L transpiler works: N=..."

@@ -1,7 +1,7 @@
-# GAMA-L end-to-end test (bezbedan: SQL + pipe, bez slanja/HITL)
+# GAMA-L end-to-end test (safe: SQL + pipe, no sending / HITL)
 t := sql("SELECT TOP 3 konto, naziv, mjesto FROM kupdob WHERE konto LIKE '2%'")
-iz := t | select konto, naziv
-n := iz | broj
-misli := ask local "Kratko: koliko kupaca sam upravo povukao iz baze?"
-remember "gamal_test" = "probao end-to-end"
-pokaz := recall "gamal_test"
+fl := t | select konto, naziv
+n := fl | count
+thought := ask local "In short: how many customers did I just pull from the database?"
+remember "gamal_test" = "tried end-to-end"
+got := recall "gamal_test"

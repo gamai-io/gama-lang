@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
-"""GAMA-L runtime — spaja GAMA-L kod sa nasom infrastrukturom.
-SQL(vp2026/mp*), AI(Oracle semapi / Zen GO), memorija(lokalni JSON),
-notify(SMTP gamatrade), interface(UI spek), HITL(wait user).
+"""GAMA-L runtime — wires GAMA-L code to our infrastructure.
+SQL (vp2026/mp*), AI (Oracle semapi / Zen GO), memory (local JSON),
+notify (SMTP gamatrade), interface (UI spec), HITL (wait user).
 """
-import os, json, subprocess, sys, time, datetime
+import os, json, sys, time, datetime
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 MEM_FILE = os.path.join(BASE, "gamal_mem.json")
 
-# ---------- memorija ----------
+# ---------- memory ----------
 def _mem():
     if os.path.exists(MEM_FILE):
         try: return json.load(open(MEM_FILE, encoding="utf-8"))
@@ -25,7 +25,7 @@ def recall(key):
 
 # ---------- AI ----------
 def ask(prompt, model="local", system=""):
-    """Ask AI. model=local -> Oracle semapi qwen; vast/... -> lokalni GPU tunel; else fallback."""
+    """Ask AI. model=local -> Oracle semapi qwen; vast/... -> local GPU tunnel; else fallback."""
     # 1) Oracle semapi
     try:
         import urllib.request
@@ -36,11 +36,10 @@ def ask(prompt, model="local", system=""):
             return json.loads(r.read().decode())["reply"]
     except Exception:
         pass
-    # 2) Vast/Ollama lokalni tunel (GPU, privatno)
+    # 2) Vast/Ollama local tunnel (GPU, private)
     try:
         import urllib.request
         mname = {"local": "gemma4:26b", "vast/qwen3-coder:30b": "qwen3-coder:30b"}.get(model, str(model).split('/')[-1])
-        # ako model nije dostupan, uzmi prvi koji jeste
         try:
             req = urllib.request.Request("http://127.0.0.1:11434/api/tags")
             with urllib.request.urlopen(req, timeout=5) as r:
@@ -56,7 +55,7 @@ def ask(prompt, model="local", system=""):
         with urllib.request.urlopen(req, timeout=120) as r:
             return json.loads(r.read().decode())["choices"][0]["message"]["content"]
     except Exception as e:
-        return f"[AI greška: {e}]"
+        return f"[AI error: {e}]"
 
 # ---------- SQL (vp2026/mp*) ----------
 def sql(query, db="vp2026"):
@@ -85,7 +84,7 @@ def notify(kind, to, subject, body, attach=None):
 
 # ---------- HITL ----------
 def hitl(prompt):
-    ans = input(f"\n[GAMA-L korisnik] {prompt} ")
+    ans = input(f"\n[GAMA-L user] {prompt} ")
     return ans.strip()
 
 # ---------- pipes ----------
