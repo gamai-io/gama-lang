@@ -117,6 +117,19 @@ class V2Tests(unittest.TestCase):
         finally:
             if old is None: os.environ.pop('GAMA_L_PROOF_KEY', None)
             else: os.environ['GAMA_L_PROOF_KEY'] = old
+    def test_package_manager(self):
+        import tempfile, pathlib
+        root = pathlib.Path(tempfile.mkdtemp())
+        dep = root / 'math'; dep.mkdir()
+        (dep / 'lib.gm').write_text('fn add(a: Int, b: Int) -> Int effects {} { return a+b }\n')
+        app = root / 'app'; app.mkdir()
+        (app / 'gamal.toml').write_text('[package]\nname = "app"\n[dependencies]\nmath = { path = "../math" }\n')
+        (app / 'main.gm').write_text('import "math/lib.gm"\nprint add(20,22)\n')
+        import contextlib, io
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(G._pkg_install(app), 0)
+        it = G.run_file(str(app / 'main.gm'))
+        self.assertEqual(it.out, ['42'])
     def test_fmt_idempotent(self):
         a = G.fmt_source('print 1   \n\n')
         self.assertEqual(G.fmt_source(a), a)

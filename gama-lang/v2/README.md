@@ -11,6 +11,24 @@ python3 gamal2.py check examples/invoice.gm
 python3 gamal2.py test
 ```
 
+## Package manager (local/vendored)
+
+```bash
+python3 gamal2.py pkg init .
+python3 gamal2.py pkg install .
+python3 gamal2.py pkg list .
+```
+
+`gamal.toml` supports local path dependencies:
+
+```toml
+[dependencies]
+math = { path = "../math" }
+```
+
+Installed modules go to `.gamal/modules/<name>` and are resolved by
+`import "name/file.gm"`. There is no remote registry yet.
+
 ## Implemented
 
 - `import "file.gm"` with cycle detection (relative to the importing file)
@@ -24,12 +42,12 @@ python3 gamal2.py test
 - `wait_user` (non-interactive fails closed)
 - `prove` (hash-chained receipt) and `verify` (tamper detection)
 - static type errors and static effect violations
-- CLI `run`, `check`, `test`
+- CLI `run`, `check`, `fmt`, `test`, `pkg`
 
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 33/33
+python3 -m unittest discover -s tests -v   # 34/34
 ```
 
 Conformance coverage: arithmetic/pipes (20 cases), type errors, effect
