@@ -71,6 +71,20 @@ class LspFeatureTests(unittest.TestCase):
     def tearDown(self):
         self.c.close()
 
+    def test_unknown_variable_diagnostic_location(self):
+        c = self.c
+        mid = c.request("initialize", {})
+        c.wait_for(mid=mid)
+        c.notify("initialized", {})
+        c.notify("textDocument/didOpen", {"textDocument": {
+            "uri": URI, "languageId": "gama-l", "version": 1, "text": "print missingName\n"}})
+        diag, _ = c.wait_for(method="textDocument/publishDiagnostics")
+        d = diag["params"]["diagnostics"]
+        self.assertEqual(len(d), 1)
+        self.assertEqual(d[0]["range"]["start"]["line"], 0)
+        self.assertEqual(d[0]["range"]["start"]["character"], 6)
+        self.assertIn("missingName", d[0]["message"])
+
     def test_did_change_diagnostics(self):
         c = self.c
         mid = c.request("initialize", {})

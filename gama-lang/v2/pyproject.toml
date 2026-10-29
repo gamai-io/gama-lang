@@ -18,4 +18,4 @@ gama-registry = "gama_registry_server:main"
 gama-release = "release:main"
 
 [tool.setuptools]
-py-modules = ["gamal2", "gama_lsp", "gama_cli", "gama_fmt", "gama_doctor", "gama_mail", "gama_registry", "gama_registry_server", "release"]
+py-modules = ["gamal2", "gama_lsp", "gama_cli", "gama_fmt", "gama_doctor", "gama_mail", "gama_registry", "gama_registry_server", "gama_ai", "release"]

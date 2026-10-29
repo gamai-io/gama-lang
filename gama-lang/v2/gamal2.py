@@ -475,7 +475,7 @@ class Checker:
         self.pop()
     def compat(self, got, want):
         return want in ("Any", got) or (want in NUM and got in NUM) or (want == "List" and got in ("List", "Table"))
-    def expr(self, e, row=False) -> str:
+    def expr(self, e, row=None) -> str:
         if isinstance(e, Literal): return tname(e.value)
         if isinstance(e, ListExpr):
             types = {self.expr(x, row) for x in e.items}
@@ -827,6 +827,12 @@ class Interpreter:
                     raise GamaRuntimeError("sql failed: %s" % ex, e.line, e.col) from None
             if e.name == "ask":
                 p = str(self.expr(e.args[0], env, row)) if e.args else ""
+                if os.environ.get("GAMA_L_AI_URL"):
+                    try:
+                        from gama_ai import AIError, ask as ai_ask
+                        return ai_ask(p)
+                    except AIError as ex:
+                        raise GamaRuntimeError("ask: %s" % ex, e.line, e.col) from None
                 url = os.environ.get("GAMA_L_ASK_URL", "").strip()
                 model = os.environ.get("GAMA_L_ASK_MODEL", "deepseek-chat")
                 if url and not url.startswith("https://") and os.environ.get("GAMA_L_ASK_ALLOW_HTTP") != "1":
@@ -972,7 +978,8 @@ def _git_source(spec: dict, root: pathlib.Path) -> str:
 
 def _pkg_install_one_git(name: str, spec: dict, root: pathlib.Path,
                          moddir: pathlib.Path, cache_root: pathlib.Path,
-                         update: bool = False) -> tuple[dict | None, str]:
+                         update: bool = False,
+                         expected: str | None = None) -> tuple[dict | None, str]:
     source = _git_source(spec, root)
     cache = cache_root / name
     if not cache.exists():
@@ -996,6 +1003,8 @@ def _pkg_install_one_git(name: str, spec: dict, root: pathlib.Path,
     rc, head, err = _git(["-C", str(cache), "rev-parse", "HEAD"], root)
     if rc != 0 or not head:
         return None, f"git rev-parse HEAD failed for {name}: {err or 'exit %d' % rc}"
+    if expected and not update and expected != head:
+        return None, f"lock mismatch for {name}: {expected[:12]} -> {head[:12]}; run: gamal2.py pkg update"
     dst = moddir / name
     try:
         _copy_tree(cache, dst)
@@ -1021,7 +1030,9 @@ def _pkg_install(root: pathlib.Path, update: bool = False) -> int:
         if not _safe_name(name):
             print(f"invalid dependency name: {name!r}"); return 1
         if isinstance(spec, dict) and spec.get("git"):
-            entry, err = _pkg_install_one_git(name, spec, root, moddir, cache_root, update)
+            entry, err = _pkg_install_one_git(
+                name, spec, root, moddir, cache_root, update,
+                (old_lock.get(name) or {}).get("commit"))
             if entry is None:
                 print(err); return 1
             old = old_lock.get(name) or {}
