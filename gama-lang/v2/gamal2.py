@@ -16,6 +16,7 @@ import hmac
 import json
 import os
 import pathlib
+import shutil
 import sqlite3
 import sys
 import urllib.request
@@ -524,7 +525,13 @@ def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
     out = []
     for s in ast:
         if isinstance(s, Import):
-            out.extend(_flatten(path.parent / s.path, root, seen, loaded))
+            candidates = [path.parent / s.path,
+                          root / ".gamal" / "modules" / s.path,
+                          root / "gama_modules" / s.path]
+            target = next((c for c in candidates if c.exists()), None)
+            if target is None:
+                raise GamaError("cannot import %s" % s.path, s.line, s.col)
+            out.extend(_flatten(target, root, seen, loaded))
         else:
             out.append(s)
     seen.discard(path); loaded.add(path)
@@ -770,8 +777,73 @@ def run(src: str, interactive=False):
     ast = check(src)
     return Interpreter(interactive=interactive).run(ast)
 
+# ------------------------------------------------------------------ package manager
+def _read_toml(path: pathlib.Path) -> dict:
+    """Small TOML subset: [section], key = "value", inline tables."""
+    out: dict = {}; sec = ""
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line: continue
+        if line.startswith("[") and line.endswith("]"):
+            sec = line[1:-1].strip(); out.setdefault(sec, {}); continue
+        if "=" not in line: continue
+        k, v = line.split("=", 1); k = k.strip(); v = v.strip()
+        if v.startswith("{") and v.endswith("}"):
+            d = {}
+            for part in v[1:-1].split(","):
+                if "=" in part:
+                    a, b = part.split("=", 1); d[a.strip()] = b.strip().strip('"\'')
+            out.setdefault(sec, {})[k] = d
+        else:
+            out.setdefault(sec, {})[k] = v.strip('"\'')
+    return out
+
+def _pkg_install(root: pathlib.Path) -> int:
+    cfg = root / "gamal.toml"
+    if not cfg.exists():
+        print("no gamal.toml (run: gamal2.py pkg init)"); return 1
+    data = _read_toml(cfg)
+    deps = data.get("dependencies") or {}
+    moddir = root / ".gamal" / "modules"; moddir.mkdir(parents=True, exist_ok=True)
+    lock = {}
+    for name, spec in deps.items():
+        src = pathlib.Path(spec.get("path", "") if isinstance(spec, dict) else spec)
+        if not src.is_absolute(): src = (root / src).resolve()
+        if not src.exists():
+            print(f"missing dependency {name}: {src}"); return 1
+        dst = moddir / name
+        if dst.exists(): shutil.rmtree(dst)
+        shutil.copytree(src, dst)
+        lock[name] = {"path": str(src), "installed": str(dst)}
+        print(f"installed {name} -> {dst}")
+    (root / ".gamal" / "lock.json").write_text(json.dumps(lock, indent=2), encoding="utf-8")
+    return 0
+
+def _pkg_init(root: pathlib.Path) -> int:
+    cfg = root / "gamal.toml"
+    if cfg.exists(): print("gamal.toml already exists"); return 0
+    cfg.write_text('[package]\nname = "app"\nversion = "0.1.0"\n\n[dependencies]\n', encoding="utf-8")
+    print("created gamal.toml"); return 0
+
+def pkg_main(argv: list[str]) -> int:
+    action = argv[0] if argv else "list"
+    root = pathlib.Path(argv[1]).resolve() if len(argv) > 1 else pathlib.Path.cwd()
+    if action == "init": return _pkg_init(root)
+    if action == "install": return _pkg_install(root)
+    if action == "list":
+        cfg = root / "gamal.toml"
+        if not cfg.exists(): print("no gamal.toml"); return 1
+        data = _read_toml(cfg)
+        for name, spec in (data.get("dependencies") or {}).items():
+            print("%s %s" % (name, spec))
+        return 0
+    print("usage: gamal2.py pkg init|install|list [dir]"); return 2
+
 # ------------------------------------------------------------------ CLI
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "pkg":
+        return pkg_main(argv[1:])
     ap = argparse.ArgumentParser(prog="gamal2")
     ap.add_argument("cmd", choices=["run", "check", "fmt", "test"], nargs="?", default="run")
     ap.add_argument("file", nargs="?")
