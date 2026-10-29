@@ -1,0 +1,53 @@
+{
+  "Function declaration": {
+    "prefix": "fn",
+    "body": [
+      "fn ${1:name}(${2:a}: ${3:Int}) -> ${4:Int} effects {} {",
+      "\t$0",
+      "}"
+    ],
+    "description": "Declare a typed function with an effects block."
+  },
+  "Let binding": {
+    "prefix": "let",
+    "body": [
+      "let ${1:name} = ${2:value}"
+    ],
+    "description": "Bind a value to a name."
+  },
+  "If / else": {
+    "prefix": "if",
+    "body": [
+      "if ${1:condition} {",
+      "\t$0",
+      "} else {",
+      "\t",
+      "}"
+    ],
+    "description": "If / else block."
+  },
+  "Prove and verify": {
+    "prefix": "prove",
+    "body": [
+      "prove ${1:name} {",
+      "\t${2:field}: ${3:value},",
+      "}",
+      "verify ${1:name}"
+    ],
+    "description": "Create a hash-chained proof and verify it."
+  },
+  "Pipe chain": {
+    "prefix": "pipe",
+    "body": [
+      "${1:rows} | filter ${2:field} | select ${3:konto, naziv}"
+    ],
+    "description": "Pipe a table through filter and select stages."
+  },
+  "Import module": {
+    "prefix": "import",
+    "body": [
+      "import \"${1:file.gm}\""
+    ],
+    "description": "Import another GAMA-L module."
+  }
+}
