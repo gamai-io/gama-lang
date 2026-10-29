@@ -32,9 +32,14 @@ Path dependencies must stay inside the project root; symlinks are rejected.
 Git dependencies clone into `.gamal/cache/<name>` and are pinned in
 `.gamal/lock.json`; reinstall fails on a lock mismatch until `pkg update`.
 Modules resolve from `.gamal/modules/<name>` via `import "name/file.gm"`.
-A local/static registry is a JSON file (path or `file://` URL) consumed by
-`pkg search|resolve|add`. There is no hosted central registry yet, but any git
-URL (including private remotes) works with the host's git credentials.
+A local/static registry is a JSON file (path, `file://`, or `http(s)://`)
+consumed by `pkg search|resolve|add`. Serve one with:
+
+```bash
+python3 gama_registry_server.py --registry registry.json --port 8089
+```
+
+Any git URL (including private remotes) works with the host's git credentials.
 
 ## Editor support (LSP, stdio)
 
@@ -44,17 +49,18 @@ python3 gamal2.py lsp
 
 JSON-RPC language server: `initialize`, `didOpen/didChange/didSave`
 diagnostics, completion, hover, definition, references, document symbols,
-semantic tokens, `shutdown`, `exit`. Positions are converted between LSP
+semantic tokens, code actions, `shutdown`, `exit`. Positions are converted between LSP
 UTF-16 and Python indexes. A syntax-only VS Code package is in `vscode/`
 (TextMate grammar + snippets); it does not start the LSP itself.
 
 ## Distribution
 
 `pyproject.toml` defines the `gama-l` package and console scripts `gama-l`,
-`gama-lsp`, `gama-doctor`; modules are `gamal2`, `gama_lsp`, `gama_cli`,
-`gama_fmt`, `gama_doctor`, `gama_mail`, `gama_registry`.
-The CLI wrapper is `gama_cli.py`. A wheel was built successfully in 22.8 KB
-during verification; publishing is not automated.
+`gama-lsp`, `gama-doctor`, `gama-registry`, `gama-release`; modules are
+`gamal2`, `gama_lsp`, `gama_cli`, `gama_fmt`, `gama_doctor`, `gama_mail`,
+`gama_registry`, `gama_registry_server`, `release`.
+The CLI wrapper is `gama_cli.py`. `release.py build` writes deterministic
+wheel/tar, `SHA256SUMS`, and `RELEASE.json`; `release.py verify` checks them.
 
 ## Doctor
 
@@ -65,6 +71,14 @@ python3 gamal2.py doctor --json
 
 Checks Python, module imports, every example parse/run, formatter idempotence,
 LSP API, SQL write guard, and a local package install.
+
+## Formatting
+
+```bash
+python3 gamal2.py fmt file.gm          # print
+python3 gamal2.py fmt --check file.gm  # rc 1 if unformatted
+python3 gamal2.py fmt --write file.gm  # write in place
+```
 
 ## Implemented
 
@@ -86,26 +100,27 @@ LSP API, SQL write guard, and a local package install.
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 116/116
+python3 -m unittest discover -s tests -v   # 146/146
 ```
 
 Conformance coverage: arithmetic/pipes (20 cases), type errors, effect
 violations (including `sql.write`/`mail` stubs), HITL returns `Denied`,
 proof/tamper, duplicate proof keys, optional HMAC proof signatures (`GAMA_L_PROOF_KEY`; `GAMA_L_REQUIRE_SIG=1` requires them),
 imports/cycles/diamonds, multi-table SQLite schema checks, git/path package
-dependencies, LSP completion/hover/definition/references/symbols/tokens/
-didChange, local registry, guarded SQL writes and SMTP mail, offline `ask` =
-`Unavailable`, 11 examples, canonical `fmt`, doctor, and distribution metadata.
+dependencies, LSP completion/hover/definition/references/symbols/tokens/code actions/
+didChange, HTTP/local registry, guarded SQL writes and SMTP mail, offline
+`ask` = `Unavailable`, 11 examples, canonical `fmt` check/write, doctor, and
+reproducible release metadata.
 
 ## Not implemented yet
 
-- hosted central package registry (local/static and git dependencies work)
+- deployed/public package registry (the HTTP server is implemented and testable)
 - full type inference and generics
 - real AI connector beyond optional OpenAI-compatible `ask`
 - full AST formatter (current `fmt` is token-based, preserves comments and
   strings, but does not reformat multi-line strings)
-- LSP code actions; VS Code package is syntax-only
-- publishing a built distribution
+- VS Code package is syntax-only
+- publishing a built release (build/checksums work)
 
 The old v0.1 transpiler remains in `gama-lang/` for reference. Do not call this
 full 2.0 until the remaining conformance tests and connectors are done.

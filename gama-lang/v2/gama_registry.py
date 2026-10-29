@@ -6,10 +6,13 @@ A registry is a JSON document:
         "math": {"version": "0.1.0", "git": "../mathrepo", "rev": "<sha>"}
     }}
 
-Only local paths and ``file://`` URLs are supported; nothing is fetched over
-the network.  This module is intentionally independent from ``gamal2`` so it
-can be used before the interpreter boots, while still writing the same
-``gamal.toml`` shape that ``gamal2._read_toml`` / ``_pkg_install`` understand.
+A registry may be loaded from a local path, a ``file://`` URL, or an
+``http://`` / ``https://`` URL.  Remote registries are fetched with a 10 s
+timeout, a 1 MiB body limit, a ``application/json`` or ``text/plain``
+content-type, and the same schema validation as local files.  This module is
+intentionally independent from ``gamal2`` so it can be used before the
+interpreter boots, while still writing the same ``gamal.toml`` shape that
+``gamal2._read_toml`` / ``_pkg_install`` understand.
 """
 
 from __future__ import annotations
@@ -17,7 +20,9 @@ from __future__ import annotations
 import json
 import pathlib
 import re
+import urllib.error
 import urllib.parse
+import urllib.request
 
 __all__ = [
     "RegistryError",
@@ -29,6 +34,10 @@ __all__ = [
 
 REGISTRY_VERSION = 1
 _PACKAGE_FIELDS = ("name", "version", "git", "rev")
+
+_MAX_REGISTRY_BYTES = 1024 * 1024
+_HTTP_TIMEOUT = 10.0
+_HTTP_CONTENT_TYPES = ("application/json", "text/plain")
 
 
 class RegistryError(Exception):
@@ -114,10 +123,17 @@ def _record(name: str, entry: dict) -> dict:
     }
 
 
-# --------------------------------------------------------------------------- public
-def load_registry(source: str) -> dict:
-    """Read and validate a registry from a path or ``file://`` URL."""
-    path = _source_path(source)
+def _split_source(source: object) -> tuple[str, str]:
+    """Return ``(scheme, original)``; plain paths yield an empty scheme."""
+    s = str(source)
+    if "://" in s:
+        return urllib.parse.urlsplit(s).scheme.lower(), s
+    if s[:5].lower() == "file:":
+        return "file", s
+    return "", s
+
+
+def _load_path(path: pathlib.Path) -> dict:
     if not path.exists():
         raise _fail("registry not found: %s" % path)
     if not path.is_file():
@@ -131,6 +147,69 @@ def load_registry(source: str) -> dict:
     except json.JSONDecodeError as ex:
         raise _fail("invalid registry JSON in %s: %s" % (path, ex)) from None
     return _validate(data)
+
+
+def _http_media_type(headers: object) -> str:
+    raw = headers.get("Content-Type", "") if headers is not None else ""
+    return raw.split(";", 1)[0].strip().lower()
+
+
+def _load_http(url: str) -> dict:
+    try:
+        with urllib.request.urlopen(url, timeout=_HTTP_TIMEOUT) as resp:
+            final_url = resp.geturl() or url
+            scheme = urllib.parse.urlsplit(final_url).scheme.lower()
+            if scheme not in ("http", "https"):
+                raise _fail(
+                    "registry redirected to unsupported scheme %r (from %s)"
+                    % (scheme, url)
+                )
+            media = _http_media_type(resp.headers)
+            if media and media not in _HTTP_CONTENT_TYPES:
+                raise _fail(
+                    "unsupported registry content type %r at %s: "
+                    "expected application/json or text/plain" % (media, url)
+                )
+            raw = resp.read(_MAX_REGISTRY_BYTES + 1)
+            charset = resp.headers.get_content_charset() or "utf-8"
+    except RegistryError:
+        raise
+    except urllib.error.HTTPError as ex:
+        raise _fail(
+            "cannot fetch registry %s: HTTP %s %s" % (url, ex.code, ex.reason)
+        ) from None
+    except (urllib.error.URLError, OSError, ValueError) as ex:
+        raise _fail("cannot fetch registry %s: %s" % (url, ex)) from None
+
+    if len(raw) > _MAX_REGISTRY_BYTES:
+        raise _fail(
+            "registry at %s is larger than %d bytes" % (url, _MAX_REGISTRY_BYTES)
+        )
+    try:
+        text = raw.decode(charset)
+    except (UnicodeDecodeError, LookupError) as ex:
+        raise _fail("cannot decode registry %s as %s: %s" % (url, charset, ex)) from None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as ex:
+        raise _fail("invalid registry JSON at %s: %s" % (url, ex)) from None
+    return _validate(data)
+
+
+# --------------------------------------------------------------------------- public
+def load_registry(source: str) -> dict:
+    """Read and validate a registry from a path, ``file://``, or http(s) URL."""
+    scheme, ref = _split_source(source)
+    if scheme in ("http", "https"):
+        return _load_http(ref)
+    if scheme == "file":
+        return _load_path(_source_path(ref))
+    if scheme:
+        raise _fail(
+            "unsupported registry source %r: use a path, file://, "
+            "http:// or https:// URL" % ref
+        )
+    return _load_path(pathlib.Path(ref))
 
 
 def search(index: dict, query: str = "") -> list[dict]:

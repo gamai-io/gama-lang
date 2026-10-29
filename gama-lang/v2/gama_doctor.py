@@ -20,8 +20,8 @@ import sys
 import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent
-IMPORT_MODULES = ("gamal2", "gama_lsp", "gama_fmt", "gama_cli", "gama_mail", "gama_registry")
-LSP_API = ("main", "completion", "hover", "definition", "references", "document_symbols", "semantic_tokens")
+IMPORT_MODULES = ("gamal2", "gama_lsp", "gama_fmt", "gama_cli", "gama_mail", "gama_registry", "gama_registry_server", "release")
+LSP_API = ("main", "completion", "hover", "definition", "references", "document_symbols", "semantic_tokens", "code_actions")
 
 
 def _examples_dir(root: pathlib.Path) -> pathlib.Path:

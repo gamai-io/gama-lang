@@ -1107,7 +1107,14 @@ def main(argv=None):
     ap.add_argument("cmd", choices=["run", "check", "fmt", "test", "lsp", "doctor"], nargs="?", default="run")
     ap.add_argument("file", nargs="?")
     ap.add_argument("--interactive", action="store_true")
-    a = ap.parse_args(argv)
+    ap.add_argument("--check", action="store_true",
+                    help="fmt: report if the file is unformatted, write nothing (rc 1 if so)")
+    ap.add_argument("--write", action="store_true",
+                    help="fmt: rewrite the file in place with the formatted source")
+    a = ap.parse_intermixed_args(argv)
+    if a.cmd != "fmt" and (a.check or a.write):
+        print("error: --check/--write are only valid with the 'fmt' command", file=sys.stderr)
+        return 2
     if a.cmd == "test":
         import unittest
         sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent / "tests"))
@@ -1119,8 +1126,22 @@ def main(argv=None):
         if a.cmd == "check":
             check_file(a.file); print("OK"); return 0
         if a.cmd == "fmt":
-            src = pathlib.Path(a.file).read_text(encoding="utf-8"); parse(src)
-            sys.stdout.write(fmt_source(src)); return 0
+            if a.check and a.write:
+                print("error: --check and --write cannot be used together", file=sys.stderr)
+                return 2
+            path = pathlib.Path(a.file)
+            src = path.read_text(encoding="utf-8"); parse(src)
+            formatted = fmt_source(src)
+            if a.check:
+                if formatted == src:
+                    return 0
+                print(f"needs formatting: {a.file}")
+                return 1
+            if a.write:
+                path.write_text(formatted, encoding="utf-8")
+                print(f"{a.file}: formatted")
+                return 0
+            sys.stdout.write(formatted); return 0
         it = run_file(a.file, interactive=a.interactive)
         for line in it.out: print(line)
         return 0

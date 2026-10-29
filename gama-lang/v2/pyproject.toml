@@ -14,6 +14,8 @@ license = { text = "MIT" }
 gama-l = "gama_cli:main"
 gama-lsp = "gama_lsp:main"
 gama-doctor = "gama_doctor:main"
+gama-registry = "gama_registry_server:main"
+gama-release = "release:main"
 
 [tool.setuptools]
-py-modules = ["gamal2", "gama_lsp", "gama_cli", "gama_fmt", "gama_doctor", "gama_mail", "gama_registry"]
+py-modules = ["gamal2", "gama_lsp", "gama_cli", "gama_fmt", "gama_doctor", "gama_mail", "gama_registry", "gama_registry_server", "release"]
