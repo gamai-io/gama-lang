@@ -30,8 +30,8 @@ class V2Tests(unittest.TestCase):
         it = G.run('remember("k", "v")\nprint recall("k")\n')
         self.assertEqual(it.out, ['v'])
     def test_hitl_noninteractive(self):
-        with self.assertRaises(G.GamaRuntimeError):
-            G.run('print wait_user("ok?")\n')
+        it = G.run('print wait_user("ok?")\n')
+        self.assertEqual(it.out, ['Denied'])
     def test_if(self):
         it = G.run('let x = 5\nif x > 3 {\n print "big"\n} else {\n print "small"\n}\n')
         self.assertEqual(it.out, ['big'])
@@ -97,6 +97,26 @@ class V2Tests(unittest.TestCase):
     def test_effect_write_stub(self):
         with self.assertRaises(G.GamaEffectError):
             G.check('fn f() -> Bool effects {} { return sql_write("x") }\n')
+    def test_unknown_column_select(self):
+        with self.assertRaises(G.GamaTypeError):
+            G.check('let r = sql("x")\nlet s = r | select kontoX\n')
+    def test_unknown_column_filter(self):
+        with self.assertRaises(G.GamaTypeError):
+            G.check('let r = sql("x")\nlet s = r | filter mjsta == "Sarajevo"\n')
+    def test_unknown_column_sum(self):
+        with self.assertRaises(G.GamaTypeError):
+            G.check('let r = sql("x")\nlet s = r | sum netoX\n')
+    def test_proof_signature(self):
+        import os
+        old = os.environ.get('GAMA_L_PROOF_KEY'); os.environ['GAMA_L_PROOF_KEY'] = 'test-key'
+        try:
+            it = G.run('prove p = {a:1}\nverify p\n')
+            self.assertTrue(it.env.get('_verify')['ok'])
+            rec = it.proofs['p']; rec['value']['a'] = 2
+            self.assertFalse(it.verify(rec)['ok'])
+        finally:
+            if old is None: os.environ.pop('GAMA_L_PROOF_KEY', None)
+            else: os.environ['GAMA_L_PROOF_KEY'] = old
     def test_fmt_idempotent(self):
         a = G.fmt_source('print 1   \n\n')
         self.assertEqual(G.fmt_source(a), a)
