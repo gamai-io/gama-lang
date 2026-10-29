@@ -91,7 +91,7 @@ python3 gamal2.py fmt --write file.gm  # write in place
 
 - `import "file.gm"` with cycle detection (relative to the importing file)
 - `let` with optional type annotation, `:=` assignment
-- `fn` with typed parameters, return type, `effects { ... }`
+- `fn` and SPEC `make` with typed parameters, defaults, return type, `effects { ... }`
 - `if` / `else` blocks, `return`
 - literals: text, int, decimal, bool, null, list, map
 - arithmetic/comparison/boolean operators
@@ -100,6 +100,8 @@ python3 gamal2.py fmt --write file.gm  # write in place
 - `wait_user` (non-interactive returns `Denied`; falsy)
 - guarded `sql_write` (INSERT/UPDATE/DELETE; needs `GAMA_L_ALLOW_WRITE=1`, rejects DDL/stacked statements)
 - guarded SMTP `mail` (needs `GAMA_L_MAIL_ENABLED=1`; config via `GAMA_L_SMTP_*`)
+- SPEC syntax aliases: `make`, `ask "..." with context`, `remember a.b = v`, `recall a.b`, `wait user "..."`, `use sql`
+- `round(value, digits)`
 - `ask` uses `gama_ai` when `GAMA_L_AI_URL` is set; config via `GAMA_L_AI_KEY`,
   `GAMA_L_AI_MODEL`, `GAMA_L_AI_ALLOW_HTTP=1` for local HTTP; HTTPS by default,
   retries 429/5xx, 1 MiB response cap; redirects are refused
@@ -110,7 +112,7 @@ python3 gamal2.py fmt --write file.gm  # write in place
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 198/198
+python3 -m unittest discover -s tests -v   # 204/204
 ```
 
 Conformance coverage: arithmetic/pipes (20 cases), type errors, effect
@@ -118,16 +120,15 @@ violations (including `sql.write`/`mail` stubs), HITL returns `Denied`,
 proof/tamper, duplicate proof keys, optional HMAC proof signatures (`GAMA_L_PROOF_KEY`; `GAMA_L_REQUIRE_SIG=1` requires them),
 imports/cycles/diamonds, multi-table SQLite schema checks, git/path package
 dependencies, LSP completion/hover/definition/references/symbols/tokens/code actions/
-rename/formatting/didChange, VS Code LSP client, HTTP/local registry, AI
-connector, guarded SQL writes and SMTP mail, offline `ask` = `Unavailable`,
-11 examples, canonical `fmt` check/write, doctor, and reproducible release
-metadata.
+rename/formatting/didChange, SPEC syntax aliases/defaults, VS Code LSP client,
+HTTP/local registry, AI connector, guarded SQL writes and SMTP mail, offline
+`ask` = `Unavailable`, 11 examples, canonical `fmt` check/write, doctor, and
+reproducible release metadata.
 
 ## Not implemented yet
 
 - deployed/public package registry (the HTTP server is implemented and testable)
-- normative SPEC syntax (`make`, `ask … with`, `remember a.b`, `wait user`, `use`) — current parser implements a smaller dialect
-- `Result`/`Ok`/`Err` errors-as-values and namespace/export modules
+- `Result`/`Ok`/`Err` errors-as-values and real namespace/export modules (`use` is currently a no-op)
 - `for`/`while`/`match`, indexing, lambdas/first-class functions
 - persistent proof chain bound to intent/lease; IR/bytecode and runtime limits
 - full type inference, records/enums/generics

@@ -60,7 +60,7 @@ class TableType(str):
 # ------------------------------------------------------------------ lexer
 KEYWORDS = {"let", "fn", "if", "else", "return", "true", "false", "null",
             "prove", "verify", "print", "effects", "filter", "select", "sum",
-            "limit", "count", "map", "in", "import"}
+            "limit", "count", "map", "in", "import", "make", "use", "wait"}
 
 @dataclass
 class Tok:
@@ -139,11 +139,13 @@ class Pipe: base: Any; stages: list; line: int; col: int
 @dataclass
 class Import: path: str; line: int; col: int
 @dataclass
+class Use: name: str; line: int; col: int
+@dataclass
 class Let: name: str; type_name: str | None; expr: Any; line: int; col: int
 @dataclass
 class Assign: name: str; expr: Any; line: int; col: int
 @dataclass
-class Param: name: str; type_name: str
+class Param: name: str; type_name: str; default: Any = None
 @dataclass
 class Fn: name: str; params: list; ret: str | None; effects: set | None; body: list; line: int; col: int
 @dataclass
@@ -200,11 +202,13 @@ class Parser:
         if x.kind == "KW" and x.val == "import":
             self.take(); path = self.expect("STRING").val
             return Import(path, x.line, x.col)
+        if x.kind == "KW" and x.val == "use":
+            self.take(); return Use(self.expect("IDENT").val, x.line, x.col)
         if x.kind == "KW" and x.val == "let":
             self.take(); name = self.expect("IDENT").val; tn = None
             if self.at("OP", ":"): self.take(); tn = self.expect("IDENT").val
             self.expect("OP", "="); self.skip_nl(); return Let(name, tn, self.expr(), x.line, x.col)
-        if x.kind == "KW" and x.val == "fn": return self.fn()
+        if x.kind == "KW" and x.val in ("fn", "make"): return self.fn()
         if x.kind == "KW" and x.val == "if": return self.if_stmt()
         if x.kind == "KW" and x.val == "return":
             self.take(); return Return(self.expr(), x.line, x.col)
@@ -221,6 +225,9 @@ class Parser:
             self.take(); return Verify(self.expr(), x.line, x.col)
         if x.kind == "KW" and x.val == "print":
             self.take(); return Print(self.expr(), x.line, x.col)
+        if x.kind == "IDENT" and x.val == "remember" and self.peek(1).kind == "IDENT":
+            self.take(); key = self.take().val; self.expect("OP", "=")
+            return ExprStmt(Call("remember", [Literal(key, x.line, x.col), self.expr()], x.line, x.col), x.line, x.col)
         if x.kind == "IDENT" and self.peek(1).kind == "OP" and self.peek(1).val == ":=":
             name = self.take().val; self.take(); return Assign(name, self.expr(), x.line, x.col)
         return ExprStmt(self.expr(), x.line, x.col)
@@ -230,7 +237,10 @@ class Parser:
         if not self.at("OP", ")"):
             while True:
                 pn = self.expect("IDENT").val; self.expect("OP", ":"); pt = self.expect("IDENT").val
-                params.append(Param(pn, pt)); self.skip_nl()
+                default = None
+                if self.at("OP", "="):
+                    self.take(); self.skip_nl(); default = self.expr()
+                params.append(Param(pn, pt, default)); self.skip_nl()
                 if not self.at("OP", ","): break
                 self.take(); self.skip_nl()
         self.expect("OP", ")"); ret = None
@@ -297,6 +307,18 @@ class Parser:
         if x.kind == "STRING": self.take(); return Literal(x.val, x.line, x.col)
         if x.kind == "KW" and x.val in ("true", "false", "null"):
             self.take(); return Literal({"true":True,"false":False,"null":None}[x.val], x.line, x.col)
+        if x.kind == "KW" and x.val == "wait":
+            self.take(); self.expect("IDENT", "user")
+            args = [self.expr()] if not (self.at("NL") or self.at("OP", ";") or self.at("EOF")) else []
+            return Call("wait_user", args, x.line, x.col)
+        if x.kind == "IDENT" and x.val == "ask" and self.peek(1).kind != "OP":
+            self.take(); arg = self.expr(); args = [arg]
+            if self.at("IDENT", "with"):
+                self.take(); args.append(self.expr())
+            return Call("ask", args, x.line, x.col)
+        if x.kind == "IDENT" and x.val == "recall" and self.peek(1).kind == "IDENT":
+            self.take(); name = self.take().val
+            return Call("recall", [Literal(name, x.line, x.col)], x.line, x.col)
         if x.kind == "IDENT":
             self.take(); name = x.val
             if self.at("OP", "("):
@@ -360,6 +382,7 @@ BUILTINS = {
     "number": (set(), "Decimal"),
     "sql_write": ({"sql.write"}, "Bool"),
     "mail": ({"mail"}, "Bool"),
+    "round": (set(), "Decimal"),
 }
 
 def sqlite_schema() -> dict[str, set[str]] | None:
@@ -444,6 +467,8 @@ class Checker:
     def stmt(self, s, allowed):
         if isinstance(s, Import):
             raise GamaError("import requires check_file/run_file", s.line, s.col)
+        if isinstance(s, Use):
+            return
         if isinstance(s, Let):
             t = self.expr(s.expr)
             if s.type_name and not self.compat(t, s.type_name): raise GamaTypeError(f"{s.name}: {t} != {s.type_name}", s.line, s.col)
@@ -543,7 +568,9 @@ class Checker:
                 return rt
             f = self.funcs.get(e.name)
             if not f: raise GamaTypeError(f"unknown function {e.name}", e.line, e.col)
-            if len(f.params) != len(e.args): raise GamaTypeError(f"{e.name} expects {len(f.params)} args", e.line, e.col)
+            required = sum(1 for p in f.params if p.default is None)
+            if not (required <= len(e.args) <= len(f.params)):
+                raise GamaTypeError(f"{e.name} expects {required}..{len(f.params)} args", e.line, e.col)
             for p, a in zip(f.params, e.args):
                 at = self.expr(a)
                 if not self.compat(at, p.type_name): raise GamaTypeError(f"{e.name}: {p.name} {at} != {p.type_name}", e.line, e.col)
@@ -708,6 +735,7 @@ class Interpreter:
     def stmt(self, s, env):
         if isinstance(s, Let): env.set(s.name, self.expr(s.expr, env))
         elif isinstance(s, Assign): env.assign(s.name, self.expr(s.expr, env))
+        elif isinstance(s, Use): pass
         elif isinstance(s, Fn): self.funcs[s.name] = (s, env)
         elif isinstance(s, If):
             if self.truth(self.expr(s.cond, env)):
@@ -836,6 +864,9 @@ class Interpreter:
                     raise GamaRuntimeError("sql failed: %s" % ex, e.line, e.col) from None
             if e.name == "ask":
                 p = str(self.expr(e.args[0], env, row)) if e.args else ""
+                if len(e.args) > 1:
+                    ctx = self.expr(e.args[1], env, row)
+                    p += "\n\nContext:\n" + (ctx if isinstance(ctx, str) else json.dumps(ctx, default=str, ensure_ascii=False))
                 if os.environ.get("GAMA_L_AI_URL"):
                     try:
                         from gama_ai import AIError, ask as ai_ask
@@ -882,10 +913,16 @@ class Interpreter:
                 except MailError as ex:
                     raise GamaRuntimeError(str(ex), e.line, e.col) from None
             if e.name == "number": return Decimal(str(self.expr(e.args[0], env, row)))
+            if e.name == "round":
+                value = Decimal(str(self.expr(e.args[0], env, row)))
+                digits = int(self.expr(e.args[1], env, row)) if len(e.args) > 1 else 0
+                return value.quantize(Decimal(1).scaleb(-digits))
             if e.name in self.funcs:
                 fn, closure = self.funcs[e.name]
                 local = Env(closure)
-                for p, a in zip(fn.params, e.args): local.set(p.name, self.expr(a, env, row))
+                for i, p in enumerate(fn.params):
+                    value = self.expr(e.args[i], env, row) if i < len(e.args) else self.expr(p.default, closure)
+                    local.set(p.name, value)
                 try:
                     for s in fn.body: self.stmt(s, local)
                 except ReturnSignal as r: return r.value
