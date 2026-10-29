@@ -13,6 +13,7 @@ license = { text = "MIT" }
 [project.scripts]
 gama-l = "gama_cli:main"
 gama-lsp = "gama_lsp:main"
+gama-doctor = "gama_doctor:main"
 
 [tool.setuptools]
-py-modules = ["gamal2", "gama_lsp", "gama_cli", "gama_fmt"]
+py-modules = ["gamal2", "gama_lsp", "gama_cli", "gama_fmt", "gama_doctor", "gama_mail", "gama_registry"]
