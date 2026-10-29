@@ -17,6 +17,8 @@ Policy:
   * Non-https URLs are rejected unless ``GAMA_L_AI_ALLOW_HTTP=1``.
   * ``/chat/completions`` is appended when the URL does not already end with
     it.
+  * Redirects are never followed: a 3xx response raises :class:`AIError`,
+    so the bearer token is never replayed to a server-chosen origin.
   * Requests are ``temperature: 0`` and responses are capped at 1 MiB.
   * Transient HTTP statuses (429/500/502/503/504) are retried twice with a
     0.2 s / 0.5 s backoff; client errors (400/401/403) are never retried.
@@ -28,6 +30,7 @@ import json
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 __all__ = ["AIError", "ask", "MAX_RESPONSE_BYTES", "RETRY_BACKOFF", "RETRY_STATUS"]
@@ -49,6 +52,40 @@ ENDPOINT_SUFFIX = "/chat/completions"
 
 class AIError(Exception):
     """Raised when an AI request cannot be configured or completed."""
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse every HTTP redirect.
+
+    Following a redirect would replay the request (including the
+    ``Authorization`` header) against a host chosen by the server, which is
+    both an SSRF primitive and a credential leak.  Returning ``None`` from
+    ``redirect_request`` makes urllib surface the 3xx as an ``HTTPError``
+    without issuing a second request.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = None
+
+
+def _opener() -> urllib.request.OpenerDirector:
+    global _OPENER
+    if _OPENER is None:
+        _OPENER = urllib.request.build_opener(_NoRedirectHandler())
+    return _OPENER
+
+
+def _origin(url: str) -> tuple[str, str, int]:
+    parts = urllib.parse.urlsplit(url)
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").lower()
+    port = parts.port
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    return scheme, host, port
 
 
 def _env(name: str) -> str:
@@ -120,10 +157,19 @@ def _parse(raw: bytes) -> str:
 def _request(url: str, data: bytes, headers: dict, timeout: int) -> bytes:
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _opener().open(req, timeout=timeout) as resp:
+            final = resp.geturl() or url
+            if _origin(final) != _origin(url):
+                raise AIError(
+                    "refusing cross-origin redirect %s -> %s" % (url, final)
+                )
+            if url.lower().startswith("https://") and final.lower().startswith("http://"):
+                raise AIError("refusing https downgrade redirect to %s" % final)
             raw = resp.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as ex:
         ex.close()
+        raise
+    except AIError:
         raise
     except (urllib.error.URLError, OSError, ValueError) as ex:
         raise AIError("request to %s failed: %s" % (url, ex)) from None
@@ -164,6 +210,10 @@ def ask(
             raw = _request(url, data, headers, timeout)
             return _parse(raw)
         except urllib.error.HTTPError as ex:
+            if 300 <= ex.code < 400:
+                raise AIError(
+                    "refusing HTTP %s redirect from %s" % (ex.code, url)
+                ) from None
             if ex.code in RETRY_STATUS and attempt < len(RETRY_BACKOFF):
                 time.sleep(RETRY_BACKOFF[attempt])
                 continue

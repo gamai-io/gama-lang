@@ -9,10 +9,12 @@ A registry is a JSON document:
 A registry may be loaded from a local path, a ``file://`` URL, or an
 ``http://`` / ``https://`` URL.  Remote registries are fetched with a 10 s
 timeout, a 1 MiB body limit, a ``application/json`` or ``text/plain``
-content-type, and the same schema validation as local files.  This module is
-intentionally independent from ``gamal2`` so it can be used before the
-interpreter boots, while still writing the same ``gamal.toml`` shape that
-``gamal2._read_toml`` / ``_pkg_install`` understand.
+content-type, and the same schema validation as local files.  Every redirect
+hop is validated before it is followed: scheme downgrades are rejected, and a
+public host may not redirect into a private, loopback, link-local or CGNAT
+target.  This module is intentionally independent from ``gamal2`` so it can be
+used before the interpreter boots, while still writing the same ``gamal.toml``
+shape that ``gamal2._read_toml`` / ``_pkg_install`` understand.
 """
 
 from __future__ import annotations
@@ -158,15 +160,73 @@ def _http_media_type(headers: object) -> str:
     return raw.split(";", 1)[0].strip().lower()
 
 
+_CGNAT_V4 = ipaddress.ip_network("100.64.0.0/10")
+_BLOCKED = ("is_private", "is_loopback", "is_link_local", "is_reserved",
+            "is_multicast", "is_unspecified")
+
+
+def _private_allowed() -> bool:
+    return os.environ.get(_PRIVATE_ALLOW_ENV) == "1"
+
+
+def _addr_forbidden(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    # ``is_global`` already covers private, loopback, link-local, reserved and
+    # unspecified ranges on modern Python; multicast is still "global" there,
+    # and CGNAT (100.64/10) is not ``is_private`` on some versions.
+    if not addr.is_global:
+        return True
+    if any(getattr(addr, name) for name in _BLOCKED):
+        return True
+    if isinstance(addr, ipaddress.IPv4Address) and addr in _CGNAT_V4:
+        return True
+    return False
+
+
 def _host_is_private(host: str) -> bool:
     try:
         addrs = [ipaddress.ip_address(host)]
     except ValueError:
         try:
-            addrs = [ipaddress.ip_address(info[4][0]) for info in socket.getaddrinfo(host, None)]
+            addrs = [
+                ipaddress.ip_address(info[4][0])
+                for info in socket.getaddrinfo(host, None)
+            ]
         except (OSError, ValueError):
-            return False
-    return any(a.is_private or a.is_loopback or a.is_link_local or a.is_reserved for a in addrs)
+            # Fail closed: an unresolvable host must not be treated as public.
+            return not _private_allowed()
+    return any(_addr_forbidden(a) for a in addrs)
+
+
+class _GuardRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Validate every redirect hop before urllib follows it.
+
+    Checking only the final URL after ``urlopen`` returns would already have
+    issued the request to the (possibly internal) redirect target.  This
+    handler rejects scheme downgrades and private/loopback/CGNAT targets at
+    each hop, so the guarded request never leaves the allowed origin space.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        original = urllib.parse.urlsplit(req.full_url)
+        target = urllib.parse.urlsplit(newurl)
+        scheme = target.scheme.lower()
+        if scheme not in ("http", "https"):
+            raise _fail(
+                "registry redirected to unsupported scheme %r (from %s)"
+                % (scheme, req.full_url)
+            )
+        if original.scheme.lower() == "https" and scheme == "http":
+            raise _fail(
+                "registry redirect downgraded https to http: %s" % newurl
+            )
+        host = target.hostname
+        if not host:
+            raise _fail("registry redirect target has no host: %s" % newurl)
+        if not _private_allowed() and _host_is_private(host):
+            raise _fail(
+                "registry redirect target is private/loopback: %s" % newurl
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def _load_http(url: str) -> dict:
@@ -174,12 +234,14 @@ def _load_http(url: str) -> dict:
     original_scheme = parsed.scheme.lower()
     if not parsed.hostname:
         raise _fail("registry URL has no host: %s" % url)
-    if os.environ.get(_PRIVATE_ALLOW_ENV) != "1" and _host_is_private(parsed.hostname):
+    if not _private_allowed() and _host_is_private(parsed.hostname):
         raise _fail("registry host is private/loopback; set %s=1 to allow" % _PRIVATE_ALLOW_ENV)
+    opener = urllib.request.build_opener(_GuardRedirectHandler())
     try:
-        with urllib.request.urlopen(url, timeout=_HTTP_TIMEOUT) as resp:
+        with opener.open(url, timeout=_HTTP_TIMEOUT) as resp:
             final_url = resp.geturl() or url
-            scheme = urllib.parse.urlsplit(final_url).scheme.lower()
+            final = urllib.parse.urlsplit(final_url)
+            scheme = final.scheme.lower()
             if scheme not in ("http", "https"):
                 raise _fail(
                     "registry redirected to unsupported scheme %r (from %s)"
@@ -187,6 +249,13 @@ def _load_http(url: str) -> dict:
                 )
             if original_scheme == "https" and scheme == "http":
                 raise _fail("registry redirect downgraded https to http: %s" % final_url)
+            if not _private_allowed():
+                if not final.hostname:
+                    raise _fail("registry redirect has no host: %s" % final_url)
+                if _host_is_private(final.hostname):
+                    raise _fail(
+                        "registry redirect host is private/loopback: %s" % final_url
+                    )
             media = _http_media_type(resp.headers)
             if not media or media not in _HTTP_CONTENT_TYPES:
                 raise _fail(
