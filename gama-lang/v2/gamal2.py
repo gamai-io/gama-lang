@@ -35,6 +35,18 @@ class GamaTypeError(GamaError): pass
 class GamaEffectError(GamaError): pass
 class GamaRuntimeError(GamaError): pass
 
+class Denied:
+    """Explicit HITL refusal value; falsy, renders as Denied."""
+    def __bool__(self): return False
+    def __str__(self): return "Denied"
+    __repr__ = __str__
+
+class TableType(str):
+    """String-compatible 'Table' type carrying an optional column set."""
+    fields: set[str] | None
+    def __new__(cls, fields=None):
+        o = str.__new__(cls, "Table"); o.fields = set(fields) if fields else None; return o
+
 # ------------------------------------------------------------------ lexer
 KEYWORDS = {"let", "fn", "if", "else", "return", "true", "false", "null",
             "prove", "verify", "print", "effects", "filter", "select", "sum",
@@ -317,7 +329,9 @@ def tname(v) -> str:
     if isinstance(v, Decimal): return "Decimal"
     if isinstance(v, str): return "Text"
     if isinstance(v, list):
-        if v and all(isinstance(x, dict) for x in v): return "Table"
+        if v and all(isinstance(x, dict) for x in v):
+            fields = set(v[0].keys())
+            return TableType(fields) if all(set(x.keys()) == fields for x in v) else TableType()
         return "List"
     if isinstance(v, dict): return "Json"
     return "Any"
@@ -415,7 +429,9 @@ class Checker:
                 for i in range(len(parts) - 1, 0, -1):
                     if self.get(".".join(parts[:i])) is not None:
                         return "Any"
-            if row: return "Any"
+            if row is not None:
+                if e.name in row: return "Any"
+                raise GamaTypeError(f"unknown column {e.name!r}", e.line, e.col)
             raise GamaTypeError(f"unknown variable {e.name}", e.line, e.col)
         if isinstance(e, Unary):
             t = self.expr(e.right, row)
@@ -444,6 +460,8 @@ class Checker:
                 eff, rt = BUILTINS[e.name]
                 self.effects |= eff
                 for a in e.args: self.expr(a, row)
+                if e.name == "sql" and not os.environ.get("GAMA_L_DB"):
+                    return TableType(DEMO_ROWS[0].keys())
                 return rt
             f = self.funcs.get(e.name)
             if not f: raise GamaTypeError(f"unknown function {e.name}", e.line, e.col)
@@ -460,18 +478,25 @@ class Checker:
             for stage, args in e.stages:
                 if t not in ("List", "Table", "Any"):
                     raise GamaTypeError(f"pipe stage {stage!r} needs List/Table", e.line, e.col)
+                fields = t.fields if isinstance(t, TableType) else (None if t == "Any" else set())
                 if stage == "filter":
-                    self.expr(args[0], row=True); t = "Table"
+                    self.expr(args[0], row=fields); t = TableType(fields)
                 elif stage == "select":
-                    t = "Table"
+                    if fields is not None:
+                        for f in args:
+                            if f not in fields: raise GamaTypeError(f"unknown column {f!r}", e.line, e.col)
+                    t = TableType(args)
                 elif stage == "sum":
-                    if args: pass
+                    if fields is not None and args and args[0] not in fields:
+                        raise GamaTypeError(f"unknown column {args[0]!r}", e.line, e.col)
                     t = "Decimal"
                 elif stage == "limit":
                     lt = self.expr(args[0], row)
                     if lt != "Int": raise GamaTypeError("limit expects Int", e.line, e.col)
-                    t = "Table"
+                    t = TableType(fields)
                 elif stage == "map":
+                    if fields is not None and args and args[0] not in fields:
+                        raise GamaTypeError(f"unknown column {args[0]!r}", e.line, e.col)
                     t = "List"
                 elif stage == "count":
                     t = "Int"
@@ -594,6 +619,9 @@ class Interpreter:
         h = hashlib.sha256((self.prev_proof + raw).encode()).hexdigest()
         rec = {"name": name, "value": val, "sha256": h, "prev": self.prev_proof,
                "id": h[:16], "ts": __import__("time").time()}
+        key = os.environ.get("GAMA_L_PROOF_KEY", "").encode()
+        if key:
+            rec["sig"] = hmac.new(key, (self.prev_proof + raw).encode(), hashlib.sha256).hexdigest()
         self.prev_proof = h
         self.proof_chain.append(h)
         return rec
@@ -606,6 +634,10 @@ class Interpreter:
         if not hmac.compare_digest(exp, str(rec.get("sha256"))): errs.append("hash_mismatch")
         if rec.get("prev") not in ("GENESIS",) and rec.get("prev") not in self.proof_chain:
             errs.append("untrusted_chain")
+        key = os.environ.get("GAMA_L_PROOF_KEY", "").encode()
+        if key:
+            want = hmac.new(key, (str(rec.get("prev", "GENESIS")) + raw).encode(), hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(want, str(rec.get("sig") or "")): errs.append("bad_signature")
         return {"ok": not errs, "expected": exp, "errors": errs}
     def expr(self, e, env, row=None):
         if isinstance(e, Literal): return e.value
@@ -698,7 +730,7 @@ class Interpreter:
             if e.name == "recall": return self.memory.get(str(self.expr(e.args[0], env, row)))
             if e.name == "wait_user":
                 if not self.interactive:
-                    raise GamaRuntimeError("HITL required but session is non-interactive", e.line, e.col)
+                    return Denied()
                 return input(f"[GAMA-L] {self.expr(e.args[0], env, row)} ").strip().lower() in ("yes", "y", "da")
             if e.name == "len": return len(self.expr(e.args[0], env, row))
             if e.name == "text": return str(self.expr(e.args[0], env, row))
@@ -717,7 +749,7 @@ class Interpreter:
             value = self.expr(e.base, env, row)
             for stage, args in e.stages:
                 if stage == "filter": value = [r for r in value if self.truth(self.expr(args[0], env, r))]
-                elif stage == "select": value = [{f: r.get(f) for f in args} for r in value]
+                elif stage == "select": value = [{f: r[f] for f in args} for r in value]
                 elif stage == "sum":
                     try:
                         value = sum((Decimal(str(r[args[0]])) for r in value), Decimal(0))
@@ -728,7 +760,9 @@ class Interpreter:
                     if n < 0: raise GamaRuntimeError("limit must be >= 0", e.line, e.col)
                     value = value[:n]
                 elif stage == "count": value = len(value)
-                elif stage == "map": value = [r.get(args[0]) for r in value]
+                elif stage == "map":
+                    try: value = [r[args[0]] for r in value]
+                    except KeyError as ex: raise GamaRuntimeError("map: unknown column %s" % ex, e.line, e.col) from None
             return value
         raise GamaRuntimeError("bad expression")
 
