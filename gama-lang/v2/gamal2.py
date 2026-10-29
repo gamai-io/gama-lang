@@ -16,9 +16,12 @@ import hmac
 import json
 import os
 import pathlib
+import re
 import shutil
 import sqlite3
+import subprocess
 import sys
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from decimal import Decimal
@@ -350,18 +353,26 @@ BUILTINS = {
     "mail": ({"mail"}, "Bool"),
 }
 
-def sqlite_schema() -> set[str] | None:
-    """Columns of the first table in GAMA_L_DB, if present (read-only)."""
+def sqlite_schema() -> dict[str, set[str]] | None:
+    """All user tables and columns in GAMA_L_DB (read-only), or None."""
     db = os.environ.get("GAMA_L_DB", "")
     if not db or not pathlib.Path(db).exists(): return None
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-        row = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT 1").fetchone()
-        if not row: con.close(); return None
-        cols = {r[1] for r in con.execute(f'PRAGMA table_info("{row[0]}")')}
-        con.close(); return cols or None
+        out = {}
+        for (name,) in con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"):
+            out[name] = {r[1] for r in con.execute(f'PRAGMA table_info("{name}")')}
+        con.close(); return out or None
     except Exception:
         return None
+
+def sql_fields(query: str) -> set[str] | None:
+    schema = sqlite_schema()
+    if not schema: return None
+    m = re.search(r"\bfrom\s+[\"`\[]?([A-Za-z_]\w*)", query, re.I)
+    if m and m.group(1) in schema:
+        return schema[m.group(1)]
+    return set().union(*schema.values())
 
 class Checker:
     def __init__(self):
@@ -475,10 +486,12 @@ class Checker:
                 self.effects |= eff
                 for a in e.args: self.expr(a, row)
                 if e.name == "sql":
-                    fields = sqlite_schema()
-                    if fields: return TableType(fields)
+                    q = e.args[0].value if e.args and isinstance(e.args[0], Literal) else ""
+                    fields = sql_fields(q)
+                    if fields is not None: return TableType(fields)
                     if not os.environ.get("GAMA_L_DB"):
                         return TableType(DEMO_ROWS[0].keys())
+                    return TableType(None)
                 return rt
             f = self.funcs.get(e.name)
             if not f: raise GamaTypeError(f"unknown function {e.name}", e.line, e.col)
@@ -520,12 +533,22 @@ class Checker:
             return t
         return "Any"
 
+def _project_root(entry: pathlib.Path) -> pathlib.Path:
+    for p in [entry.parent, *entry.parents]:
+        if (p / "gamal.toml").exists():
+            return p
+    return entry.parent
+
 def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
              seen: set | None = None, loaded: set | None = None) -> list:
-    path = path.resolve(); root = (root or path.parent).resolve()
+    path = path.resolve(); root = (root or _project_root(path)).resolve()
     if seen is None: seen = set()
     if loaded is None: loaded = set()
-    if os.path.commonpath([str(path), str(root)]) != str(root):
+    try:
+        inside = os.path.commonpath([str(path), str(root)]) == str(root)
+    except ValueError:
+        inside = False
+    if not inside:
         raise GamaError("import outside project root: %s" % path)
     if path in seen:
         raise GamaError("import cycle: %s" % path)
@@ -555,7 +578,7 @@ def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
 
 def load_file(path: str):
     p = pathlib.Path(path).resolve()
-    return _flatten(p, p.parent)
+    return _flatten(p, _project_root(p))
 
 def check(src: str):
     ast = parse(src)
@@ -682,9 +705,15 @@ class Interpreter:
         if rec.get("prev") not in ("GENESIS",) and rec.get("prev") not in self.proof_chain:
             errs.append("untrusted_chain")
         key = os.environ.get("GAMA_L_PROOF_KEY", "").encode()
-        if key:
-            want = hmac.new(key, (str(rec.get("prev", "GENESIS")) + raw).encode(), hashlib.sha256).hexdigest()
-            if not hmac.compare_digest(want, str(rec.get("sig") or "")): errs.append("bad_signature")
+        sig = rec.get("sig")
+        if sig:
+            if not key:
+                errs.append("missing_key")
+            else:
+                want = hmac.new(key, (str(rec.get("prev", "GENESIS")) + raw).encode(), hashlib.sha256).hexdigest()
+                if not hmac.compare_digest(want, str(sig)): errs.append("bad_signature")
+        elif os.environ.get("GAMA_L_REQUIRE_SIG") == "1":
+            errs.append("missing_signature")
         return {"ok": not errs, "expected": exp, "errors": errs}
     def expr(self, e, env, row=None):
         if isinstance(e, Literal): return e.value
@@ -838,25 +867,133 @@ def _read_toml(path: pathlib.Path) -> dict:
             out.setdefault(sec, {})[k] = v.strip('"\'')
     return out
 
-def _pkg_install(root: pathlib.Path) -> int:
+def _safe_name(name: str) -> bool:
+    return bool(name) and "/" not in name and "\\" not in name and ".." not in name and not name.startswith(".")
+
+def _inside(root: pathlib.Path, path: pathlib.Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve()); return True
+    except ValueError:
+        return False
+
+def _copy_tree(src: pathlib.Path, dst: pathlib.Path) -> None:
+    for p in src.rglob("*"):
+        rel = p.relative_to(src).parts
+        if ".git" in rel or ".gamal" in rel:
+            continue
+        if p.is_symlink():
+            raise ValueError(f"symlink not allowed in dependency: {p}")
+    if dst.exists():
+        if dst.is_symlink(): dst.unlink()
+        else: shutil.rmtree(dst)
+    shutil.copytree(src, dst, symlinks=True,
+                    ignore=shutil.ignore_patterns(".git", ".gamal"))
+
+def _sanitize_source(source: str) -> str:
+    try:
+        u = urllib.parse.urlsplit(source)
+        if u.scheme and u.netloc and ("@" in u.netloc):
+            host = u.netloc.rsplit("@", 1)[1]
+            return urllib.parse.urlunsplit((u.scheme, host, u.path, u.query, u.fragment))
+    except Exception:
+        pass
+    return source
+
+def _git(args: list[str], root: pathlib.Path) -> tuple[int, str, str]:
+    """Run git without a shell. Returns (rc, stdout, stderr)."""
+    try:
+        p = subprocess.run(["git", *args], cwd=str(root), capture_output=True,
+                           text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as ex:
+        return 1, "", str(ex)
+    return p.returncode, p.stdout.strip(), p.stderr.strip()
+
+def _git_source(spec: dict, root: pathlib.Path) -> str:
+    """Local git paths resolve relative to the project root; URLs stay as-is."""
+    git = spec.get("git", "")
+    if "://" in git or git.startswith("git@") or pathlib.Path(git).is_absolute():
+        return git
+    return str((root / git).resolve())
+
+def _pkg_install_one_git(name: str, spec: dict, root: pathlib.Path,
+                         moddir: pathlib.Path, cache_root: pathlib.Path,
+                         update: bool = False) -> tuple[dict | None, str]:
+    source = _git_source(spec, root)
+    cache = cache_root / name
+    if not cache.exists():
+        cache_root.mkdir(parents=True, exist_ok=True)
+        rc, _, err = _git(["clone", "--quiet", "--", source, str(cache)], root)
+        if rc != 0:
+            return None, f"git clone failed for {name} ({source}): {err or 'exit %d' % rc}"
+    elif update and not spec.get("rev"):
+        _git(["-C", str(cache), "fetch", "--quiet", "--all", "--tags"], root)
+        _git(["-C", str(cache), "pull", "--quiet", "--ff-only"], root)
+    rev = spec.get("rev")
+    if rev:
+        rev = str(rev)
+        if rev.startswith("-") or not all(c.isalnum() or c in "._/@^~{}" for c in rev):
+            return None, f"invalid git rev for {name}: {rev!r}"
+        # Refresh refs first; tolerate a failed fetch (rev may already be cached).
+        _git(["-C", str(cache), "fetch", "--quiet", "--all", "--tags"], root)
+        rc, _, err = _git(["-C", str(cache), "checkout", "--quiet", rev, "--"], root)
+        if rc != 0:
+            return None, f"git checkout {rev} failed for {name}: {err or 'exit %d' % rc}"
+    rc, head, err = _git(["-C", str(cache), "rev-parse", "HEAD"], root)
+    if rc != 0 or not head:
+        return None, f"git rev-parse HEAD failed for {name}: {err or 'exit %d' % rc}"
+    dst = moddir / name
+    try:
+        _copy_tree(cache, dst)
+    except Exception as ex:
+        return None, f"copy failed for {name}: {ex}"
+    return {"source": _sanitize_source(spec.get("git", source)), "commit": head, "installed": str(dst)}, ""
+
+def _pkg_install(root: pathlib.Path, update: bool = False) -> int:
     cfg = root / "gamal.toml"
     if not cfg.exists():
         print("no gamal.toml (run: gamal2.py pkg init)"); return 1
     data = _read_toml(cfg)
     deps = data.get("dependencies") or {}
     moddir = root / ".gamal" / "modules"; moddir.mkdir(parents=True, exist_ok=True)
-    lock = {}
+    cache_root = root / ".gamal" / "cache"
+    lock_path = root / ".gamal" / "lock.json"
+    old_lock = {}
+    if lock_path.exists():
+        try: old_lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        except Exception: old_lock = {}
+    lock: dict = {}
     for name, spec in deps.items():
-        src = pathlib.Path(spec.get("path", "") if isinstance(spec, dict) else spec)
+        if not _safe_name(name):
+            print(f"invalid dependency name: {name!r}"); return 1
+        if isinstance(spec, dict) and spec.get("git"):
+            entry, err = _pkg_install_one_git(name, spec, root, moddir, cache_root, update)
+            if entry is None:
+                print(err); return 1
+            old = old_lock.get(name) or {}
+            if not update and old.get("commit") and old.get("commit") != entry["commit"]:
+                print(f"lock mismatch for {name}: {old['commit'][:12]} -> {entry['commit'][:12]}; run: gamal2.py pkg update")
+                return 1
+            lock[name] = entry
+            print(f"installed {name} -> {entry['installed']} ({entry['commit'][:12]})")
+            continue
+        src_value = spec.get("path", "") if isinstance(spec, dict) else spec
+        if not src_value:
+            print(f"missing dependency {name}: no path or git source"); return 1
+        src = pathlib.Path(src_value)
         if not src.is_absolute(): src = (root / src).resolve()
+        else: src = src.resolve()
+        if not _inside(root, src) or src == root.resolve():
+            print(f"unsafe path dependency {name}: must be inside project root"); return 1
         if not src.exists():
             print(f"missing dependency {name}: {src}"); return 1
         dst = moddir / name
-        if dst.exists(): shutil.rmtree(dst)
-        shutil.copytree(src, dst)
+        try:
+            _copy_tree(src, dst)
+        except Exception as ex:
+            print(f"copy failed for {name}: {ex}"); return 1
         lock[name] = {"path": str(src), "installed": str(dst)}
         print(f"installed {name} -> {dst}")
-    (root / ".gamal" / "lock.json").write_text(json.dumps(lock, indent=2), encoding="utf-8")
+    lock_path.write_text(json.dumps(lock, indent=2), encoding="utf-8")
     return 0
 
 def _pkg_init(root: pathlib.Path) -> int:
@@ -870,6 +1007,7 @@ def pkg_main(argv: list[str]) -> int:
     root = pathlib.Path(argv[1]).resolve() if len(argv) > 1 else pathlib.Path.cwd()
     if action == "init": return _pkg_init(root)
     if action == "install": return _pkg_install(root)
+    if action == "update": return _pkg_install(root, update=True)
     if action == "list":
         cfg = root / "gamal.toml"
         if not cfg.exists(): print("no gamal.toml"); return 1
@@ -877,7 +1015,7 @@ def pkg_main(argv: list[str]) -> int:
         for name, spec in (data.get("dependencies") or {}).items():
             print("%s %s" % (name, spec))
         return 0
-    print("usage: gamal2.py pkg init|install|list [dir]"); return 2
+    print("usage: gamal2.py pkg init|install|update|list [dir]"); return 2
 
 # ------------------------------------------------------------------ CLI
 def main(argv=None):

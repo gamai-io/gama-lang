@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Minimal GAMA-L 2 language server (stdio JSON-RPC).
 
-Supports initialize, didOpen/didChange/didSave diagnostics, shutdown and exit.
-No completion/hover yet.
+Supports initialize, didOpen/didChange/didSave diagnostics, completion, hover,
+shutdown and exit.
 """
 from __future__ import annotations
 import json
+import re
 import sys
 import urllib.parse
 from pathlib import Path
@@ -49,13 +50,28 @@ def uri_path(uri: str) -> str:
         return uri
 
 
+def utf16_len(s: str) -> int:
+    return len(s.encode("utf-16-le")) // 2
+
+
+def utf16_to_index(line: str, col: int) -> int:
+    """Convert an LSP UTF-16 column to a Python character index."""
+    units = 0; i = 0
+    while i < len(line) and units < col:
+        units += 2 if ord(line[i]) > 0xFFFF else 1
+        i += 1
+    return i
+
+
 def diagnostics(uri: str, text: str):
     try:
         G.check(text)
         return []
     except G.GamaError as e:
         line = max(0, int(e.line or 1) - 1)
-        col = max(0, int(e.col or 1) - 1)
+        rows = (text or "").split("\n")
+        prefix = rows[line][:max(0, int(e.col or 1) - 1)] if line < len(rows) else ""
+        col = utf16_len(prefix)
         return [{
             "range": {"start": {"line": line, "character": col},
                       "end": {"line": line, "character": col + 1}},
@@ -74,6 +90,96 @@ def publish(uri: str, text: str):
           "params": {"uri": uri, "diagnostics": diagnostics(uri, text)}})
 
 
+
+# ---------------------------------------------------------------- features
+KIND_KEYWORD = 14
+KIND_FUNCTION = 3
+KIND_VARIABLE = 6
+
+NAME_RE = re.compile(r"\b(let|fn)\s+([A-Za-z_]\w*)")
+WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+# short human descriptions for builtins and keyword-like builtins
+DESCRIPTIONS = {
+    "sql": "`sql`: Runs a read-only SQL query and returns a Table.",
+    "ask": "`ask`: Asks the configured LLM endpoint and returns Text.",
+    "wait_user": "`wait_user`: Human-in-the-loop gate; returns Bool (Denied when non-interactive).",
+    "prove": "`prove`: Creates a proven value with a sha256 hash chain (`prove name = expr`).",
+    "verify": "`verify`: Verifies a proven value's hash chain; result in `_verify`.",
+    "print": "`print`: Prints a value to output.",
+    "sum": "`sum`: Sums the values of a column in a pipe.",
+    "count": "`count`: Counts rows in a pipe.",
+    "filter": "`filter`: Filters rows in a pipe by a condition.",
+    "select": "`select`: Projects columns in a pipe.",
+    "limit": "`limit`: Limits the number of rows in a pipe.",
+    "map": "`map`: Maps values in a pipe.",
+    "len": "`len`: Returns the length of a list or text as Int.",
+    "text": "`text`: Converts a value to Text.",
+    "number": "`number`: Converts a value to Decimal.",
+    "remember": "`remember`: Writes a key/value pair to memory.",
+    "recall": "`recall`: Reads a value from memory.",
+    "sql_write": "`sql_write`: Performs a SQL write; returns Bool.",
+    "mail": "`mail`: Sends mail through the mail effect; returns Bool.",
+}
+
+
+def doc_names(text: str):
+    """Return {name: kind} for let/fn declarations in the document."""
+    out = {}
+    for m in NAME_RE.finditer(text or ""):
+        out[m.group(2)] = m.group(1)
+    return out
+
+
+def completion(uri: str, text: str):
+    items = []
+    seen = set()
+    for kw in sorted(G.KEYWORDS):
+        if kw in seen:
+            continue
+        seen.add(kw)
+        items.append({"label": kw, "kind": KIND_KEYWORD})
+    for name in sorted(G.BUILTINS):
+        if name in seen:
+            continue
+        seen.add(name)
+        items.append({"label": name, "kind": KIND_FUNCTION})
+    for name in sorted(doc_names(text)):
+        if name in seen:
+            continue
+        seen.add(name)
+        items.append({"label": name, "kind": KIND_VARIABLE})
+    return {"isIncomplete": False, "items": items}
+
+
+def word_at(text: str, line: int, character: int):
+    lines = (text or "").split("\n")
+    if line < 0 or line >= len(lines):
+        return None
+    row = lines[line]
+    pos = utf16_to_index(row, max(0, character))
+    for m in WORD_RE.finditer(row):
+        if m.start() <= pos <= m.end():
+            return m.group(0)
+    return None
+
+
+def hover(uri: str, text: str, line: int, character: int):
+    name = word_at(text, line, character)
+    if not name:
+        return None
+    value = None
+    if name in DESCRIPTIONS:
+        value = DESCRIPTIONS[name]
+    elif name in doc_names(text):
+        value = "GAMA-L %s `%s`" % (doc_names(text)[name], name)
+    elif name in G.KEYWORDS:
+        value = "GAMA-L keyword `%s`" % name
+    if value is None:
+        return None
+    return {"contents": {"kind": "markdown", "value": value}}
+
+
 def main():
     docs: dict[str, str] = {}
     while True:
@@ -85,7 +191,11 @@ def main():
         params = msg.get("params") or {}
         if method == "initialize":
             send({"jsonrpc": "2.0", "id": mid, "result": {
-                "capabilities": {"textDocumentSync": 1},
+                "capabilities": {
+                    "textDocumentSync": 1,
+                    "completionProvider": {"triggerCharacters": [" ", "|", "."]},
+                    "hoverProvider": True,
+                },
                 "serverInfo": {"name": "gama-lsp", "version": "2.0-core"},
             }})
         elif method == "initialized":
@@ -97,12 +207,26 @@ def main():
         elif method in ("textDocument/didOpen", "textDocument/didChange", "textDocument/didSave"):
             td = params.get("textDocument") or {}
             uri = td.get("uri") or ""
-            text = td.get("text")
+            changes = params.get("contentChanges") or []
+            text = changes[-1].get("text") if changes else td.get("text")
             if text is None:
                 text = docs.get(uri, "")
             docs[uri] = text
             if uri:
                 publish(uri, text)
+        elif method == "textDocument/completion":
+            td = params.get("textDocument") or {}
+            uri = td.get("uri") or ""
+            text = docs.get(uri, td.get("text") or "")
+            send({"jsonrpc": "2.0", "id": mid, "result": completion(uri, text)})
+        elif method == "textDocument/hover":
+            td = params.get("textDocument") or {}
+            uri = td.get("uri") or ""
+            text = docs.get(uri, td.get("text") or "")
+            pos = params.get("position") or {}
+            line = int(pos.get("line") or 0)
+            ch = int(pos.get("character") or 0)
+            send({"jsonrpc": "2.0", "id": mid, "result": hover(uri, text, line, ch)})
         elif mid is not None:
             send({"jsonrpc": "2.0", "id": mid, "result": None})
 

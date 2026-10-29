@@ -112,7 +112,11 @@ class V2Tests(unittest.TestCase):
         try:
             it = G.run('prove p = {a:1}\nverify p\n')
             self.assertTrue(it.env.get('_verify')['ok'])
-            rec = it.proofs['p']; rec['value']['a'] = 2
+            rec = it.proofs['p']
+            os.environ.pop('GAMA_L_PROOF_KEY', None)
+            self.assertEqual(it.verify(rec)['errors'], ['missing_key'])
+            os.environ['GAMA_L_PROOF_KEY'] = 'test-key'
+            rec['value']['a'] = 2
             self.assertFalse(it.verify(rec)['ok'])
         finally:
             if old is None: os.environ.pop('GAMA_L_PROOF_KEY', None)
@@ -129,15 +133,42 @@ class V2Tests(unittest.TestCase):
         finally:
             if old is None: os.environ.pop('GAMA_L_DB', None)
             else: os.environ['GAMA_L_DB'] = old
+    def test_sqlite_schema_picks_query_table(self):
+        import os, sqlite3, tempfile, pathlib
+        db = pathlib.Path(tempfile.mkdtemp()) / 'x.db'
+        c = sqlite3.connect(db)
+        c.execute('create table kupci(konto int,naziv text)')
+        c.execute('create table fakture(broj int,iznos int)')
+        c.commit(); c.close()
+        old = os.environ.get('GAMA_L_DB'); os.environ['GAMA_L_DB'] = str(db)
+        try:
+            G.check('let r = sql("select * from kupci")\nlet s = r | select naziv\n')
+            with self.assertRaises(G.GamaTypeError):
+                G.check('let r = sql("select * from kupci")\nlet s = r | select broj\n')
+        finally:
+            if old is None: os.environ.pop('GAMA_L_DB', None)
+            else: os.environ['GAMA_L_DB'] = old
+    def test_unreadable_sql_schema_skips_columns(self):
+        import os, tempfile, pathlib
+        old = os.environ.get('GAMA_L_DB')
+        os.environ['GAMA_L_DB'] = str(pathlib.Path(tempfile.mkdtemp()) / 'missing.db')
+        try:
+            G.check('let r = sql("x")\nlet s = r | select anything_i_want\n')
+        finally:
+            if old is None: os.environ.pop('GAMA_L_DB', None)
+            else: os.environ['GAMA_L_DB'] = old
     def test_lsp_diagnostics(self):
         import subprocess, json
-        p = subprocess.Popen(['python3', 'gama-lang/v2/gamal2.py', 'lsp'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        import pathlib
+        exe = pathlib.Path(__file__).resolve().parents[1] / 'gamal2.py'
+        p = subprocess.Popen(['python3', str(exe), 'lsp'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         def send(o):
             b = json.dumps(o).encode(); p.stdin.write(b'Content-Length: %d\r\n\r\n' % len(b) + b); p.stdin.flush()
         def recv():
             h = {}
             while True:
                 l = p.stdout.readline()
+                if not l: raise RuntimeError('LSP closed stdout')
                 if l in (b'\r\n', b'\n'): break
                 k, _, v = l.decode().partition(':'); h[k.lower()] = v.strip()
             return json.loads(p.stdout.read(int(h['content-length'])))
@@ -152,16 +183,19 @@ class V2Tests(unittest.TestCase):
     def test_package_manager(self):
         import tempfile, pathlib
         root = pathlib.Path(tempfile.mkdtemp())
-        dep = root / 'math'; dep.mkdir()
-        (dep / 'lib.gm').write_text('fn add(a: Int, b: Int) -> Int effects {} { return a+b }\n')
         app = root / 'app'; app.mkdir()
-        (app / 'gamal.toml').write_text('[package]\nname = "app"\n[dependencies]\nmath = { path = "../math" }\n')
+        dep = app / 'math'; dep.mkdir()
+        (dep / 'lib.gm').write_text('fn add(a: Int, b: Int) -> Int effects {} { return a+b }\n')
+        (app / 'gamal.toml').write_text('[package]\nname = "app"\n[dependencies]\nmath = { path = "math" }\n')
         (app / 'main.gm').write_text('import "math/lib.gm"\nprint add(20,22)\n')
         import contextlib, io
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(G._pkg_install(app), 0)
         it = G.run_file(str(app / 'main.gm'))
         self.assertEqual(it.out, ['42'])
+        src = app / 'src'; src.mkdir()
+        (src / 'main.gm').write_text('import "math/lib.gm"\nprint add(20,22)\n')
+        self.assertEqual(G.run_file(str(src / 'main.gm')).out, ['42'])
     def test_fmt_idempotent(self):
         a = G.fmt_source('print 1   \n\n')
         self.assertEqual(G.fmt_source(a), a)

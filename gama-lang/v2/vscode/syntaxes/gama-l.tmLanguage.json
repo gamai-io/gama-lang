@@ -1,0 +1,113 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "GAMA-L",
+  "scopeName": "source.gama-l",
+  "fileTypes": [
+    "gm"
+  ],
+  "patterns": [
+    {
+      "name": "comment.line.number-sign.gama-l",
+      "match": "#.*$"
+    },
+    {
+      "name": "string.quoted.double.gama-l",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.gama-l",
+          "match": "\\\\."
+        }
+      ]
+    },
+    {
+      "name": "string.quoted.single.gama-l",
+      "begin": "'",
+      "end": "'",
+      "patterns": [
+        {
+          "name": "constant.character.escape.gama-l",
+          "match": "\\\\."
+        }
+      ]
+    },
+    {
+      "name": "constant.numeric.gama-l",
+      "match": "\\b\\d+(\\.\\d+)?\\b"
+    },
+    {
+      "name": "meta.pipe.gama-l",
+      "match": "(\\|)\\s*(filter|select|sum|limit|count|map)\\b",
+      "captures": {
+        "1": {
+          "name": "keyword.operator.pipe.gama-l"
+        },
+        "2": {
+          "name": "support.function.pipe-stage.gama-l"
+        }
+      }
+    },
+    {
+      "match": "(\\bfn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": {
+          "name": "keyword.control.fn.gama-l"
+        },
+        "2": {
+          "name": "entity.name.function.gama-l"
+        }
+      }
+    },
+    {
+      "match": "(\\blet)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": {
+          "name": "keyword.control.let.gama-l"
+        },
+        "2": {
+          "name": "variable.other.gama-l"
+        }
+      }
+    },
+    {
+      "match": "(\\bprove)\\s+([A-Za-z_][A-Za-z0-9_.]*)",
+      "captures": {
+        "1": {
+          "name": "keyword.control.prove.gama-l"
+        },
+        "2": {
+          "name": "entity.name.type.proof.gama-l"
+        }
+      }
+    },
+    {
+      "name": "constant.language.gama-l",
+      "match": "\\b(true|false|null)\\b"
+    },
+    {
+      "name": "support.type.gama-l",
+      "match": "\\b(Int|Decimal|Text|Bool|List|Table|Any)\\b"
+    },
+    {
+      "name": "support.function.builtin.gama-l",
+      "match": "\\b(sql|ask|wait_user|sql_write|mail|len|text|number)\\b"
+    },
+    {
+      "name": "keyword.control.gama-l",
+      "match": "\\b(let|fn|if|else|return|prove|verify|print|effects|filter|select|sum|limit|count|map|in|import)\\b"
+    },
+    {
+      "name": "keyword.operator.gama-l",
+      "match": "==|!=|<=|>=|&&|\\|\\||:=|->|\\||[+*/%!<>=]|-"
+    },
+    {
+      "name": "entity.name.function.call.gama-l",
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()"
+    },
+    {
+      "name": "punctuation.gama-l",
+      "match": "[{}()\\[\\],:;]"
+    }
+  ]
+}

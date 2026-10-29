@@ -1,0 +1,42 @@
+{
+  "name": "gama-l",
+  "displayName": "GAMA-L",
+  "description": "Syntax highlighting for the GAMA-L 2 language (.gm files).",
+  "version": "0.1.0",
+  "publisher": "gama",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "gama-l",
+        "aliases": [
+          "GAMA-L",
+          "gamal"
+        ],
+        "extensions": [
+          ".gm"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "gama-l",
+        "scopeName": "source.gama-l",
+        "path": "./syntaxes/gama-l.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "gama-l",
+        "path": "./snippets/gama-l.json"
+      }
+    ]
+  }
+}
