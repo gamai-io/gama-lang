@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import zipfile
 
 __all__ = ["ReleaseError", "build", "verify", "main"]
@@ -120,22 +121,94 @@ def _source_entries() -> list[tuple[str, pathlib.Path]]:
     return entries
 
 
-def _clean_dir(out_dir: pathlib.Path) -> None:
-    resolved = out_dir.resolve()
-    if resolved == PROJECT_ROOT.resolve() or resolved == PROJECT_ROOT.resolve().parent:
-        raise ReleaseError("refusing to use project/source directory as release output: %s" % out_dir)
-    if out_dir.exists() and ((out_dir / "pyproject.toml").exists() or (out_dir / "gamal2.py").exists()):
-        raise ReleaseError("refusing to clean a source directory: %s" % out_dir)
-    if out_dir.exists():
-        if out_dir.is_dir() and not out_dir.is_symlink():
-            for child in out_dir.iterdir():
+#: Names the release build itself writes into ``out_dir``.
+_KNOWN_RELEASE_NAMES = frozenset({"SHA256SUMS", "RELEASE.json"})
+#: Suffixes of artifacts the release build itself writes.
+_KNOWN_RELEASE_SUFFIXES = (".whl", ".tar.gz")
+
+
+def _validate_out_dir(out_dir: pathlib.Path) -> pathlib.Path:
+    """Return the resolved output path, refusing dangerous locations."""
+    raw = pathlib.Path(out_dir)
+    resolved = raw.expanduser().resolve()
+    root = PROJECT_ROOT.resolve()
+    home = pathlib.Path.home().resolve()
+
+    if resolved == pathlib.Path(resolved.anchor):
+        raise ReleaseError("refusing to use filesystem root as release output: %s" % resolved)
+    if resolved == home:
+        raise ReleaseError("refusing to use home directory as release output: %s" % resolved)
+    if any(".git" in part for part in resolved.parts):
+        raise ReleaseError("refusing to use a path containing .git as release output: %s" % resolved)
+    if resolved == root or root in resolved.parents or resolved in root.parents:
+        raise ReleaseError(
+            "refusing to use project/source directory as release output: %s" % out_dir
+        )
+    return resolved
+
+
+def _is_known_artifact(path: pathlib.Path) -> bool:
+    """True for a regular file the release build owns (wheel/sdist/checksums)."""
+    return (
+        path.is_file()
+        and not path.is_symlink()
+        and (path.name in _KNOWN_RELEASE_NAMES or path.name.endswith(_KNOWN_RELEASE_SUFFIXES))
+    )
+
+
+def _assert_cleanable(out_dir: pathlib.Path, force: bool = False) -> pathlib.Path:
+    """Validate ``out_dir`` and ensure it can be cleaned without data loss."""
+    raw = pathlib.Path(out_dir)
+    resolved = _validate_out_dir(raw)
+    if raw.is_symlink():
+        raise ReleaseError("refusing to clean a symlink: %s" % raw)
+    if not resolved.exists():
+        return resolved
+    if resolved.is_symlink():
+        raise ReleaseError("refusing to clean a symlink: %s" % resolved)
+    if not resolved.is_dir():
+        if not force:
+            raise ReleaseError(
+                "release output is a file; use --force to replace it: %s" % resolved
+            )
+        return resolved
+
+    children = list(resolved.iterdir())
+    if not children:
+        return resolved
+    unknown = sorted(child.name for child in children if not _is_known_artifact(child))
+    if unknown and not force:
+        raise ReleaseError(
+            "refusing to delete unknown entries in %s: %s (use --force)"
+            % (resolved, ", ".join(unknown))
+        )
+    return resolved
+
+
+def _clean_dir(out_dir: pathlib.Path, force: bool = False) -> None:
+    """Prepare ``out_dir`` for a release, deleting only owned or forced entries."""
+    resolved = _assert_cleanable(out_dir, force=force)
+    if resolved.exists():
+        if resolved.is_symlink():
+            raise ReleaseError("refusing to clean a symlink: %s" % resolved)
+        if resolved.is_dir():
+            for child in resolved.iterdir():
+                if not force and not _is_known_artifact(child):
+                    raise ReleaseError(
+                        "refusing to delete unknown entry in %s: %s"
+                        % (resolved, child.name)
+                    )
                 if child.is_dir() and not child.is_symlink():
                     shutil.rmtree(child)
                 else:
                     child.unlink()
         else:
-            out_dir.unlink()
-    out_dir.mkdir(parents=True, exist_ok=True)
+            if not force:
+                raise ReleaseError(
+                    "release output is a file; use --force to replace it: %s" % resolved
+                )
+            resolved.unlink()
+    resolved.mkdir(parents=True, exist_ok=True)
 
 
 def _pip_env() -> dict:
@@ -232,50 +305,67 @@ def _now() -> str:
 
 
 # --------------------------------------------------------------------------- API
-def build(out_dir: pathlib.Path) -> dict:
-    """Build wheel + deterministic sdist + SHA256SUMS + RELEASE.json."""
-    out_dir = pathlib.Path(out_dir)
+def build(out_dir: pathlib.Path, force: bool = False) -> dict:
+    """Build wheel + deterministic sdist + SHA256SUMS + RELEASE.json.
+
+    The artifacts are produced in a temporary staging directory and moved into
+    ``out_dir`` only after the whole build succeeds, so a failed build never
+    destroys an existing release.  Unknown files in ``out_dir`` are refused
+    unless ``force`` is true; known release artifacts may be replaced.
+    """
+    out_dir = _validate_out_dir(pathlib.Path(out_dir))
+    _assert_cleanable(out_dir, force=force)
     name = _name()
     version = _version()
     junk_before = {p.name for p in PROJECT_ROOT.glob("build")}
     junk_before |= {p.name for p in PROJECT_ROOT.glob("*.egg-info")}
 
-    _clean_dir(out_dir)
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging = pathlib.Path(
+        tempfile.mkdtemp(prefix=".gama-release-", dir=str(out_dir.parent))
+    )
     try:
-        wheel = _wheel(out_dir)
-        sdist = _sdist(out_dir, name, version)
+        try:
+            wheel = _wheel(staging)
+            sdist = _sdist(staging, name, version)
+        finally:
+            _cleanup_build_junk(junk_before)
+
+        files = []
+        for path in (wheel, sdist):
+            files.append({
+                "name": path.name,
+                "sha256": _sha256(path),
+                "size": path.stat().st_size,
+            })
+
+        stamp = _now()
+        manifest = {
+            "name": name,
+            "version": version,
+            "python": "%d.%d.%d" % sys.version_info[:3],
+            "built_at": stamp,
+            "build_time": stamp,
+            "files": files,
+            "sha256": {entry["name"]: entry["sha256"] for entry in files},
+        }
+
+        sums_path = staging / "SHA256SUMS"
+        sums_path.write_text(
+            "".join("%s  %s\n" % (entry["sha256"], entry["name"]) for entry in files),
+            encoding="utf-8",
+        )
+        release_path = staging / "RELEASE.json"
+        release_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+        _clean_dir(out_dir, force=force)
+        for child in sorted(staging.iterdir()):
+            os.replace(str(child), str(out_dir / child.name))
     finally:
-        _cleanup_build_junk(junk_before)
-
-    files = []
-    for path in (wheel, sdist):
-        files.append({
-            "name": path.name,
-            "sha256": _sha256(path),
-            "size": path.stat().st_size,
-        })
-
-    stamp = _now()
-    manifest = {
-        "name": name,
-        "version": version,
-        "python": "%d.%d.%d" % sys.version_info[:3],
-        "built_at": stamp,
-        "build_time": stamp,
-        "files": files,
-        "sha256": {entry["name"]: entry["sha256"] for entry in files},
-    }
-
-    sums_path = out_dir / "SHA256SUMS"
-    sums_path.write_text(
-        "".join("%s  %s\n" % (entry["sha256"], entry["name"]) for entry in files),
-        encoding="utf-8",
-    )
-    release_path = out_dir / "RELEASE.json"
-    release_path.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
+        shutil.rmtree(staging, ignore_errors=True)
 
     return {
         "ok": True,
@@ -317,6 +407,21 @@ def _check_sdist(path: pathlib.Path, errors: list[str]) -> None:
             errors.append("sdist missing module: %s" % module)
 
 
+def _safe_member(out_dir: pathlib.Path, name: str) -> pathlib.Path | None:
+    """Resolve a manifest file name, refusing anything outside ``out_dir``."""
+    if not isinstance(name, str) or not name:
+        return None
+    relative = pathlib.PurePosixPath(name)
+    if relative.is_absolute() or ".." in relative.parts:
+        return None
+    candidate = (out_dir / name).resolve()
+    try:
+        candidate.relative_to(out_dir.resolve())
+    except ValueError:
+        return None
+    return candidate
+
+
 def verify(out_dir: pathlib.Path) -> dict:
     """Verify hashes recorded in RELEASE.json plus archive contents."""
     out_dir = pathlib.Path(out_dir)
@@ -348,14 +453,17 @@ def verify(out_dir: pathlib.Path) -> dict:
             continue
         fname = entry.get("name")
         expected = entry.get("sha256")
-        if not fname or not expected:
+        if not isinstance(fname, str) or not fname or not isinstance(expected, str) or not expected:
             errors.append("file entry without name/sha256: %r" % (entry,))
             continue
         if fname in seen:
             errors.append("duplicate file entry: %s" % fname)
             continue
         seen.add(fname)
-        path = out_dir / fname
+        path = _safe_member(out_dir, fname)
+        if path is None:
+            errors.append("file entry escapes out_dir: %s" % fname)
+            continue
         if not path.is_file():
             errors.append("missing file: %s" % fname)
             continue
@@ -398,14 +506,23 @@ def main(argv=None) -> int:
     )
     sub = parser.add_subparsers(dest="command", required=True)
     build_parser = sub.add_parser("build", help="build wheel, sdist and checksums")
-    build_parser.add_argument("--out", default="dist", help="output directory")
+    build_parser.add_argument(
+        "--out", default="dist",
+        help="output directory (must be outside the package source tree)",
+    )
+    build_parser.add_argument(
+        "--force", action="store_true",
+        help="replace unknown files and non-empty output directories",
+    )
     verify_parser = sub.add_parser("verify", help="verify an existing release directory")
     verify_parser.add_argument("--out", default="dist", help="release directory")
     args = parser.parse_args(argv)
 
     out = pathlib.Path(args.out).expanduser().resolve()
     try:
-        result = build(out) if args.command == "build" else verify(out)
+        result = (
+            build(out, force=args.force) if args.command == "build" else verify(out)
+        )
     except ReleaseError as exc:
         result = {"ok": False, "errors": [str(exc)]}
     except OSError as exc:

@@ -52,9 +52,12 @@ python3 gamal2.py lsp
 JSON-RPC language server: `initialize`, `didOpen/didChange/didSave`
 diagnostics, completion, hover, definition, references, document symbols,
 semantic tokens, code actions, rename, document formatting, `shutdown`,
-`exit`. Positions are converted between LSP
+`exit`. Malformed frames return a JSON-RPC error and no longer kill the
+server; multiline strings keep correct line/column positions. Positions are converted between LSP
 UTF-16 and Python indexes. A syntax-only VS Code package is in `vscode/`
-(TextMate grammar + snippets + a dependency-free LSP client).
+(TextMate grammar + snippets + a dependency-free LSP client). The extension
+requires a trusted workspace before spawning Python, supports `gama-lsp` from
+PATH or a configured script, and restarts with bounded backoff.
 
 ## Distribution
 
@@ -99,7 +102,7 @@ python3 gamal2.py fmt --write file.gm  # write in place
 - guarded SMTP `mail` (needs `GAMA_L_MAIL_ENABLED=1`; config via `GAMA_L_SMTP_*`)
 - `ask` uses `gama_ai` when `GAMA_L_AI_URL` is set; config via `GAMA_L_AI_KEY`,
   `GAMA_L_AI_MODEL`, `GAMA_L_AI_ALLOW_HTTP=1` for local HTTP; HTTPS by default,
-  retries 429/5xx, 1 MiB response cap
+  retries 429/5xx, 1 MiB response cap; redirects are refused
 - `prove` (hash-chained receipt, optional HMAC via `GAMA_L_PROOF_KEY`) and `verify` (tamper detection)
 - static type errors and static effect violations
 - CLI `run`, `check`, `fmt`, `test`, `pkg`, `lsp`
@@ -107,7 +110,7 @@ python3 gamal2.py fmt --write file.gm  # write in place
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 171/171
+python3 -m unittest discover -s tests -v   # 198/198
 ```
 
 Conformance coverage: arithmetic/pipes (20 cases), type errors, effect
@@ -123,7 +126,11 @@ metadata.
 ## Not implemented yet
 
 - deployed/public package registry (the HTTP server is implemented and testable)
-- full type inference and generics
+- normative SPEC syntax (`make`, `ask … with`, `remember a.b`, `wait user`, `use`) — current parser implements a smaller dialect
+- `Result`/`Ok`/`Err` errors-as-values and namespace/export modules
+- `for`/`while`/`match`, indexing, lambdas/first-class functions
+- persistent proof chain bound to intent/lease; IR/bytecode and runtime limits
+- full type inference, records/enums/generics
 - full AST formatter (current `fmt` is token-based, preserves comments and
   strings, but does not reformat multi-line strings)
 - Marketplace packaging/signing for the VS Code extension

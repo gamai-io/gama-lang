@@ -23,6 +23,12 @@ import subprocess
 import sys
 import urllib.parse
 import urllib.request
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect())
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -82,6 +88,9 @@ def lex(src: str) -> list[Tok]:
                     esc = src[i+1]
                     buf.append({"n":"\n","t":"\t","\\":"\\",'"':'"',"'":"'"}.get(esc, esc))
                     i += 2; col += 2
+                elif src[i] == "\n":
+                    # Multiline string: newline advances the line and resets col.
+                    buf.append("\n"); i += 1; line += 1; col = 1
                 else:
                     buf.append(src[i]); i += 1; col += 1
             if i >= n: raise GamaError("unterminated string", *start)
@@ -846,7 +855,7 @@ class Interpreter:
                 if key: headers["Authorization"] = "Bearer " + key
                 try:
                     req = urllib.request.Request(url.rstrip("/") + "/v1/chat/completions", data=body, headers=headers)
-                    with urllib.request.urlopen(req, timeout=60) as r:
+                    with _NO_REDIRECT_OPENER.open(req, timeout=60) as r:
                         d = json.loads(r.read(1 << 20).decode())
                     self.last_ask = {"model": model, "prompt_hash": hashlib.sha256(p.encode()).hexdigest()}
                     return d["choices"][0]["message"]["content"]

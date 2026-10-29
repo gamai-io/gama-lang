@@ -2,10 +2,22 @@
   "name": "gama-l",
   "displayName": "GAMA-L",
   "description": "Syntax highlighting and LSP diagnostics for the GAMA-L 2 language (.gm files).",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "gama",
   "license": "MIT",
   "main": "./extension.js",
+  "extensionKind": [
+    "workspace"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "restrictedConfigurations": [
+        "gama-l.pythonPath",
+        "gama-l.serverScript"
+      ]
+    }
+  },
   "engines": {
     "vscode": "^1.80.0"
   },
@@ -55,12 +67,12 @@
         "gama-l.pythonPath": {
           "type": "string",
           "default": "python3",
-          "description": "Python interpreter used to start the GAMA-L language server."
+          "description": "Python interpreter used to start the GAMA-L language server. Falls back to python/py when python3 is not found."
         },
         "gama-l.serverScript": {
           "type": "string",
-          "default": "${workspaceFolder}/gama-lang/v2/gamal2.py",
-          "description": "Path to gamal2.py. ${workspaceFolder} is expanded to the first workspace folder."
+          "default": "",
+          "description": "Path to gamal2.py. Leave empty to auto-detect: uses the gama-lsp command on PATH, then gamal2.py next to this extension. ${workspaceFolder} is expanded to the first workspace folder."
         }
       }
     }

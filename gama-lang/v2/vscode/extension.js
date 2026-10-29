@@ -9,6 +9,10 @@ const LANG_ID = 'gama-l';
 const CLIENT_NAME = 'gama-l-vscode';
 const CLIENT_VERSION = '0.2.0';
 
+// Automatic restarts after an unexpected exit: delays grow, total is capped.
+const RESTART_DELAYS_MS = [1000, 2000, 4000];
+const MAX_RESTARTS = 3;
+
 // ---------------------------------------------------------------- JSON-RPC framing
 
 function findHeaderEnd(buf) {
@@ -65,12 +69,68 @@ function createStreamParser(onMessage) {
 
 // ---------------------------------------------------------------- helpers
 
+function firstWorkspaceFolder() {
+  const folders = vscode.workspace.workspaceFolders;
+  return folders && folders.length ? folders[0] : null;
+}
+
 function expandWorkspaceFolder(p) {
   if (!p) return p;
-  const folder = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0];
   if (p.indexOf('${workspaceFolder}') === -1) return p;
+  const folder = firstWorkspaceFolder();
   if (!folder) return p.replace(/\$\{workspaceFolder\}/g, '');
   return p.replace(/\$\{workspaceFolder\}/g, folder.uri.fsPath);
+}
+
+function isExecutableFile(p) {
+  try {
+    if (!fs.statSync(p).isFile()) return false;
+    fs.accessSync(p, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolve a bare command (e.g. "gama-lsp") against PATH.
+ * On Windows PATHEXT extensions are tried as well.
+ */
+function findInPath(name) {
+  if (!name || name.indexOf('/') !== -1 || name.indexOf('\\') !== -1) return null;
+  const envPath = process.env.PATH || process.env.Path || '';
+  if (!envPath) return null;
+  const sep = process.platform === 'win32' ? ';' : ':';
+  const isWin = process.platform === 'win32';
+  const hasExt = isWin && /\.[a-z0-9]+$/i.test(name);
+  const exts = isWin
+    ? (process.env.PATHEXT || '.EXE;.CMD;.BAT')
+        .split(';')
+        .map((e) => e.trim())
+        .filter(Boolean)
+    : [''];
+  const names = hasExt ? [name] : exts.map((e) => name + e);
+  for (const dir of envPath.split(sep)) {
+    if (!dir) continue;
+    for (const candidate of names) {
+      const full = path.join(dir, candidate);
+      if (isExecutableFile(full)) return full;
+    }
+  }
+  return null;
+}
+
+function interpreterCandidates(preferred) {
+  const list = [];
+  const add = (value) => {
+    const v = (value || '').trim();
+    if (v && list.indexOf(v) === -1) list.push(v);
+  };
+  add(preferred);
+  add('python3');
+  add('python');
+  add('py');
+  return list;
 }
 
 function toSeverity(value) {
@@ -112,6 +172,31 @@ function toDiagnostic(item) {
   return diagnostic;
 }
 
+function failedCheckNames(result) {
+  if (!result || typeof result !== 'object') return [];
+  if (Array.isArray(result.checks)) {
+    return result.checks
+      .filter((c) => c && c.ok === false)
+      .map((c) => (typeof c.name === 'string' && c.name ? c.name : 'unknown'));
+  }
+  const legacy = result.failed;
+  if (Array.isArray(legacy)) return legacy.map(String);
+  if (typeof legacy === 'string' && legacy.trim()) {
+    return legacy
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
+function passedCheckCount(result) {
+  if (!result || !Array.isArray(result.checks)) return null;
+  const total = result.checks.length;
+  const passed = result.checks.filter((c) => c && c.ok === true).length;
+  return { passed, total };
+}
+
 // ---------------------------------------------------------------- client
 
 class GamaLspClient {
@@ -125,9 +210,14 @@ class GamaLspClient {
     this._nextId = 1;
     this._debounce = new Map();
     this._warned = false;
+    this._trustNotified = false;
     this._stopping = false;
     this._opened = new Set();
     this._disposables = [];
+    this._candidates = [];
+    this._candidateIndex = 0;
+    this._restartAttempts = 0;
+    this._restartTimer = null;
   }
 
   readConfig() {
@@ -136,44 +226,152 @@ class GamaLspClient {
     const rawScript = cfg.get('serverScript') || '';
     let serverScript = expandWorkspaceFolder(String(rawScript).trim());
     if (serverScript && !path.isAbsolute(serverScript)) {
-      const folder = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0];
+      const folder = firstWorkspaceFolder();
       const base = folder ? folder.uri.fsPath : this._context.extensionPath;
       serverScript = path.resolve(base, serverScript);
     }
     return { pythonPath, serverScript };
   }
 
-  warnOnce(message) {
+  warnOnce(message, ...actions) {
     if (this._warned) return;
     this._warned = true;
-    vscode.window.showWarningMessage(message);
+    return Promise.resolve(vscode.window.showWarningMessage(message, ...actions));
+  }
+
+  /**
+   * Workspace Trust gate: never spawn a server (or a workspace script) in an
+   * untrusted workspace. Explains once and offers the two ways forward.
+   */
+  ensureTrusted() {
+    if (vscode.workspace.isTrusted) return true;
+    if (this._trustNotified) return false;
+    this._trustNotified = true;
+    this._out.appendLine('[trust] workspace is not trusted; language server not started');
+    Promise.resolve(
+      vscode.window.showWarningMessage(
+        'GAMA-L: this workspace is not trusted, so the GAMA-L language server was not started. ' +
+          'Trust the workspace to enable diagnostics, or configure the server in settings.',
+        'Manage Trust',
+        'Open Settings'
+      )
+    ).then((choice) => {
+      try {
+        if (choice === 'Manage Trust') {
+          vscode.commands.executeCommand('workbench.trust.manage');
+        } else if (choice === 'Open Settings') {
+          vscode.commands.executeCommand('workbench.action.openSettings', 'gama-l');
+        }
+      } catch {
+        /* command may not exist in older hosts */
+      }
+    });
+    return false;
+  }
+
+  /**
+   * Decide how to launch, in order:
+   *   1. gama-l.serverScript set  -> pythonPath [script, "lsp"] (with interpreter fallback)
+   *   2. gama-lsp on PATH        -> gama-lsp
+   *   3. <extensionPath>/../gamal2.py -> pythonPath [script, "lsp"]
+   *   4. nothing                 -> warning with Open Settings
+   */
+  resolveLaunchOptions() {
+    const { pythonPath, serverScript } = this.readConfig();
+    const folder = firstWorkspaceFolder();
+    const workspaceCwd = folder ? folder.uri.fsPath : undefined;
+
+    if (serverScript) {
+      if (!fs.existsSync(serverScript)) {
+        return { warning: 'GAMA-L: server script not found: ' + serverScript };
+      }
+      return {
+        candidates: interpreterCandidates(pythonPath).map((cmd) => ({
+          cmd,
+          args: [serverScript, 'lsp'],
+          cwd: path.dirname(serverScript),
+        })),
+      };
+    }
+
+    const lsp = findInPath('gama-lsp');
+    if (lsp) {
+      return { candidates: [{ cmd: lsp, args: [], cwd: workspaceCwd }] };
+    }
+
+    const bundled = path.resolve(this._context.extensionPath, '..', 'gamal2.py');
+    if (fs.existsSync(bundled)) {
+      return {
+        candidates: interpreterCandidates(pythonPath).map((cmd) => ({
+          cmd,
+          args: [bundled, 'lsp'],
+          cwd: path.dirname(bundled),
+        })),
+      };
+    }
+
+    return {
+      warning:
+        'GAMA-L: no language server found. Set "gama-l.serverScript" to gamal2.py ' +
+        'or install the "gama-lsp" command on PATH.',
+    };
   }
 
   start() {
     this.stop();
     this._stopping = false;
+    this._warned = false;
 
-    const { pythonPath, serverScript } = this.readConfig();
-    if (!serverScript) {
-      this.warnOnce('GAMA-L: "gama-l.serverScript" is empty. Set it to the path of gamal2.py.');
+    if (!this.ensureTrusted()) return;
+
+    const resolved = this.resolveLaunchOptions();
+    if (resolved.warning) {
+      this.warnOnce(resolved.warning, 'Open Settings').then((choice) => {
+        if (choice === 'Open Settings') {
+          vscode.commands.executeCommand('workbench.action.openSettings', 'gama-l');
+        }
+      });
       return;
     }
-    if (!fs.existsSync(serverScript)) {
-      this.warnOnce('GAMA-L: server script not found: ' + serverScript);
+
+    this._candidates = resolved.candidates;
+    this._candidateIndex = 0;
+    this.launch();
+  }
+
+  launch() {
+    const candidate = this._candidates[this._candidateIndex];
+    if (!candidate) {
+      this.warnOnce(
+        'GAMA-L: could not start the language server. Check "gama-l.pythonPath" and that ' +
+          'Python 3.10+ (or the "gama-lsp" command) is installed.'
+      );
       return;
     }
 
-    this._out.appendLine('[start] ' + pythonPath + ' ' + serverScript + ' lsp');
+    this._out.appendLine(
+      '[start] ' + candidate.cmd + ' ' + candidate.args.join(' ') +
+        (candidate.cwd ? '  (cwd=' + candidate.cwd + ')' : '')
+    );
 
     let proc;
     try {
-      proc = cp.spawn(pythonPath, [serverScript, 'lsp'], {
+      proc = cp.spawn(candidate.cmd, candidate.args, {
         stdio: ['pipe', 'pipe', 'pipe'],
-        cwd: path.dirname(serverScript),
+        cwd: candidate.cwd,
         windowsHide: true,
+        // Windows cannot CreateProcess a .cmd/.bat shim directly (pip installs
+        // console scripts that way); use the shell for those only.
+        shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(candidate.cmd),
       });
     } catch (err) {
-      this.warnOnce('GAMA-L: could not start language server: ' + String(err && err.message));
+      this._out.appendLine('[spawn] ' + String(err && err.message));
+      this.nextCandidate();
+      return;
+    }
+
+    if (!proc) {
+      this.nextCandidate();
       return;
     }
 
@@ -190,34 +388,96 @@ class GamaLspClient {
     });
 
     proc.on('error', (err) => {
+      const code = err && err.code;
       this._out.appendLine('[error] ' + String(err && err.message));
+      // ENOENT -> try the next interpreter (python3 -> python -> py).
+      if (code === 'ENOENT' && this._candidateIndex + 1 < this._candidates.length) {
+        proc._gamaTerminated = true;
+        this.nextCandidate();
+        return;
+      }
       this.warnOnce(
         'GAMA-L: language server failed to start (' +
-          pythonPath +
+          candidate.cmd +
           '). Check "gama-l.pythonPath" and that Python 3.10+ is installed.'
       );
-      this.onExit(proc);
+      this.onProcessTerminated(proc, null, null);
     });
 
-    proc.on('exit', (code, signal) => {
-      this._out.appendLine('[exit] code=' + code + ' signal=' + signal);
-      if (!this._stopping) {
-        this.warnOnce(
-          'GAMA-L: language server stopped unexpectedly (exit ' +
-            code +
-            '). Diagnostics are disabled until the window reloads.'
-        );
-      }
-      this.onExit(proc);
-    });
+    // Both exit and close are handled, guarded so a restart is scheduled once.
+    proc.on('exit', (code, signal) => this.onProcessTerminated(proc, code, signal));
+    proc.on('close', (code, signal) => this.onProcessTerminated(proc, code, signal));
 
     this._out.appendLine('[server] started, pid=' + proc.pid);
     this.initialize();
   }
 
+  nextCandidate() {
+    this._candidateIndex += 1;
+    this._proc = null;
+    this._parser = null;
+    if (this._candidateIndex < this._candidates.length) {
+      this.launch();
+      return;
+    }
+    this.warnOnce(
+      'GAMA-L: could not start the language server. Check "gama-l.pythonPath" and that ' +
+        'Python 3.10+ is installed.'
+    );
+  }
+
+  onProcessTerminated(proc, code, signal) {
+    if (!proc || proc._gamaTerminated) return;
+    proc._gamaTerminated = true;
+
+    this._out.appendLine('[exit] code=' + code + ' signal=' + signal);
+
+    const intentional = !!proc._gamaIntentional || this._stopping || this._proc !== proc;
+    this.onExit(proc);
+    if (intentional) return;
+
+    this.scheduleRestart(code, signal);
+  }
+
+  scheduleRestart(code, signal) {
+    if (this._restartAttempts >= MAX_RESTARTS) {
+      vscode.window
+        .showWarningMessage(
+          'GAMA-L: language server stopped ' + MAX_RESTARTS +
+            ' times in a row (last exit ' + code + '). Giving up until the window reloads; ' +
+            'check "gama-l.serverScript"/"gama-l.pythonPath".',
+          'Open Settings'
+        )
+        .then((choice) => {
+          if (choice === 'Open Settings') {
+            vscode.commands.executeCommand('workbench.action.openSettings', 'gama-l');
+          }
+        });
+      return;
+    }
+
+    if (this._restartTimer) return;
+
+    const delay = RESTART_DELAYS_MS[Math.min(this._restartAttempts, RESTART_DELAYS_MS.length - 1)];
+    this._restartAttempts += 1;
+    this._out.appendLine(
+      '[restart] scheduled in ' + delay + 'ms (attempt ' + this._restartAttempts + '/' + MAX_RESTARTS + ')'
+    );
+    vscode.window.showWarningMessage(
+      'GAMA-L: language server stopped unexpectedly (exit ' + code + '). Restarting in ' +
+        delay / 1000 + 's (attempt ' + this._restartAttempts + '/' + MAX_RESTARTS + ').'
+    );
+
+    this._restartTimer = setTimeout(() => {
+      this._restartTimer = null;
+      this.start();
+    }, delay);
+  }
+
   onExit(proc) {
     if (this._proc !== proc) return;
     this._proc = null;
+    this._parser = null;
     this._opened.clear();
     for (const [, entry] of this._pending) {
       clearTimeout(entry.timer);
@@ -227,7 +487,7 @@ class GamaLspClient {
   }
 
   initialize() {
-    const folder = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0];
+    const folder = firstWorkspaceFolder();
     this.request('initialize', {
       processId: process.pid,
       clientInfo: { name: CLIENT_NAME, version: CLIENT_VERSION },
@@ -242,7 +502,10 @@ class GamaLspClient {
         },
       },
     })
-      .then(() => {
+      .then((result) => {
+        if (result === null) return;
+        // The server answered: this launch is healthy, so future crashes get a full budget.
+        this._restartAttempts = 0;
         this.notify('initialized', {});
         this.openVisibleDocuments();
       })
@@ -403,6 +666,7 @@ class GamaLspClient {
     const proc = this._proc;
     if (!proc) return;
     this._stopping = true;
+    proc._gamaIntentional = true;
     this.request('shutdown', null, 1500).then(() => {
       this.notify('exit', null);
       setTimeout(() => {
@@ -416,18 +680,26 @@ class GamaLspClient {
   }
 
   stop() {
+    this._stopping = true;
+    if (this._restartTimer) {
+      clearTimeout(this._restartTimer);
+      this._restartTimer = null;
+    }
     for (const timer of this._debounce.values()) clearTimeout(timer);
     this._debounce.clear();
-    if (this._proc) {
+    const proc = this._proc;
+    this._proc = null;
+    this._parser = null;
+    this._opened.clear();
+    if (proc) {
+      // Mark before kill so the exit/close handler does not report "unexpected".
+      proc._gamaIntentional = true;
       try {
-        this._proc.kill();
+        proc.kill();
       } catch {
         /* ignore */
       }
     }
-    this._proc = null;
-    this._parser = null;
-    this._opened.clear();
   }
 
   restart() {
@@ -465,17 +737,49 @@ class GamaLspClient {
 // ---------------------------------------------------------------- doctor
 
 function runDoctor(client) {
+  if (!client.ensureTrusted()) return;
+
   const { pythonPath, serverScript } = client.readConfig();
-  if (!serverScript || !fs.existsSync(serverScript)) {
-    vscode.window.showErrorMessage(
-      'GAMA-L doctor failed: server script not found (' + (serverScript || 'empty') + ')'
-    );
-    return;
+  const folder = firstWorkspaceFolder();
+  let cmd;
+  let args;
+  let cwd;
+
+  if (serverScript) {
+    if (!fs.existsSync(serverScript)) {
+      vscode.window.showErrorMessage(
+        'GAMA-L doctor failed: server script not found (' + serverScript + ')'
+      );
+      return;
+    }
+    cmd = pythonPath;
+    args = [serverScript, 'doctor', '--json'];
+    cwd = path.dirname(serverScript);
+  } else {
+    const cli = findInPath('gama-l');
+    if (!cli) {
+      vscode.window
+        .showWarningMessage(
+          'GAMA-L doctor: "gama-l.serverScript" is not set and the "gama-l" command was not ' +
+            'found on PATH. Set "gama-l.serverScript" to gamal2.py.',
+          'Open Settings'
+        )
+        .then((choice) => {
+          if (choice === 'Open Settings') {
+            vscode.commands.executeCommand('workbench.action.openSettings', 'gama-l');
+          }
+        });
+      return;
+    }
+    cmd = cli;
+    args = ['doctor', '--json'];
+    cwd = folder ? folder.uri.fsPath : undefined;
   }
+
   cp.execFile(
-    pythonPath,
-    [serverScript, 'doctor', '--json'],
-    { timeout: 60000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 },
+    cmd,
+    args,
+    { timeout: 60000, windowsHide: true, maxBuffer: 8 * 1024 * 1024, cwd },
     (err, stdout, stderr) => {
       const raw = String(stdout || '').trim();
       let parsed = null;
@@ -494,15 +798,16 @@ function runDoctor(client) {
       }
 
       if (parsed && typeof parsed === 'object') {
-        const ok = parsed.ok === true;
-        if (ok) {
-          vscode.window.showInformationMessage('GAMA-L doctor: ok = true');
-        } else {
-          let failed = parsed.failed;
-          if (Array.isArray(failed)) failed = failed.join(', ');
-          if (typeof failed !== 'string' || !failed.trim()) failed = 'see details';
-          vscode.window.showWarningMessage('GAMA-L doctor: ok = false — failed: ' + failed);
+        if (parsed.ok === true) {
+          const counts = passedCheckCount(parsed);
+          const suffix = counts ? ' (' + counts.passed + '/' + counts.total + ' checks)' : '';
+          vscode.window.showInformationMessage('GAMA-L doctor: ok = true' + suffix);
+          return;
         }
+        const failed = failedCheckNames(parsed);
+        vscode.window.showWarningMessage(
+          'GAMA-L doctor: ok = false — failed: ' + (failed.length ? failed.join(', ') : 'see details')
+        );
         return;
       }
 

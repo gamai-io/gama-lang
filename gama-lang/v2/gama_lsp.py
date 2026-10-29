@@ -14,26 +14,59 @@ from pathlib import Path
 
 import gamal2 as G
 
+# Framing limits: reject absurd frames instead of buffering them.
+MAX_HEADER_BYTES = 16 * 1024 * 1024
+MAX_BODY_BYTES = 16 * 1024 * 1024
+
+# Sentinel returned only on a real end of input (not on malformed frames).
+EOF = object()
+
+
+class FramingError(Exception):
+    """A malformed JSON-RPC frame; the loop reports it and keeps running."""
+
 
 def read_msg():
+    """Read one JSON-RPC frame.
+
+    Returns the decoded message, or the ``EOF`` sentinel on real end of input.
+    Raises ``FramingError`` for malformed headers/body; callers must report the
+    error and continue reading instead of treating it as end of stream.
+    """
     headers = {}
+    header_bytes = 0
     while True:
         line = sys.stdin.buffer.readline()
         if not line:
-            return None
+            return EOF
+        header_bytes += len(line)
+        if header_bytes > MAX_HEADER_BYTES:
+            raise FramingError("header section exceeds %d bytes" % MAX_HEADER_BYTES)
         if line in (b"\r\n", b"\n"):
             break
-        k, _, v = line.decode("ascii", "replace").partition(":")
+        k, sep, v = line.decode("ascii", "replace").partition(":")
+        if not sep:
+            # Not a header line: ignore garbage until the blank separator.
+            continue
         headers[k.strip().lower()] = v.strip()
+    raw_len = headers.get("content-length")
+    if raw_len is None:
+        raise FramingError("missing Content-Length header")
     try:
-        n = int(headers.get("content-length", "0"))
-    except ValueError:
-        return None
+        n = int(raw_len)
+    except (TypeError, ValueError):
+        raise FramingError("invalid Content-Length: %r" % raw_len)
+    if n < 0:
+        raise FramingError("negative Content-Length: %d" % n)
+    if n > MAX_BODY_BYTES:
+        raise FramingError("body exceeds %d bytes" % MAX_BODY_BYTES)
     body = sys.stdin.buffer.read(n)
+    if len(body) != n:
+        raise FramingError("truncated body: expected %d bytes, got %d" % (n, len(body)))
     try:
         return json.loads(body.decode("utf-8"))
-    except Exception:
-        return None
+    except Exception as ex:
+        raise FramingError("invalid JSON body: %s" % ex)
 
 
 def send(obj):
@@ -41,6 +74,17 @@ def send(obj):
     sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(data))
     sys.stdout.buffer.write(data)
     sys.stdout.buffer.flush()
+
+
+def send_error(mid, code, message):
+    """Send a JSON-RPC error response (id may be None for parse errors)."""
+    send({"jsonrpc": "2.0", "id": mid,
+          "error": {"code": code, "message": message}})
+
+
+def _obj(value):
+    """Return ``value`` if it is a dict, else an empty dict."""
+    return value if isinstance(value, dict) else {}
 
 
 def uri_path(uri: str) -> str:
@@ -69,13 +113,18 @@ def diagnostics(uri: str, text: str):
         G.check(text)
         return []
     except G.GamaError as e:
+        rows = (text or "").split("\n") or [""]
         line = max(0, int(e.line or 1) - 1)
-        rows = (text or "").split("\n")
-        prefix = rows[line][:max(0, int(e.col or 1) - 1)] if line < len(rows) else ""
-        col = utf16_len(prefix)
+        # Clamp to the last line: EOF/unterminated errors can point past it.
+        line = min(line, len(rows) - 1)
+        row = rows[line]
+        char_index = min(max(0, int(e.col or 1) - 1), len(row))
+        line_len = utf16_len(row)
+        col = min(utf16_len(row[:char_index]), line_len)
+        end_col = min(col + 1, line_len)
         return [{
             "range": {"start": {"line": line, "character": col},
-                      "end": {"line": line, "character": col + 1}},
+                      "end": {"line": line, "character": end_col}},
             "severity": 1,
             "source": "gama-l",
             "message": e.msg,
@@ -540,12 +589,30 @@ def semantic_tokens(uri: str, text: str):
 def main():
     docs: dict[str, str] = {}
     while True:
-        msg = read_msg()
-        if msg is None:
+        try:
+            msg = read_msg()
+        except FramingError as ex:
+            # Malformed frame: report ParseError and keep serving.
+            send_error(None, -32700, str(ex))
+            continue
+        if msg is EOF:
             break
-        method = msg.get("method") or ""
+        if not isinstance(msg, dict):
+            send_error(None, -32600, "invalid request: expected object")
+            continue
         mid = msg.get("id")
-        params = msg.get("params") or {}
+        method = msg.get("method")
+        if not isinstance(method, str):
+            send_error(mid, -32600, "invalid request: missing method")
+            continue
+        params = msg.get("params", {})
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            # Never crash on scalar params (e.g. "oops"); report and continue.
+            if mid is not None:
+                send_error(mid, -32602, "invalid params: expected object")
+            continue
         if method == "initialize":
             send({"jsonrpc": "2.0", "id": mid, "result": {
                 "capabilities": {
@@ -573,78 +640,81 @@ def main():
         elif method == "exit":
             break
         elif method in ("textDocument/didOpen", "textDocument/didChange", "textDocument/didSave"):
-            td = params.get("textDocument") or {}
+            td = _obj(params.get("textDocument"))
             uri = td.get("uri") or ""
             changes = params.get("contentChanges") or []
-            text = changes[-1].get("text") if changes else td.get("text")
+            last_change = _obj(changes[-1]) if changes else {}
+            text = last_change.get("text") if changes else td.get("text")
             if text is None:
                 text = docs.get(uri, "")
+            if not isinstance(text, str):
+                text = str(text)
             docs[uri] = text
             if uri:
                 publish(uri, text)
         elif method == "textDocument/completion":
-            td = params.get("textDocument") or {}
+            td = _obj(params.get("textDocument"))
             uri = td.get("uri") or ""
             text = docs.get(uri, td.get("text") or "")
             send({"jsonrpc": "2.0", "id": mid, "result": completion(uri, text)})
         elif method == "textDocument/hover":
-            td = params.get("textDocument") or {}
+            td = _obj(params.get("textDocument"))
             uri = td.get("uri") or ""
             text = docs.get(uri, td.get("text") or "")
-            pos = params.get("position") or {}
+            pos = _obj(params.get("position"))
             line = int(pos.get("line") or 0)
             ch = int(pos.get("character") or 0)
             send({"jsonrpc": "2.0", "id": mid, "result": hover(uri, text, line, ch)})
         elif method == "textDocument/definition":
-            td = params.get("textDocument") or {}
+            td = _obj(params.get("textDocument"))
             uri = td.get("uri") or ""
             text = docs.get(uri, td.get("text") or "")
-            pos = params.get("position") or {}
+            pos = _obj(params.get("position"))
             line = int(pos.get("line") or 0)
             ch = int(pos.get("character") or 0)
             send({"jsonrpc": "2.0", "id": mid, "result": definition(uri, text, line, ch)})
         elif method == "textDocument/references":
-            td = params.get("textDocument") or {}
+            td = _obj(params.get("textDocument"))
             uri = td.get("uri") or ""
             text = docs.get(uri, td.get("text") or "")
-            pos = params.get("position") or {}
+            pos = _obj(params.get("position"))
             line = int(pos.get("line") or 0)
             ch = int(pos.get("character") or 0)
             send({"jsonrpc": "2.0", "id": mid, "result": references(uri, text, line, ch)})
         elif method == "textDocument/formatting":
-            td = params.get("textDocument") or {}
+            td = _obj(params.get("textDocument"))
             uri = td.get("uri") or ""
             text = docs.get(uri, td.get("text") or "")
             send({"jsonrpc": "2.0", "id": mid,
                   "result": formatting(uri, text)})
         elif method == "textDocument/rename":
-            td = params.get("textDocument") or {}
+            td = _obj(params.get("textDocument"))
             uri = td.get("uri") or ""
             text = docs.get(uri, td.get("text") or "")
-            pos = params.get("position") or {}
+            pos = _obj(params.get("position"))
             line = int(pos.get("line") or 0)
             ch = int(pos.get("character") or 0)
             send({"jsonrpc": "2.0", "id": mid, "result": rename(
                 uri, text, line, ch, str(params.get("newName") or ""))})
         elif method == "textDocument/documentSymbol":
-            td = params.get("textDocument") or {}
+            td = _obj(params.get("textDocument"))
             uri = td.get("uri") or ""
             text = docs.get(uri, td.get("text") or "")
             send({"jsonrpc": "2.0", "id": mid,
                   "result": document_symbols(uri, text)})
         elif method == "textDocument/semanticTokens/full":
-            td = params.get("textDocument") or {}
+            td = _obj(params.get("textDocument"))
             uri = td.get("uri") or ""
             text = docs.get(uri, td.get("text") or "")
             send({"jsonrpc": "2.0", "id": mid,
                   "result": semantic_tokens(uri, text)})
         elif method == "textDocument/codeAction":
-            td = params.get("textDocument") or {}
+            td = _obj(params.get("textDocument"))
             uri = td.get("uri") or ""
             text = docs.get(uri, td.get("text") or "")
             send({"jsonrpc": "2.0", "id": mid, "result": code_actions(
-                uri, text, params.get("range") or {},
-                params.get("context") or {})})
+                uri, text, _obj(params.get("range")),
+                _obj(params.get("context")))})
         elif mid is not None:
             send({"jsonrpc": "2.0", "id": mid, "result": None})
 
