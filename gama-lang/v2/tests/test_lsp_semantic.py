@@ -6,6 +6,7 @@ import unittest
 
 V2 = pathlib.Path(__file__).resolve().parents[1]
 GAMAL2 = V2 / "gamal2.py"
+sys.path.insert(0, str(V2))
 URI = "file:///tmp/lsp_semantic_demo.gm"
 
 DOC = (
@@ -150,6 +151,19 @@ class LspSemanticTests(unittest.TestCase):
             self.assertGreaterEqual(start, 0)
             self.assertLess(line, len(DOC.split("\n")))
 
+    def test_string_token_span(self):
+        import gama_lsp
+        res = gama_lsp.semantic_tokens(URI, 'let y = "abc" + 1\n')
+        data = res["data"]
+        # find tokenType 4 (string)
+        line = 0; start = 0; strings = []
+        for i in range(0, len(data), 5):
+            dl, ds, length, ttype, _mods = data[i:i+5]
+            line += dl
+            start = start + ds if dl == 0 else ds
+            if ttype == 4:
+                strings.append((line, start, length))
+        self.assertEqual(strings, [(0, 8, 5)])  # "abc" including quotes
     def test_shutdown(self):
         sid = self.c.request("shutdown", {})
         sresp, _ = self.c.wait_for(mid=sid)

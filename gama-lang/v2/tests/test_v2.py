@@ -13,6 +13,9 @@ class V2Tests(unittest.TestCase):
     def test_filter_select(self):
         it = G.run('let r = sql("x")\nlet s = r | filter mjesto == "Sarajevo" | select konto, naziv\nprint s | count\n')
         self.assertEqual(it.out, ['1'])
+    def test_unknown_variable_is_type_error(self):
+        with self.assertRaises(G.GamaTypeError):
+            G.check('print missingName\n')
     def test_type_error(self):
         with self.assertRaises(G.GamaTypeError):
             G.check('let x: Int = "text"\n')

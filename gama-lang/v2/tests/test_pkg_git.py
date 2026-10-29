@@ -84,6 +84,18 @@ class PkgGitTests(unittest.TestCase):
             rc = G._pkg_install(self.app, update=True)
         self.assertEqual(rc, 0, buf.getvalue())
         self.assertEqual(self._lock()["math"]["commit"], new_head)
+    def test_lock_mismatch_keeps_installed_module(self):
+        self.assertEqual(self._install('math = { git = "../mathrepo" }')[0], 0)
+        mod = self.app / ".gamal" / "modules" / "math" / "lib.gm"
+        before = mod.read_text(encoding="utf-8")
+        cache = self.app / ".gamal" / "cache" / "math"
+        (cache / "lib.gm").write_text(LIB + "fn sub(a: Int, b: Int) -> Int effects {} { return a-b }\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(cache), "-c", "user.email=test@example.com",
+                        "-c", "user.name=Test", "commit", "-qam", "cache-only"], check=True)
+        rc, out = self._install('math = { git = "../mathrepo" }')
+        self.assertEqual(rc, 1)
+        self.assertIn("lock mismatch", out)
+        self.assertEqual(mod.read_text(encoding="utf-8"), before)
     def test_path_outside_root_rejected(self):
         outside = self.base / "outside"
         outside.mkdir()

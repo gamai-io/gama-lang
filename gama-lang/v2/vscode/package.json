@@ -1,15 +1,19 @@
 {
   "name": "gama-l",
   "displayName": "GAMA-L",
-  "description": "Syntax highlighting for the GAMA-L 2 language (.gm files).",
-  "version": "0.1.0",
+  "description": "Syntax highlighting and LSP diagnostics for the GAMA-L 2 language (.gm files).",
+  "version": "0.2.0",
   "publisher": "gama",
   "license": "MIT",
+  "main": "./extension.js",
   "engines": {
     "vscode": "^1.80.0"
   },
   "categories": [
     "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:gama-l"
   ],
   "contributes": {
     "languages": [
@@ -37,6 +41,28 @@
         "language": "gama-l",
         "path": "./snippets/gama-l.json"
       }
-    ]
+    ],
+    "commands": [
+      {
+        "command": "gama-l.doctor",
+        "title": "GAMA-L: Run Doctor"
+      }
+    ],
+    "configuration": {
+      "type": "object",
+      "title": "GAMA-L",
+      "properties": {
+        "gama-l.pythonPath": {
+          "type": "string",
+          "default": "python3",
+          "description": "Python interpreter used to start the GAMA-L language server."
+        },
+        "gama-l.serverScript": {
+          "type": "string",
+          "default": "${workspaceFolder}/gama-lang/v2/gamal2.py",
+          "description": "Path to gamal2.py. ${workspaceFolder} is expanded to the first workspace folder."
+        }
+      }
+    }
   }
 }

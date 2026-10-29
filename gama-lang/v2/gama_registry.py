@@ -17,9 +17,12 @@ interpreter boots, while still writing the same ``gamal.toml`` shape that
 
 from __future__ import annotations
 
+import ipaddress
 import json
+import os
 import pathlib
 import re
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -38,6 +41,7 @@ _PACKAGE_FIELDS = ("name", "version", "git", "rev")
 _MAX_REGISTRY_BYTES = 1024 * 1024
 _HTTP_TIMEOUT = 10.0
 _HTTP_CONTENT_TYPES = ("application/json", "text/plain")
+_PRIVATE_ALLOW_ENV = "GAMA_L_REGISTRY_ALLOW_PRIVATE"
 
 
 class RegistryError(Exception):
@@ -154,7 +158,24 @@ def _http_media_type(headers: object) -> str:
     return raw.split(";", 1)[0].strip().lower()
 
 
+def _host_is_private(host: str) -> bool:
+    try:
+        addrs = [ipaddress.ip_address(host)]
+    except ValueError:
+        try:
+            addrs = [ipaddress.ip_address(info[4][0]) for info in socket.getaddrinfo(host, None)]
+        except (OSError, ValueError):
+            return False
+    return any(a.is_private or a.is_loopback or a.is_link_local or a.is_reserved for a in addrs)
+
+
 def _load_http(url: str) -> dict:
+    parsed = urllib.parse.urlsplit(url)
+    original_scheme = parsed.scheme.lower()
+    if not parsed.hostname:
+        raise _fail("registry URL has no host: %s" % url)
+    if os.environ.get(_PRIVATE_ALLOW_ENV) != "1" and _host_is_private(parsed.hostname):
+        raise _fail("registry host is private/loopback; set %s=1 to allow" % _PRIVATE_ALLOW_ENV)
     try:
         with urllib.request.urlopen(url, timeout=_HTTP_TIMEOUT) as resp:
             final_url = resp.geturl() or url
@@ -164,8 +185,10 @@ def _load_http(url: str) -> dict:
                     "registry redirected to unsupported scheme %r (from %s)"
                     % (scheme, url)
                 )
+            if original_scheme == "https" and scheme == "http":
+                raise _fail("registry redirect downgraded https to http: %s" % final_url)
             media = _http_media_type(resp.headers)
-            if media and media not in _HTTP_CONTENT_TYPES:
+            if not media or media not in _HTTP_CONTENT_TYPES:
                 raise _fail(
                     "unsupported registry content type %r at %s: "
                     "expected application/json or text/plain" % (media, url)

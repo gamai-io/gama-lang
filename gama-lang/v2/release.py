@@ -43,6 +43,9 @@ SOURCE_FILES = (
     "gama_doctor.py",
     "gama_mail.py",
     "gama_registry.py",
+    "gama_registry_server.py",
+    "gama_ai.py",
+    "release.py",
     "pyproject.toml",
     "README.md",
     "MANIFEST.in",
@@ -118,6 +121,11 @@ def _source_entries() -> list[tuple[str, pathlib.Path]]:
 
 
 def _clean_dir(out_dir: pathlib.Path) -> None:
+    resolved = out_dir.resolve()
+    if resolved == PROJECT_ROOT.resolve() or resolved == PROJECT_ROOT.resolve().parent:
+        raise ReleaseError("refusing to use project/source directory as release output: %s" % out_dir)
+    if out_dir.exists() and ((out_dir / "pyproject.toml").exists() or (out_dir / "gamal2.py").exists()):
+        raise ReleaseError("refusing to clean a source directory: %s" % out_dir)
     if out_dir.exists():
         if out_dir.is_dir() and not out_dir.is_symlink():
             for child in out_dir.iterdir():
@@ -304,6 +312,9 @@ def _check_sdist(path: pathlib.Path, errors: list[str]) -> None:
         return
     if not any(name == "pyproject.toml" or name.endswith("/pyproject.toml") for name in names):
         errors.append("sdist does not contain pyproject.toml")
+    for module in WHEEL_MODULES:
+        if not any(name == module or name.endswith("/" + module) for name in names):
+            errors.append("sdist missing module: %s" % module)
 
 
 def verify(out_dir: pathlib.Path) -> dict:
@@ -313,6 +324,8 @@ def verify(out_dir: pathlib.Path) -> dict:
     release_path = out_dir / "RELEASE.json"
     if not release_path.is_file():
         return {"ok": False, "errors": ["missing RELEASE.json in %s" % out_dir]}
+    if not (out_dir / "SHA256SUMS").is_file():
+        return {"ok": False, "errors": ["missing SHA256SUMS in %s" % out_dir]}
     try:
         manifest = json.loads(release_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:

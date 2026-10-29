@@ -327,6 +327,73 @@ def code_actions(uri: str, text: str, req_range, context):
     return actions
 
 
+RENAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
+
+
+def formatting(uri: str, text: str):
+    """Full-document formatting: one TextEdit when the source changes."""
+    src = text or ""
+    try:
+        formatted = G.fmt_source(src)
+    except Exception:
+        return []
+    if formatted == src:
+        return []
+    lines = src.split("\n")
+    last = len(lines) - 1
+    return [{
+        "range": {"start": {"line": 0, "character": 0},
+                  "end": {"line": last, "character": utf16_len(lines[last])}},
+        "newText": formatted,
+    }]
+
+
+def rename(uri: str, text: str, line: int, character: int, new_name: str):
+    """Rename a let/fn declaration and all Var/Call references to it."""
+    if not RENAME_RE.match(new_name or ""):
+        return None
+    name = word_at(text, line, character)
+    if not name:
+        return None
+    try:
+        program = G.parse(text)
+    except Exception:
+        return None
+    lines = (text or "").split("\n")
+    width = utf16_len(name)
+    edits = []
+    seen = set()
+
+    def add(line0: int, col: int) -> bool:
+        if line0 < 0 or line0 >= len(lines):
+            return False
+        key = (line0, col)
+        if key in seen:
+            return True
+        seen.add(key)
+        edits.append({"range": {"start": {"line": line0, "character": col},
+                                "end": {"line": line0, "character": col + width}},
+                      "newText": new_name})
+        return True
+
+    found = False
+    for node in _walk(program):
+        if isinstance(node, (G.Var, G.Call)) and getattr(node, "name", None) == name:
+            line0 = max(0, int(node.line) - 1)
+            col = _utf16_pos(lines[line0], int(node.col) - 1) if line0 < len(lines) else 0
+            if add(line0, col):
+                found = True
+        elif isinstance(node, (G.Let, G.Fn)) and getattr(node, "name", None) == name:
+            line0 = max(0, int(node.line) - 1)
+            if line0 < len(lines):
+                idx = _name_pos(lines[line0], max(0, int(node.col) - 1), name)
+                if idx is not None and add(line0, _utf16_pos(lines[line0], idx)):
+                    found = True
+    if not found or not edits:
+        return None
+    return {"changes": {uri: edits}}
+
+
 def hover(uri: str, text: str, line: int, character: int):
     name = word_at(text, line, character)
     if not name:
@@ -393,6 +460,7 @@ def _raw_lexeme(src: str, offsets, tok) -> str:
         return str(tok.val)
     start = offsets[line0] + max(0, int(tok.col) - 1)
     if tok.kind == "STRING":
+        start = offsets[line0] + max(0, int(tok.col) - 2)
         i = start + 1
         n = len(src)
         while i < n:
@@ -403,7 +471,8 @@ def _raw_lexeme(src: str, offsets, tok) -> str:
                 i += 1
                 break
             i += 1
-        return src[start:i]
+        line_end = offsets[line0] + len(src.split("\n")[line0])
+        return src[start:min(i, line_end)]
     if tok.kind == "NUMBER":
         return str(tok.val)
     return str(tok.val)
@@ -450,6 +519,8 @@ def semantic_tokens(uri: str, text: str):
         if line0 >= len(lines):
             continue
         char_idx = max(0, int(tok.col) - 1)
+        if tok.kind == "STRING":
+            char_idx = max(0, int(tok.col) - 2)
         start = utf16_len(lines[line0][:char_idx])
         length = utf16_len(_raw_lexeme(src, offsets, tok))
         if length <= 0:
@@ -483,6 +554,8 @@ def main():
                     "hoverProvider": True,
                     "definitionProvider": True,
                     "referencesProvider": True,
+                    "renameProvider": True,
+                    "documentFormattingProvider": True,
                     "documentSymbolProvider": True,
                     "codeActionProvider": {"codeActionKinds": ["quickfix"]},
                     "semanticTokensProvider": {
@@ -538,6 +611,21 @@ def main():
             line = int(pos.get("line") or 0)
             ch = int(pos.get("character") or 0)
             send({"jsonrpc": "2.0", "id": mid, "result": references(uri, text, line, ch)})
+        elif method == "textDocument/formatting":
+            td = params.get("textDocument") or {}
+            uri = td.get("uri") or ""
+            text = docs.get(uri, td.get("text") or "")
+            send({"jsonrpc": "2.0", "id": mid,
+                  "result": formatting(uri, text)})
+        elif method == "textDocument/rename":
+            td = params.get("textDocument") or {}
+            uri = td.get("uri") or ""
+            text = docs.get(uri, td.get("text") or "")
+            pos = params.get("position") or {}
+            line = int(pos.get("line") or 0)
+            ch = int(pos.get("character") or 0)
+            send({"jsonrpc": "2.0", "id": mid, "result": rename(
+                uri, text, line, ch, str(params.get("newName") or ""))})
         elif method == "textDocument/documentSymbol":
             td = params.get("textDocument") or {}
             uri = td.get("uri") or ""

@@ -115,6 +115,27 @@ class ReleaseTests(unittest.TestCase):
             result = release.verify(copy)
             self.assertFalse(result["ok"])
 
+    def test_07_refuses_source_output(self):
+        with self.assertRaises(release.ReleaseError):
+            release._clean_dir(release.PROJECT_ROOT)
+        self.assertTrue((release.PROJECT_ROOT / "gamal2.py").is_file())
+
+    def test_08_sdist_contains_all_modules(self):
+        import tarfile
+        with tarfile.open(str(self.out / self.result["sdist"])) as archive:
+            names = archive.getnames()
+        for module in release.WHEEL_MODULES:
+            self.assertTrue(any(n == module or n.endswith("/" + module) for n in names), module)
+
+    def test_09_verify_requires_sums(self):
+        with tempfile.TemporaryDirectory() as td:
+            copy = pathlib.Path(td) / "dist"
+            shutil.copytree(self.out, copy)
+            (copy / "SHA256SUMS").unlink()
+            result = release.verify(copy)
+            self.assertFalse(result["ok"])
+            self.assertTrue(any("SHA256SUMS" in e for e in result["errors"]))
+
     def test_06_cli(self):
         with tempfile.TemporaryDirectory() as td:
             out = pathlib.Path(td) / "cli-dist"

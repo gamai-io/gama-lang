@@ -33,7 +33,9 @@ Git dependencies clone into `.gamal/cache/<name>` and are pinned in
 `.gamal/lock.json`; reinstall fails on a lock mismatch until `pkg update`.
 Modules resolve from `.gamal/modules/<name>` via `import "name/file.gm"`.
 A local/static registry is a JSON file (path, `file://`, or `http(s)://`)
-consumed by `pkg search|resolve|add`. Serve one with:
+consumed by `pkg search|resolve|add`. For a loopback/private HTTP registry set
+`GAMA_L_REGISTRY_ALLOW_PRIVATE=1` (the client blocks private hosts by default).
+Serve one with:
 
 ```bash
 python3 gama_registry_server.py --registry registry.json --port 8089
@@ -49,16 +51,17 @@ python3 gamal2.py lsp
 
 JSON-RPC language server: `initialize`, `didOpen/didChange/didSave`
 diagnostics, completion, hover, definition, references, document symbols,
-semantic tokens, code actions, `shutdown`, `exit`. Positions are converted between LSP
+semantic tokens, code actions, rename, document formatting, `shutdown`,
+`exit`. Positions are converted between LSP
 UTF-16 and Python indexes. A syntax-only VS Code package is in `vscode/`
-(TextMate grammar + snippets); it does not start the LSP itself.
+(TextMate grammar + snippets + a dependency-free LSP client).
 
 ## Distribution
 
 `pyproject.toml` defines the `gama-l` package and console scripts `gama-l`,
 `gama-lsp`, `gama-doctor`, `gama-registry`, `gama-release`; modules are
 `gamal2`, `gama_lsp`, `gama_cli`, `gama_fmt`, `gama_doctor`, `gama_mail`,
-`gama_registry`, `gama_registry_server`, `release`.
+`gama_registry`, `gama_registry_server`, `gama_ai`, `release`.
 The CLI wrapper is `gama_cli.py`. `release.py build` writes deterministic
 wheel/tar, `SHA256SUMS`, and `RELEASE.json`; `release.py verify` checks them.
 
@@ -70,7 +73,8 @@ python3 gamal2.py doctor --json
 ```
 
 Checks Python, module imports, every example parse/run, formatter idempotence,
-LSP API, SQL write guard, and a local package install.
+LSP API (including rename/formatting/code actions), SQL write guard, and a
+local package install.
 
 ## Formatting
 
@@ -93,6 +97,9 @@ python3 gamal2.py fmt --write file.gm  # write in place
 - `wait_user` (non-interactive returns `Denied`; falsy)
 - guarded `sql_write` (INSERT/UPDATE/DELETE; needs `GAMA_L_ALLOW_WRITE=1`, rejects DDL/stacked statements)
 - guarded SMTP `mail` (needs `GAMA_L_MAIL_ENABLED=1`; config via `GAMA_L_SMTP_*`)
+- `ask` uses `gama_ai` when `GAMA_L_AI_URL` is set; config via `GAMA_L_AI_KEY`,
+  `GAMA_L_AI_MODEL`, `GAMA_L_AI_ALLOW_HTTP=1` for local HTTP; HTTPS by default,
+  retries 429/5xx, 1 MiB response cap
 - `prove` (hash-chained receipt, optional HMAC via `GAMA_L_PROOF_KEY`) and `verify` (tamper detection)
 - static type errors and static effect violations
 - CLI `run`, `check`, `fmt`, `test`, `pkg`, `lsp`
@@ -100,7 +107,7 @@ python3 gamal2.py fmt --write file.gm  # write in place
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 146/146
+python3 -m unittest discover -s tests -v   # 171/171
 ```
 
 Conformance coverage: arithmetic/pipes (20 cases), type errors, effect
@@ -108,18 +115,18 @@ violations (including `sql.write`/`mail` stubs), HITL returns `Denied`,
 proof/tamper, duplicate proof keys, optional HMAC proof signatures (`GAMA_L_PROOF_KEY`; `GAMA_L_REQUIRE_SIG=1` requires them),
 imports/cycles/diamonds, multi-table SQLite schema checks, git/path package
 dependencies, LSP completion/hover/definition/references/symbols/tokens/code actions/
-didChange, HTTP/local registry, guarded SQL writes and SMTP mail, offline
-`ask` = `Unavailable`, 11 examples, canonical `fmt` check/write, doctor, and
-reproducible release metadata.
+rename/formatting/didChange, VS Code LSP client, HTTP/local registry, AI
+connector, guarded SQL writes and SMTP mail, offline `ask` = `Unavailable`,
+11 examples, canonical `fmt` check/write, doctor, and reproducible release
+metadata.
 
 ## Not implemented yet
 
 - deployed/public package registry (the HTTP server is implemented and testable)
 - full type inference and generics
-- real AI connector beyond optional OpenAI-compatible `ask`
 - full AST formatter (current `fmt` is token-based, preserves comments and
   strings, but does not reformat multi-line strings)
-- VS Code package is syntax-only
+- Marketplace packaging/signing for the VS Code extension
 - publishing a built release (build/checksums work)
 
 The old v0.1 transpiler remains in `gama-lang/` for reference. Do not call this

@@ -1,4 +1,5 @@
 import json
+import os
 import pathlib
 import socket
 import sys
@@ -69,9 +70,15 @@ class HttpRegistryTests(unittest.TestCase):
         self.registry.write_text(json.dumps(VALID), encoding="utf-8")
         self.httpd, self.thread = _start(S.make_handler(self.registry))
         self.base = "http://127.0.0.1:%d" % self.httpd.server_address[1]
+        self._old_private = os.environ.get("GAMA_L_REGISTRY_ALLOW_PRIVATE")
+        os.environ["GAMA_L_REGISTRY_ALLOW_PRIVATE"] = "1"
 
     def tearDown(self):
         _stop(self.httpd, self.thread)
+        if self._old_private is None:
+            os.environ.pop("GAMA_L_REGISTRY_ALLOW_PRIVATE", None)
+        else:
+            os.environ["GAMA_L_REGISTRY_ALLOW_PRIVATE"] = self._old_private
         self._tmp.cleanup()
 
     def _get(self, path, timeout=5):
@@ -83,6 +90,11 @@ class HttpRegistryTests(unittest.TestCase):
         err = cm.exception
         self.assertEqual(err.code, code, path)
         err.close()
+
+    def test_private_host_rejected_without_optin(self):
+        os.environ.pop("GAMA_L_REGISTRY_ALLOW_PRIVATE", None)
+        with self.assertRaises(R.RegistryError):
+            R.load_registry(self.base + "/index.json")
 
     def test_load_registry_and_search_over_http(self):
         index = R.load_registry(self.base + "/index.json")
@@ -162,6 +174,16 @@ class HttpRegistryTests(unittest.TestCase):
 
 
 class HttpRegistryContentTests(unittest.TestCase):
+    def setUp(self):
+        self._old_private = os.environ.get("GAMA_L_REGISTRY_ALLOW_PRIVATE")
+        os.environ["GAMA_L_REGISTRY_ALLOW_PRIVATE"] = "1"
+
+    def tearDown(self):
+        if self._old_private is None:
+            os.environ.pop("GAMA_L_REGISTRY_ALLOW_PRIVATE", None)
+        else:
+            os.environ["GAMA_L_REGISTRY_ALLOW_PRIVATE"] = self._old_private
+
     def _with_server(self, handler_cls, fn):
         httpd, thread = _start(handler_cls)
         try:
