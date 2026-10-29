@@ -270,6 +270,63 @@ def references(uri: str, text: str, line: int, character: int):
     return out
 
 
+def _range_seg(rng):
+    """Return (start, end) as (line, character) tuples for an LSP range."""
+    start = (rng or {}).get("start") or {}
+    end = (rng or {}).get("end") or {}
+    return ((int(start.get("line") or 0), int(start.get("character") or 0)),
+            (int(end.get("line") or 0), int(end.get("character") or 0)))
+
+
+def _overlaps(diag_range, req_range) -> bool:
+    """True when a diagnostic range intersects the requested range."""
+    ds, de = _range_seg(diag_range)
+    rs, re_ = _range_seg(req_range)
+    if rs == re_:
+        # collapsed request (cursor position): same-line diagnostics count
+        return ds[0] <= rs[0] <= de[0]
+    # half-open intersection
+    return not (de <= rs or re_ <= ds)
+
+
+def code_actions(uri: str, text: str, req_range, context):
+    """Return quickfix code actions that comment out offending lines."""
+    ctx = context or {}
+    diags = ctx.get("diagnostics")
+    if diags is None:
+        diags = [d for d in diagnostics(uri, text)
+                 if _overlaps(d.get("range") or {}, req_range)]
+    else:
+        diags = [d for d in diags
+                 if _overlaps(d.get("range") or {}, req_range)]
+    lines = (text or "").split("\n")
+    actions = []
+    seen = set()
+    for d in diags:
+        start = (d.get("range") or {}).get("start") or {}
+        line = int(start.get("line") or 0)
+        if line in seen:
+            continue
+        if line < 0 or line >= len(lines):
+            continue
+        original = lines[line]
+        seen.add(line)
+        if original.lstrip().startswith("#"):
+            continue
+        actions.append({
+            "title": "Comment out line %d" % (line + 1),
+            "kind": "quickfix",
+            "diagnostics": [d],
+            "edit": {"changes": {uri: [{
+                "range": {"start": {"line": line, "character": 0},
+                          "end": {"line": line,
+                                  "character": utf16_len(original)}},
+                "newText": "# " + original,
+            }]}},
+        })
+    return actions
+
+
 def hover(uri: str, text: str, line: int, character: int):
     name = word_at(text, line, character)
     if not name:
@@ -427,6 +484,7 @@ def main():
                     "definitionProvider": True,
                     "referencesProvider": True,
                     "documentSymbolProvider": True,
+                    "codeActionProvider": {"codeActionKinds": ["quickfix"]},
                     "semanticTokensProvider": {
                         "legend": {"tokenTypes": TOKEN_TYPES,
                                    "tokenModifiers": []},
@@ -492,6 +550,13 @@ def main():
             text = docs.get(uri, td.get("text") or "")
             send({"jsonrpc": "2.0", "id": mid,
                   "result": semantic_tokens(uri, text)})
+        elif method == "textDocument/codeAction":
+            td = params.get("textDocument") or {}
+            uri = td.get("uri") or ""
+            text = docs.get(uri, td.get("text") or "")
+            send({"jsonrpc": "2.0", "id": mid, "result": code_actions(
+                uri, text, params.get("range") or {},
+                params.get("context") or {})})
         elif mid is not None:
             send({"jsonrpc": "2.0", "id": mid, "result": None})
 
