@@ -1,4 +1,6 @@
-# GAMA OS — PRODUCT LINE (branded, tested, sellable)
+# GAMA OS — PRODUCT LINE (v0.1 scaffold; 2.0 is a roadmap)
+
+> Current status: builder + launcher only, not a bootable signed image. 2.0 acceptance tests: `gama-os/ROADMAP_2.0.md`.
 
 Our own operating-system family on top of a Linux kernel — **the GAMA fleet as a platform**.
 Every machine = a node in our mesh, with integrated AI (GAMA-L).
