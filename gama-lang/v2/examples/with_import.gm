@@ -1,0 +1,4 @@
+import "lib.gm"
+print add(lib_value, 1)
+prove p = { result: add(2, 3) }
+verify p
