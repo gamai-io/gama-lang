@@ -1,0 +1,2 @@
+remember("demo", "vrijednost")
+print recall("demo")

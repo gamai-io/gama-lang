@@ -29,19 +29,21 @@ python3 gamal2.py test
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 13/13
+python3 -m unittest discover -s tests -v   # 29/29
 ```
 
-Conformance coverage is the T1-T5 subset from `SPEC_2.0.md`:
-arithmetic/pipes, type error, effect violation, HITL denial, proof/tamper,
-plus imports and real read-only SQLite.
+Conformance coverage: arithmetic/pipes (20 cases), type errors, effect
+violations (including `sql.write`/`mail` stubs), HITL fail-closed, proof/tamper,
+duplicate proof keys, imports/cycles/diamonds, offline `ask` = `Unavailable`,
+10 examples, and deterministic `fmt`. T4 currently fails closed by raising,
+not by returning a `Denied` value.
 
 ## Not implemented yet
 
 - modules/imports and package manager
 - full type inference and generics
 - real SQL/AI/mail connectors (the core uses demo/mock adapters)
-- formatter, LSP, VS Code syntax, distribution build
+- full AST formatter (current `fmt` normalizes whitespace only), LSP, VS Code syntax, distribution build
 
 The old v0.1 transpiler remains in `gama-lang/` for reference. Do not call this
 full 2.0 until the remaining conformance tests and connectors are done.
