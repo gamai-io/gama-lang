@@ -30,8 +30,8 @@ class V2Tests(unittest.TestCase):
         it = G.run('remember("k", "v")\nprint recall("k")\n')
         self.assertEqual(it.out, ['v'])
     def test_hitl_noninteractive(self):
-        it = G.run('print wait_user("ok?")\n')
-        self.assertEqual(it.out, ['False'])
+        with self.assertRaises(G.GamaRuntimeError):
+            G.run('print wait_user("ok?")\n')
     def test_if(self):
         it = G.run('let x = 5\nif x > 3 {\n print "big"\n} else {\n print "small"\n}\n')
         self.assertEqual(it.out, ['big'])
@@ -53,6 +53,75 @@ class V2Tests(unittest.TestCase):
         finally:
             if old is None: os.environ.pop('GAMA_L_DB', None)
             else: os.environ['GAMA_L_DB'] = old
+    def test_newline_literals(self):
+        it = G.run('let m = {\n a: 1,\n b: 2\n}\nprint m.a\n')
+        self.assertEqual(it.out, ['1'])
+    def test_assign_declares(self):
+        it = G.run('x := 5\nprint x\n')
+        self.assertEqual(it.out, ['5'])
+    def test_else_newline(self):
+        it = G.run('if true {\n print "a"\n}\nelse {\n print "b"\n}\n')
+        self.assertEqual(it.out, ['a'])
+    def test_block_scope(self):
+        it = G.run('if true {\n let a = 1\n print a\n}\n')
+        self.assertEqual(it.out, ['1'])
+    def test_dotted_proof(self):
+        it = G.run('prove inv.posted = { a: 1 }\nprint inv.posted.a\n')
+        self.assertEqual(it.out, ['1'])
+    def test_sum_type(self):
+        it = G.run('let r = sql("x")\nlet s = r | sum neto\nprint s + 1\n')
+        self.assertEqual(it.out, ['351.00'])
+    def test_division_decimal(self):
+        it = G.run('print 1/3\n')
+        self.assertEqual(it.out[0][:5], '0.333')
+    def test_return_type(self):
+        with self.assertRaises(G.GamaTypeError):
+            G.check('fn f() -> Int effects {} { return "x" }\n')
+    def test_statement_terminator(self):
+        with self.assertRaises(G.GamaError):
+            G.check('print 1 2\n')
+    def test_duplicate_prove(self):
+        with self.assertRaises(G.GamaRuntimeError):
+            G.run('prove p = {a:1}\nprove p = {a:2}\n')
+    def test_import_diamond(self):
+        import tempfile
+        d = tempfile.mkdtemp(); pathlib.Path(d,'d.gm').write_text('fn d() -> Int effects {} { return 1 }\n')
+        pathlib.Path(d,'b.gm').write_text('import "d.gm"\nfn b() -> Int effects {} { return d()+1 }\n')
+        pathlib.Path(d,'c.gm').write_text('import "d.gm"\nfn c() -> Int effects {} { return d()+2 }\n')
+        pathlib.Path(d,'a.gm').write_text('import "b.gm"\nimport "c.gm"\nprint b()+c()\n')
+        it = G.run_file(str(pathlib.Path(d,'a.gm')))
+        self.assertEqual(it.out, ['5'])
+    def test_ask_offline(self):
+        it = G.run('print ask("hi")\n')
+        self.assertEqual(it.out, ['Unavailable'])
+    def test_effect_write_stub(self):
+        with self.assertRaises(G.GamaEffectError):
+            G.check('fn f() -> Bool effects {} { return sql_write("x") }\n')
+    def test_fmt_idempotent(self):
+        a = G.fmt_source('print 1   \n\n')
+        self.assertEqual(G.fmt_source(a), a)
+    def test_corpus(self):
+        cases = {
+            'print 1+2*3\n': '7', 'print (1+2)*3\n': '9', 'print 17%5\n': '2',
+            'print 10/4\n': '2.5', 'print 1 == 1\n': 'True', 'print 1 < 2\n': 'True',
+            'print true && false\n': 'False', 'print !true\n': 'False',
+            'let r = sql("x")\nprint r | count\n': '2',
+            'let r = sql("x")\nprint r | select konto | count\n': '2',
+            'let r = sql("x")\nprint r | filter mjesto == "Sarajevo" | count\n': '1',
+            'let r = sql("x")\nprint r | sum neto\n': '350.00',
+            'let r = sql("x")\nprint r | map naziv | count\n': '2',
+            'print "a" + "b"\n': 'ab', 'print 5 - 2\n': '3', 'print 2 * 6\n': '12',
+            'print null == null\n': 'True', 'print 1 != 2\n': 'True', 'print 10 >= 10\n': 'True',
+            'print 1 < 2 && 2 < 3\n': 'True',
+        }
+        for src, exp in cases.items():
+            self.assertEqual(G.run(src).out[-1], exp, src)
+    def test_examples_run(self):
+        import pathlib
+        for p in sorted((pathlib.Path(__file__).resolve().parents[1] / 'examples').glob('*.gm')):
+            if p.name == 'lib.gm':
+                continue
+            G.run_file(str(p))
     def test_function(self):
         it = G.run('fn add(a: Int, b: Int) -> Int effects {} {\n return a+b\n}\nprint add(2,3)\n')
         self.assertEqual(it.out, ['5'])

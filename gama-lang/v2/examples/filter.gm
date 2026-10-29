@@ -1,0 +1,4 @@
+let r = sql("select konto, naziv, mjesto, neto from customers")
+let s = r | filter mjesto == "Sarajevo" | select konto, naziv
+print s | count
+print s

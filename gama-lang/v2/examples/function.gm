@@ -1,0 +1,4 @@
+fn add(a: Int, b: Int) -> Int effects {} {
+  return a + b
+}
+print add(20, 22)

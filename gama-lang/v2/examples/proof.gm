@@ -1,0 +1,5 @@
+prove doc.posted {
+  invoice: "MOCK-2026-001",
+  total: 117.00
+}
+verify doc.posted

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import pathlib
@@ -149,17 +150,25 @@ class Parser:
         return self.take()
     def skip_seps(self):
         while self.at("NL") or self.at("OP", ";"): self.take()
+    def skip_nl(self):
+        while self.at("NL"): self.take()
     def program(self):
         out = []; self.skip_seps()
         while not self.at("EOF"):
-            out.append(self.statement()); self.skip_seps()
+            out.append(self.statement())
+            if not (self.at("NL") or self.at("OP", ";") or self.at("EOF")):
+                x = self.peek(); raise GamaError("expected end of statement", x.line, x.col)
+            self.skip_seps()
         return out
     def block(self):
         self.expect("OP", "{"); self.skip_seps(); out = []
         while not self.at("OP", "}"):
             if self.at("EOF"):
                 x = self.peek(); raise GamaError("unterminated block", x.line, x.col)
-            out.append(self.statement()); self.skip_seps()
+            out.append(self.statement())
+            if not (self.at("NL") or self.at("OP", ";") or self.at("OP", "}")):
+                x = self.peek(); raise GamaError("expected end of statement", x.line, x.col)
+            self.skip_seps()
         self.expect("OP", "}"); return out
     def statement(self):
         x = self.peek()
@@ -169,14 +178,20 @@ class Parser:
         if x.kind == "KW" and x.val == "let":
             self.take(); name = self.expect("IDENT").val; tn = None
             if self.at("OP", ":"): self.take(); tn = self.expect("IDENT").val
-            self.expect("OP", "="); return Let(name, tn, self.expr(), x.line, x.col)
+            self.expect("OP", "="); self.skip_nl(); return Let(name, tn, self.expr(), x.line, x.col)
         if x.kind == "KW" and x.val == "fn": return self.fn()
         if x.kind == "KW" and x.val == "if": return self.if_stmt()
         if x.kind == "KW" and x.val == "return":
             self.take(); return Return(self.expr(), x.line, x.col)
         if x.kind == "KW" and x.val == "prove":
-            self.take(); name = self.expect("IDENT").val; self.expect("OP", "=")
-            return Prove(name, self.expr(), x.line, x.col)
+            self.take(); name = self.expect("IDENT").val; self.skip_nl()
+            if self.at("OP", "="):
+                self.take(); self.skip_nl(); expr = self.expr()
+            elif self.at("OP", "{"):
+                expr = self.primary()
+            else:
+                raise GamaError("prove expects '=' or '{'", x.line, x.col)
+            return Prove(name, expr, x.line, x.col)
         if x.kind == "KW" and x.val == "verify":
             self.take(); return Verify(self.expr(), x.line, x.col)
         if x.kind == "KW" and x.val == "print":
@@ -185,47 +200,54 @@ class Parser:
             name = self.take().val; self.take(); return Assign(name, self.expr(), x.line, x.col)
         return ExprStmt(self.expr(), x.line, x.col)
     def fn(self):
-        x = self.take(); name = self.expect("IDENT").val; self.expect("OP", "(")
+        x = self.take(); name = self.expect("IDENT").val; self.expect("OP", "("); self.skip_nl()
         params = []
         if not self.at("OP", ")"):
             while True:
                 pn = self.expect("IDENT").val; self.expect("OP", ":"); pt = self.expect("IDENT").val
-                params.append(Param(pn, pt))
+                params.append(Param(pn, pt)); self.skip_nl()
                 if not self.at("OP", ","): break
-                self.take()
+                self.take(); self.skip_nl()
         self.expect("OP", ")"); ret = None
-        if self.at("OP", "->"): self.take(); ret = self.expect("IDENT").val
+        if self.at("OP", "->"): self.take(); self.skip_nl(); ret = self.expect("IDENT").val
         effects = None
         if self.at("KW", "effects"):
-            self.take(); self.expect("OP", "{"); effects = set()
+            self.take(); self.expect("OP", "{"); self.skip_nl(); effects = set()
             while not self.at("OP", "}"):
-                effects.add(self.expect("IDENT").val)
-                if self.at("OP", ","): self.take()
+                effects.add(self.expect("IDENT").val); self.skip_nl()
+                if self.at("OP", ","): self.take(); self.skip_nl()
             self.expect("OP", "}")
         return Fn(name, params, ret, effects, self.block(), x.line, x.col)
     def if_stmt(self):
-        x = self.take(); cond = self.expr(); then = self.block(); other = None
+        x = self.take(); cond = self.expr(); self.skip_nl(); then = self.block(); other = None
+        save = self.i; self.skip_seps()
         if self.at("KW", "else"):
-            self.take()
+            self.take(); self.skip_nl()
             other = self.if_stmt() if self.at("KW", "if") else self.block()
+        else:
+            self.i = save
         return If(cond, then, other, x.line, x.col)
     def expr(self): return self.pipe()
     def pipe(self):
         left = self.binary(0); stages = []
-        while self.at("OP", "|"):
-            x = self.take()
+        while True:
+            save = self.i; self.skip_nl()
+            if not self.at("OP", "|"):
+                self.i = save; break
+            x = self.take(); self.skip_nl()
             st = self.take()
             if st.kind not in ("IDENT", "KW"): raise GamaError("pipe stage expected", st.line, st.col)
             stage = st.val; args = []
             if stage in ("filter", "limit"):
-                args = [self.binary(0)]
+                self.skip_nl(); args = [self.binary(0)]
             elif stage == "select":
+                self.skip_nl()
                 while True:
                     args.append(self.expect("IDENT").val)
                     if not self.at("OP", ","): break
-                    self.take()
+                    self.take(); self.skip_nl()
             elif stage in ("sum", "map"):
-                args = [self.expect("IDENT").val]
+                self.skip_nl(); args = [self.expect("IDENT").val]
             elif stage == "count":
                 pass
             else:
@@ -252,40 +274,34 @@ class Parser:
             self.take(); return Literal({"true":True,"false":False,"null":None}[x.val], x.line, x.col)
         if x.kind == "IDENT":
             self.take(); name = x.val
-            if "." in name:
-                parts = name.split(".")
-                node = Var(parts[0], x.line, x.col)
-                for part in parts[1:]:
-                    node = Attr(node, part, x.line, x.col)
-                return node
             if self.at("OP", "("):
-                self.take(); args = []
+                self.take(); self.skip_nl(); args = []
                 if not self.at("OP", ")"):
                     while True:
-                        args.append(self.expr())
+                        args.append(self.expr()); self.skip_nl()
                         if not self.at("OP", ","): break
-                        self.take()
+                        self.take(); self.skip_nl()
                 self.expect("OP", ")"); return Call(name, args, x.line, x.col)
             return Var(name, x.line, x.col)
         if x.kind == "OP" and x.val == "(":
-            self.take(); e = self.expr(); self.expect("OP", ")"); return e
+            self.take(); self.skip_nl(); e = self.expr(); self.skip_nl(); self.expect("OP", ")"); return e
         if x.kind == "OP" and x.val == "[":
-            self.take(); items = []
+            self.take(); self.skip_nl(); items = []
             if not self.at("OP", "]"):
                 while True:
-                    items.append(self.expr())
+                    items.append(self.expr()); self.skip_nl()
                     if not self.at("OP", ","): break
-                    self.take()
+                    self.take(); self.skip_nl()
             self.expect("OP", "]"); return ListExpr(items, x.line, x.col)
         if x.kind == "OP" and x.val == "{":
-            self.take(); items = {}
+            self.take(); self.skip_nl(); items = {}
             if not self.at("OP", "}"):
                 while True:
                     k = self.take()
                     if k.kind not in ("IDENT", "STRING", "KW"): raise GamaError("map key expected", k.line, k.col)
-                    self.expect("OP", ":"); items[str(k.val)] = self.expr()
+                    self.expect("OP", ":"); self.skip_nl(); items[str(k.val)] = self.expr(); self.skip_nl()
                     if not self.at("OP", ","): break
-                    self.take()
+                    self.take(); self.skip_nl()
             self.expect("OP", "}"); return MapExpr(items, x.line, x.col)
         raise GamaError(f"unexpected token {x.val!r}", x.line, x.col)
 
@@ -315,6 +331,8 @@ BUILTINS = {
     "len": (set(), "Int"),
     "text": (set(), "Text"),
     "number": (set(), "Decimal"),
+    "sql_write": ({"sql.write"}, "Bool"),
+    "mail": ({"mail"}, "Bool"),
 }
 
 class Checker:
@@ -322,6 +340,7 @@ class Checker:
         self.scope: list[dict[str, str]] = [{}]
         self.funcs: dict[str, Fn] = {}
         self.effects: set[str] = set()
+        self.ret_type: str | None = None
     def push(self): self.scope.append({})
     def pop(self): self.scope.pop()
     def get(self, n):
@@ -343,16 +362,22 @@ class Checker:
             if s.type_name and not self.compat(t, s.type_name): raise GamaTypeError(f"{s.name}: {t} != {s.type_name}", s.line, s.col)
             self.set(s.name, s.type_name or t)
         elif isinstance(s, Assign):
-            if self.get(s.name) is None: raise GamaTypeError(f"unknown variable {s.name}", s.line, s.col)
-            self.expr(s.expr)
+            t = self.expr(s.expr)
+            cur = self.get(s.name)
+            if cur is None: self.set(s.name, t)
+            elif not self.compat(t, cur): raise GamaTypeError(f"{s.name}: {t} != {cur}", s.line, s.col)
         elif isinstance(s, Fn):
             self.fn(s)
         elif isinstance(s, If):
-            self.expr(s.cond)
+            ct = self.expr(s.cond)
+            if ct != "Bool": raise GamaTypeError(f"if condition must be Bool, got {ct}", s.line, s.col)
             self.push(); [self.stmt(x, allowed) for x in s.then]; self.pop()
             if s.other:
                 self.push(); [self.stmt(x, allowed) for x in s.other]; self.pop()
-        elif isinstance(s, Return): self.expr(s.expr)
+        elif isinstance(s, Return):
+            if self.ret_type is None: raise GamaTypeError("return outside function", s.line, s.col)
+            rt = self.expr(s.expr)
+            if not self.compat(rt, self.ret_type): raise GamaTypeError(f"return {rt} != {self.ret_type}", s.line, s.col)
         elif isinstance(s, Prove):
             self.expr(s.expr); self.effects.add("proof.write")
             self.set(s.name, "Json")
@@ -363,8 +388,9 @@ class Checker:
         self.push()
         for p in f.params: self.set(p.name, p.type_name)
         old = self.effects; self.effects = set()
+        old_ret = self.ret_type; self.ret_type = f.ret or "Any"
         for s in f.body: self.stmt(s, f.effects or set())
-        used = set(self.effects); self.effects = old
+        used = set(self.effects); self.effects = old; self.ret_type = old_ret
         allowed = f.effects or set()
         bad = used - allowed
         if bad: raise GamaEffectError(f"function {f.name} uses undeclared effects: {','.join(sorted(bad))}", f.line, f.col)
@@ -383,9 +409,14 @@ class Checker:
             return "Any"
         if isinstance(e, Var):
             t = self.get(e.name)
-            if t is None and row: return "Any"
-            if t is None: raise GamaTypeError(f"unknown variable {e.name}", e.line, e.col)
-            return t
+            if t is not None: return t
+            if "." in e.name:
+                parts = e.name.split(".")
+                for i in range(len(parts) - 1, 0, -1):
+                    if self.get(".".join(parts[:i])) is not None:
+                        return "Any"
+            if row: return "Any"
+            raise GamaTypeError(f"unknown variable {e.name}", e.line, e.col)
         if isinstance(e, Unary):
             t = self.expr(e.right, row)
             if e.op == "!" and t != "Bool": raise GamaTypeError("! expects Bool", e.line, e.col)
@@ -397,7 +428,16 @@ class Checker:
                 if e.op == "+" and a == b == "Text": return "Text"
                 if a not in NUM or b not in NUM: raise GamaTypeError(f"{e.op} expects numbers", e.line, e.col)
                 return "Decimal" if "Decimal" in (a, b) or e.op == "/" else "Int"
-            if e.op in ("<", "<=", ">", ">="): return "Bool"
+            if e.op in ("<", "<=", ">", ">="):
+                if "Any" in (a, b): return "Bool"
+                if not ((a in NUM and b in NUM) or (a == b == "Text")):
+                    raise GamaTypeError(f"{e.op} expects two numbers or two texts", e.line, e.col)
+                return "Bool"
+            if e.op in ("&&", "||"):
+                if a != "Bool" or b != "Bool": raise GamaTypeError(f"{e.op} expects Bool", e.line, e.col)
+                return "Bool"
+            if "Any" in (a, b): return "Bool"
+            if a != b and not (a in NUM and b in NUM): raise GamaTypeError("== expects matching types", e.line, e.col)
             return "Bool"
         if isinstance(e, Call):
             if e.name in BUILTINS:
@@ -415,42 +455,59 @@ class Checker:
             return f.ret or "Any"
         if isinstance(e, Pipe):
             t = self.expr(e.base, row)
-            if t not in ("List", "Table", "Any"): raise GamaTypeError("pipe needs List/Table", e.line, e.col)
+            if t not in ("List", "Table", "Any"):
+                raise GamaTypeError("pipe needs List/Table", e.line, e.col)
             for stage, args in e.stages:
+                if t not in ("List", "Table", "Any"):
+                    raise GamaTypeError(f"pipe stage {stage!r} needs List/Table", e.line, e.col)
                 if stage == "filter":
-                    self.expr(args[0], row=True)
+                    self.expr(args[0], row=True); t = "Table"
                 elif stage == "select":
-                    pass
+                    t = "Table"
                 elif stage == "sum":
-                    pass
+                    if args: pass
+                    t = "Decimal"
                 elif stage == "limit":
-                    self.expr(args[0], row)
+                    lt = self.expr(args[0], row)
+                    if lt != "Int": raise GamaTypeError("limit expects Int", e.line, e.col)
+                    t = "Table"
                 elif stage == "map":
-                    pass
+                    t = "List"
                 elif stage == "count":
-                    t = "Int"; continue
-                if stage != "count": t = "Table" if stage in ("select", "filter", "limit") else "List"
+                    t = "Int"
             return t
         return "Any"
 
-def _flatten(path: pathlib.Path, seen: set | None = None) -> list:
-    seen = seen or set()
-    path = path.resolve()
+def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
+             seen: set | None = None, loaded: set | None = None) -> list:
+    path = path.resolve(); root = (root or path.parent).resolve()
+    if seen is None: seen = set()
+    if loaded is None: loaded = set()
+    if os.path.commonpath([str(path), str(root)]) != str(root):
+        raise GamaError("import outside project root: %s" % path)
     if path in seen:
         raise GamaError("import cycle: %s" % path)
+    if path in loaded:
+        return []
+    if len(seen) > 64:
+        raise GamaError("import depth limit exceeded")
     seen.add(path)
-    ast = parse(path.read_text(encoding="utf-8"))
+    try:
+        ast = parse(path.read_text(encoding="utf-8"))
+    except OSError as ex:
+        raise GamaError("cannot import %s: %s" % (path, ex)) from None
     out = []
     for s in ast:
         if isinstance(s, Import):
-            out.extend(_flatten((path.parent / s.path), seen))
+            out.extend(_flatten(path.parent / s.path, root, seen, loaded))
         else:
             out.append(s)
-    seen.remove(path)
+    seen.discard(path); loaded.add(path)
     return out
 
 def load_file(path: str):
-    return _flatten(pathlib.Path(path))
+    p = pathlib.Path(path).resolve()
+    return _flatten(p, p.parent)
 
 def check(src: str):
     ast = parse(src)
@@ -463,6 +520,13 @@ def check_file(path: str):
 def run_file(path: str, interactive=False):
     ast = check_file(path)
     return Interpreter(interactive=interactive).run(ast)
+
+def fmt_source(src: str) -> str:
+    """Deterministic whitespace formatter (full AST formatting is later)."""
+    lines = [ln.rstrip() for ln in src.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    while lines and not lines[0]: lines.pop(0)
+    while lines and not lines[-1]: lines.pop()
+    return "\n".join(lines) + "\n"
 
 # ------------------------------------------------------------------ evaluator
 class ReturnSignal(Exception):
@@ -478,7 +542,7 @@ class Env:
     def assign(self, n, v):
         if n in self.v: self.v[n] = v; return
         if self.parent: self.parent.assign(n, v); return
-        raise GamaRuntimeError(f"unknown variable {n}")
+        self.v[n] = v
 
 DEMO_ROWS = [
     {"konto": "2111176", "naziv": "ALFA HADŽIĆI", "mjesto": "Hadžići", "neto": Decimal("100.00")},
@@ -488,7 +552,7 @@ DEMO_ROWS = [
 class Interpreter:
     def __init__(self, interactive=False):
         self.env = Env(); self.funcs = {}; self.out = []; self.memory = {}
-        self.proofs = {}; self.prev_proof = "GENESIS"; self.interactive = interactive
+        self.proofs = {}; self.proof_chain = []; self.prev_proof = "GENESIS"; self.interactive = interactive
         self.last_ask = None
     def run(self, stmts):
         for s in stmts: self.stmt(s, self.env)
@@ -499,9 +563,11 @@ class Interpreter:
         elif isinstance(s, Fn): self.funcs[s.name] = (s, env)
         elif isinstance(s, If):
             if self.truth(self.expr(s.cond, env)):
-                for x in s.then: self.stmt(x, Env(env))
+                blk = Env(env)
+                for x in s.then: self.stmt(x, blk)
             elif s.other:
-                for x in s.other: self.stmt(x, Env(env))
+                blk = Env(env)
+                for x in s.other: self.stmt(x, blk)
         elif isinstance(s, Return): raise ReturnSignal(self.expr(s.expr, env))
         elif isinstance(s, Prove):
             val = self.expr(s.expr, env)
@@ -518,19 +584,29 @@ class Interpreter:
         if isinstance(v, (dict, list)): return json.dumps(v, ensure_ascii=False, default=str)
         return str(v)
     def prove(self, name, val):
+        if name in self.proofs:
+            old = self.proofs[name]
+            if old.get("value") == val:
+                return old
+            raise GamaRuntimeError(f"prove: duplicate key {name!r} with different value")
         core = {"name": name, "value": val}
         raw = json.dumps(core, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
         h = hashlib.sha256((self.prev_proof + raw).encode()).hexdigest()
         rec = {"name": name, "value": val, "sha256": h, "prev": self.prev_proof,
                "id": h[:16], "ts": __import__("time").time()}
         self.prev_proof = h
+        self.proof_chain.append(h)
         return rec
     def verify(self, rec):
         if not isinstance(rec, dict) or "sha256" not in rec: return {"ok": False, "errors": ["not_a_proof"]}
         raw = json.dumps({"name": rec.get("name"), "value": rec.get("value")},
                          sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
         exp = hashlib.sha256((rec.get("prev", "GENESIS") + raw).encode()).hexdigest()
-        return {"ok": exp == rec.get("sha256"), "expected": exp, "errors": [] if exp == rec.get("sha256") else ["hash_mismatch"]}
+        errs = []
+        if not hmac.compare_digest(exp, str(rec.get("sha256"))): errs.append("hash_mismatch")
+        if rec.get("prev") not in ("GENESIS",) and rec.get("prev") not in self.proof_chain:
+            errs.append("untrusted_chain")
+        return {"ok": not errs, "expected": exp, "errors": errs}
     def expr(self, e, env, row=None):
         if isinstance(e, Literal): return e.value
         if isinstance(e, ListExpr): return [self.expr(x, env, row) for x in e.items]
@@ -541,7 +617,26 @@ class Interpreter:
             return base.get(e.name)
         if isinstance(e, Var):
             if row is not None and e.name in row: return row[e.name]
-            return env.get(e.name)
+            try:
+                return env.get(e.name)
+            except GamaRuntimeError:
+                if "." not in e.name: raise
+                parts = e.name.split(".")
+                base_n = None
+                for i in range(len(parts) - 1, 0, -1):
+                    try:
+                        env.get(".".join(parts[:i])); base_n = i; break
+                    except GamaRuntimeError:
+                        pass
+                if base_n is None: raise
+                obj = env.get(".".join(parts[:base_n]))
+                for part in parts[base_n:]:
+                    if isinstance(obj, dict) and part not in obj and isinstance(obj.get("value"), dict):
+                        obj = obj["value"]
+                    if not isinstance(obj, dict) or part not in obj:
+                        raise GamaRuntimeError(f"unknown field {e.name}", e.line, e.col)
+                    obj = obj[part]
+                return obj
         if isinstance(e, Unary):
             v = self.expr(e.right, env, row)
             return (not self.truth(v)) if e.op == "!" else -v
@@ -549,9 +644,16 @@ class Interpreter:
             if e.op == "&&": return self.truth(self.expr(e.left, env, row)) and self.truth(self.expr(e.right, env, row))
             if e.op == "||": return self.truth(self.expr(e.left, env, row)) or self.truth(self.expr(e.right, env, row))
             a = self.expr(e.left, env, row); b = self.expr(e.right, env, row)
-            return {"+":lambda:a+b,"-":lambda:a-b,"*":lambda:a*b,"/":lambda:a/b,"%":lambda:a%b,
-                    "==":lambda:a==b,"!=":lambda:a!=b,"<":lambda:a<b,"<=":lambda:a<=b,
-                    ">":lambda:a>b,">=":lambda:a>=b}[e.op]()
+            try:
+                if e.op == "/":
+                    return Decimal(a) / Decimal(b)
+                if e.op == "%":
+                    return Decimal(a) % Decimal(b)
+                return {"+":lambda:a+b,"-":lambda:a-b,"*":lambda:a*b,
+                        "==":lambda:a==b,"!=":lambda:a!=b,"<":lambda:a<b,"<=":lambda:a<=b,
+                        ">":lambda:a>b,">=":lambda:a>=b}[e.op]()
+            except (ZeroDivisionError, ArithmeticError, TypeError, ValueError) as ex:
+                raise GamaRuntimeError(f"{e.op}: {ex}", e.line, e.col) from None
         if isinstance(e, Call):
             if e.name == "sql":
                 q = str(self.expr(e.args[0], env, row)) if e.args else ""
@@ -560,33 +662,47 @@ class Interpreter:
                     return [dict(r) for r in DEMO_ROWS]
                 if not q.lstrip().lower().startswith(("select", "with")):
                     raise GamaRuntimeError("GAMA_L_DB only allows SELECT/WITH", e.line, e.col)
-                con = sqlite3.connect("file:%s?mode=ro" % pathlib.Path(dbp).resolve(), uri=True)
                 try:
-                    cur = con.execute(q); rows = [dict(zip([d[0] for d in cur.description], r)) for r in cur.fetchall()]
-                finally:
-                    con.close()
-                return rows
+                    con = sqlite3.connect("file:%s?mode=ro" % pathlib.Path(dbp).resolve(), uri=True)
+                    con.execute("PRAGMA query_only = ON")
+                    try:
+                        cur = con.execute(q)
+                        rows = [dict(zip([d[0] for d in cur.description], r)) for r in cur.fetchmany(10000)]
+                    finally:
+                        con.close()
+                    return rows
+                except sqlite3.Error as ex:
+                    raise GamaRuntimeError("sql failed: %s" % ex, e.line, e.col) from None
             if e.name == "ask":
                 p = str(self.expr(e.args[0], env, row)) if e.args else ""
                 url = os.environ.get("GAMA_L_ASK_URL", "").strip()
                 model = os.environ.get("GAMA_L_ASK_MODEL", "deepseek-chat")
+                if url and not url.startswith("https://") and os.environ.get("GAMA_L_ASK_ALLOW_HTTP") != "1":
+                    raise GamaRuntimeError("ask: endpoint must be https://", e.line, e.col)
                 if not url:
                     self.last_ask = {"model": "mock", "prompt_hash": hashlib.sha256(p.encode()).hexdigest()}
-                    return "[mock-ai] " + p
+                    return "Unavailable"
                 body = json.dumps({"model": model, "messages": [{"role": "user", "content": p}]}).encode()
                 headers = {"Content-Type": "application/json"}
                 key = os.environ.get("GAMA_L_ASK_KEY", "")
                 if key: headers["Authorization"] = "Bearer " + key
-                req = urllib.request.Request(url.rstrip("/") + "/v1/chat/completions", data=body, headers=headers)
-                with urllib.request.urlopen(req, timeout=60) as r:
-                    d = json.loads(r.read().decode())
-                self.last_ask = {"model": model, "prompt_hash": hashlib.sha256(p.encode()).hexdigest()}
-                return d["choices"][0]["message"]["content"]
+                try:
+                    req = urllib.request.Request(url.rstrip("/") + "/v1/chat/completions", data=body, headers=headers)
+                    with urllib.request.urlopen(req, timeout=60) as r:
+                        d = json.loads(r.read(1 << 20).decode())
+                    self.last_ask = {"model": model, "prompt_hash": hashlib.sha256(p.encode()).hexdigest()}
+                    return d["choices"][0]["message"]["content"]
+                except Exception as ex:
+                    raise GamaRuntimeError("ask failed: %s" % ex, e.line, e.col) from None
             if e.name == "remember": self.memory[str(self.expr(e.args[0], env, row))] = self.expr(e.args[1], env, row); return True
             if e.name == "recall": return self.memory.get(str(self.expr(e.args[0], env, row)))
-            if e.name == "wait_user": return bool(self.interactive and input(f"[GAMA-L] {self.expr(e.args[0], env, row)} ").strip().lower() in ("yes","y","da"))
+            if e.name == "wait_user":
+                if not self.interactive:
+                    raise GamaRuntimeError("HITL required but session is non-interactive", e.line, e.col)
+                return input(f"[GAMA-L] {self.expr(e.args[0], env, row)} ").strip().lower() in ("yes", "y", "da")
             if e.name == "len": return len(self.expr(e.args[0], env, row))
             if e.name == "text": return str(self.expr(e.args[0], env, row))
+            if e.name in ("sql_write", "mail"): raise GamaRuntimeError(f"{e.name}: connector not configured", e.line, e.col)
             if e.name == "number": return Decimal(str(self.expr(e.args[0], env, row)))
             if e.name in self.funcs:
                 fn, closure = self.funcs[e.name]
@@ -602,8 +718,15 @@ class Interpreter:
             for stage, args in e.stages:
                 if stage == "filter": value = [r for r in value if self.truth(self.expr(args[0], env, r))]
                 elif stage == "select": value = [{f: r.get(f) for f in args} for r in value]
-                elif stage == "sum": value = sum((r.get(args[0], 0) or 0) for r in value)
-                elif stage == "limit": value = value[:int(self.expr(args[0], env, row))]
+                elif stage == "sum":
+                    try:
+                        value = sum((Decimal(str(r[args[0]])) for r in value), Decimal(0))
+                    except (KeyError, TypeError, ValueError) as ex:
+                        raise GamaRuntimeError("sum: %s" % ex, e.line, e.col) from None
+                elif stage == "limit":
+                    n = int(self.expr(args[0], env, row))
+                    if n < 0: raise GamaRuntimeError("limit must be >= 0", e.line, e.col)
+                    value = value[:n]
                 elif stage == "count": value = len(value)
                 elif stage == "map": value = [r.get(args[0]) for r in value]
             return value
@@ -616,7 +739,7 @@ def run(src: str, interactive=False):
 # ------------------------------------------------------------------ CLI
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="gamal2")
-    ap.add_argument("cmd", choices=["run", "check", "test"], nargs="?", default="run")
+    ap.add_argument("cmd", choices=["run", "check", "fmt", "test"], nargs="?", default="run")
     ap.add_argument("file", nargs="?")
     ap.add_argument("--interactive", action="store_true")
     a = ap.parse_args(argv)
@@ -627,14 +750,16 @@ def main(argv=None):
         return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
     if not a.file:
         print("usage: gamal2.py run FILE.gm"); return 2
-    src = open(a.file, encoding="utf-8").read()
     try:
         if a.cmd == "check":
             check_file(a.file); print("OK"); return 0
+        if a.cmd == "fmt":
+            src = pathlib.Path(a.file).read_text(encoding="utf-8"); parse(src)
+            sys.stdout.write(fmt_source(src)); return 0
         it = run_file(a.file, interactive=a.interactive)
         for line in it.out: print(line)
         return 0
-    except GamaError as e:
+    except (GamaError, OSError, ReturnSignal, TypeError, IndexError, ZeroDivisionError, ValueError) as e:
         print(f"{type(e).__name__}: {e}", file=sys.stderr); return 1
 
 if __name__ == "__main__":
