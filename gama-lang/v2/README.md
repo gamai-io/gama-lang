@@ -18,6 +18,8 @@ python3 gamal2.py pkg init .
 python3 gamal2.py pkg install .
 python3 gamal2.py pkg update .
 python3 gamal2.py pkg list .
+python3 gamal2.py pkg search registry.json
+python3 gamal2.py pkg add registry.json math 0.1.0
 ```
 
 ```toml
@@ -30,8 +32,9 @@ Path dependencies must stay inside the project root; symlinks are rejected.
 Git dependencies clone into `.gamal/cache/<name>` and are pinned in
 `.gamal/lock.json`; reinstall fails on a lock mismatch until `pkg update`.
 Modules resolve from `.gamal/modules/<name>` via `import "name/file.gm"`.
-There is no central registry yet, but any git URL (including private remotes)
-works with the host's git credentials.
+A local/static registry is a JSON file (path or `file://` URL) consumed by
+`pkg search|resolve|add`. There is no hosted central registry yet, but any git
+URL (including private remotes) works with the host's git credentials.
 
 ## Editor support (LSP, stdio)
 
@@ -40,16 +43,28 @@ python3 gamal2.py lsp
 ```
 
 JSON-RPC language server: `initialize`, `didOpen/didChange/didSave`
-diagnostics, completion, hover, definition, references, `shutdown`, `exit`.
-Positions are converted between LSP UTF-16 and Python indexes. A syntax-only
-VS Code package is in `vscode/` (TextMate grammar + snippets); it does not
-start the LSP itself.
+diagnostics, completion, hover, definition, references, document symbols,
+semantic tokens, `shutdown`, `exit`. Positions are converted between LSP
+UTF-16 and Python indexes. A syntax-only VS Code package is in `vscode/`
+(TextMate grammar + snippets); it does not start the LSP itself.
 
 ## Distribution
 
-`pyproject.toml` defines the `gama-l` package and console scripts `gama-l` and
-`gama-lsp`; modules are `gamal2`, `gama_lsp`, `gama_cli`, `gama_fmt`.
-The CLI wrapper is `gama_cli.py`. Build/install is not run in tests.
+`pyproject.toml` defines the `gama-l` package and console scripts `gama-l`,
+`gama-lsp`, `gama-doctor`; modules are `gamal2`, `gama_lsp`, `gama_cli`,
+`gama_fmt`, `gama_doctor`, `gama_mail`, `gama_registry`.
+The CLI wrapper is `gama_cli.py`. A wheel was built successfully in 22.8 KB
+during verification; publishing is not automated.
+
+## Doctor
+
+```bash
+python3 gamal2.py doctor
+python3 gamal2.py doctor --json
+```
+
+Checks Python, module imports, every example parse/run, formatter idempotence,
+LSP API, SQL write guard, and a local package install.
 
 ## Implemented
 
@@ -63,6 +78,7 @@ The CLI wrapper is `gama_cli.py`. Build/install is not run in tests.
 - `ask` (offline mock, or OpenAI-compatible `GAMA_L_ASK_URL`), `sql` (demo table, or read-only SQLite via `GAMA_L_DB`), `remember/recall`
 - `wait_user` (non-interactive returns `Denied`; falsy)
 - guarded `sql_write` (INSERT/UPDATE/DELETE; needs `GAMA_L_ALLOW_WRITE=1`, rejects DDL/stacked statements)
+- guarded SMTP `mail` (needs `GAMA_L_MAIL_ENABLED=1`; config via `GAMA_L_SMTP_*`)
 - `prove` (hash-chained receipt, optional HMAC via `GAMA_L_PROOF_KEY`) and `verify` (tamper detection)
 - static type errors and static effect violations
 - CLI `run`, `check`, `fmt`, `test`, `pkg`, `lsp`
@@ -70,26 +86,25 @@ The CLI wrapper is `gama_cli.py`. Build/install is not run in tests.
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 83/83
+python3 -m unittest discover -s tests -v   # 116/116
 ```
 
 Conformance coverage: arithmetic/pipes (20 cases), type errors, effect
 violations (including `sql.write`/`mail` stubs), HITL returns `Denied`,
 proof/tamper, duplicate proof keys, optional HMAC proof signatures (`GAMA_L_PROOF_KEY`; `GAMA_L_REQUIRE_SIG=1` requires them),
 imports/cycles/diamonds, multi-table SQLite schema checks, git/path package
-dependencies, LSP completion/hover/definition/references/didChange, guarded
-SQL writes, offline `ask` = `Unavailable`, 10 examples, canonical `fmt`, and
-distribution metadata.
+dependencies, LSP completion/hover/definition/references/symbols/tokens/
+didChange, local registry, guarded SQL writes and SMTP mail, offline `ask` =
+`Unavailable`, 11 examples, canonical `fmt`, doctor, and distribution metadata.
 
 ## Not implemented yet
 
-- central package registry (git and local dependencies work)
+- hosted central package registry (local/static and git dependencies work)
 - full type inference and generics
-- real AI/mail connectors (read-only SQLite, optional `ask`, and guarded
-  `sql_write` work)
+- real AI connector beyond optional OpenAI-compatible `ask`
 - full AST formatter (current `fmt` is token-based, preserves comments and
   strings, but does not reformat multi-line strings)
-- LSP code actions and semantic tokens; VS Code package is syntax-only
+- LSP code actions; VS Code package is syntax-only
 - publishing a built distribution
 
 The old v0.1 transpiler remains in `gama-lang/` for reference. Do not call this

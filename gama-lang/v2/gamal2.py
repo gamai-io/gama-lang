@@ -857,7 +857,15 @@ class Interpreter:
             if e.name == "sql_write":
                 q = str(self.expr(e.args[0], env, row)) if e.args else ""
                 return sql_write(q, e.line, e.col)
-            if e.name == "mail": raise GamaRuntimeError("mail: connector not configured", e.line, e.col)
+            if e.name == "mail":
+                if len(e.args) != 3:
+                    raise GamaRuntimeError("mail expects to, subject, body", e.line, e.col)
+                vals = [self.expr(a, env, row) for a in e.args]
+                try:
+                    from gama_mail import MailError, send_mail
+                    return send_mail(str(vals[0]), str(vals[1]), str(vals[2]), e.line, e.col)
+                except MailError as ex:
+                    raise GamaRuntimeError(str(ex), e.line, e.col) from None
             if e.name == "number": return Decimal(str(self.expr(e.args[0], env, row)))
             if e.name in self.funcs:
                 fn, closure = self.funcs[e.name]
@@ -1053,6 +1061,26 @@ def pkg_main(argv: list[str]) -> int:
     action = argv[0] if argv else "list"
     root = pathlib.Path(argv[1]).resolve() if len(argv) > 1 else pathlib.Path.cwd()
     if action == "init": return _pkg_init(root)
+    if action in ("search", "resolve", "add"):
+        import gama_registry as R
+        if len(argv) < 2:
+            print("usage: gamal2.py pkg %s <registry.json> [name] [version]" % action); return 2
+        try:
+            idx = R.load_registry(argv[1])
+            if action == "search":
+                q = argv[2] if len(argv) > 2 else ""
+                for row in R.search(idx, q):
+                    print("%s %s %s" % (row["name"], row.get("version") or "-", row.get("git") or "-"))
+                return 0
+            if len(argv) < 3:
+                print("usage: gamal2.py pkg %s <registry.json> <name> [version]" % action); return 2
+            entry = R.resolve(idx, argv[2], argv[3] if len(argv) > 3 else None)
+            if action == "resolve":
+                print(json.dumps(entry, indent=2)); return 0
+            R.add_dependency(pathlib.Path.cwd(), argv[2], entry)
+            print("added %s -> gamal.toml" % argv[2]); return 0
+        except R.RegistryError as ex:
+            print("registry error: %s" % ex); return 1
     if action == "install": return _pkg_install(root)
     if action == "update": return _pkg_install(root, update=True)
     if action == "list":
@@ -1062,18 +1090,21 @@ def pkg_main(argv: list[str]) -> int:
         for name, spec in (data.get("dependencies") or {}).items():
             print("%s %s" % (name, spec))
         return 0
-    print("usage: gamal2.py pkg init|install|update|list [dir]"); return 2
+    print("usage: gamal2.py pkg init|install|update|list|search|resolve|add ..."); return 2
 
 # ------------------------------------------------------------------ CLI
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "doctor":
+        import gama_doctor
+        return gama_doctor.main(argv[1:])
     if argv and argv[0] == "lsp":
         import gama_lsp
         return gama_lsp.main() or 0
     if argv and argv[0] == "pkg":
         return pkg_main(argv[1:])
     ap = argparse.ArgumentParser(prog="gamal2")
-    ap.add_argument("cmd", choices=["run", "check", "fmt", "test", "lsp"], nargs="?", default="run")
+    ap.add_argument("cmd", choices=["run", "check", "fmt", "test", "lsp", "doctor"], nargs="?", default="run")
     ap.add_argument("file", nargs="?")
     ap.add_argument("--interactive", action="store_true")
     a = ap.parse_args(argv)

@@ -286,6 +286,129 @@ def hover(uri: str, text: str, line: int, character: int):
     return {"contents": {"kind": "markdown", "value": value}}
 
 
+# ------------------------------------------------- document symbols & themes
+KIND_SYMBOL_FUNCTION = 12
+KIND_SYMBOL_VARIABLE = 13
+
+TOKEN_TYPES = ["keyword", "type", "function", "variable", "string", "number", "operator"]
+TYPE_NAMES = {"Int", "Decimal", "Text", "Bool", "List", "Table", "Any"}
+
+T_KEYWORD, T_TYPE, T_FUNCTION, T_VARIABLE, T_STRING, T_NUMBER, T_OP = range(7)
+
+
+def _fn_names(text: str) -> set:
+    return {n.name for n in _declarations(text) if isinstance(n, G.Fn)}
+
+
+def document_symbols(uri: str, text: str):
+    """Return LSP DocumentSymbol[] for top-level let/fn declarations."""
+    out = []
+    for node in _declarations(text):
+        is_fn = isinstance(node, G.Fn)
+        loc = _decl_start(uri, text, node, node.name)
+        if loc is None:
+            continue
+        rng = loc["range"]
+        out.append({
+            "name": node.name,
+            "detail": "%s(%s)" % ("fn" if is_fn else "let", node.name),
+            "kind": KIND_SYMBOL_FUNCTION if is_fn else KIND_SYMBOL_VARIABLE,
+            "range": rng,
+            "selectionRange": rng,
+            "children": [],
+        })
+    return out
+
+
+def _line_offsets(src: str):
+    offsets = []
+    pos = 0
+    for line in src.split("\n"):
+        offsets.append(pos)
+        pos += len(line) + 1
+    return offsets
+
+
+def _raw_lexeme(src: str, offsets, tok) -> str:
+    """Source spelling of a token (strings keep quotes/escapes)."""
+    line0 = max(0, int(tok.line) - 1)
+    if line0 >= len(offsets):
+        return str(tok.val)
+    start = offsets[line0] + max(0, int(tok.col) - 1)
+    if tok.kind == "STRING":
+        i = start + 1
+        n = len(src)
+        while i < n:
+            if src[i] == "\\":
+                i += 2
+                continue
+            if src[i] == src[start]:
+                i += 1
+                break
+            i += 1
+        return src[start:i]
+    if tok.kind == "NUMBER":
+        return str(tok.val)
+    return str(tok.val)
+
+
+def _token_type(tok, fns):
+    if tok.kind == "KW":
+        return T_KEYWORD
+    if tok.kind == "IDENT":
+        if tok.val in TYPE_NAMES:
+            return T_TYPE
+        if tok.val in G.BUILTINS or tok.val in fns:
+            return T_FUNCTION
+        return T_VARIABLE
+    if tok.kind == "STRING":
+        return T_STRING
+    if tok.kind == "NUMBER":
+        return T_NUMBER
+    if tok.kind == "OP":
+        return T_OP
+    return None
+
+
+def semantic_tokens(uri: str, text: str):
+    """Full-document semantic tokens (LSP delta encoding)."""
+    try:
+        toks = G.lex(text)
+    except Exception:
+        return {"data": []}
+    src = text or ""
+    lines = src.split("\n")
+    offsets = _line_offsets(src)
+    fns = _fn_names(text)
+    data = []
+    prev_line = 0
+    prev_start = 0
+    for tok in toks:
+        if tok.kind in ("NL", "EOF"):
+            continue
+        ttype = _token_type(tok, fns)
+        if ttype is None:
+            continue
+        line0 = max(0, int(tok.line) - 1)
+        if line0 >= len(lines):
+            continue
+        char_idx = max(0, int(tok.col) - 1)
+        start = utf16_len(lines[line0][:char_idx])
+        length = utf16_len(_raw_lexeme(src, offsets, tok))
+        if length <= 0:
+            continue
+        if line0 == prev_line:
+            delta_line = 0
+            delta_start = start - prev_start
+        else:
+            delta_line = line0 - prev_line
+            delta_start = start
+        data.extend([delta_line, delta_start, length, ttype, 0])
+        prev_line = line0
+        prev_start = start
+    return {"data": data}
+
+
 def main():
     docs: dict[str, str] = {}
     while True:
@@ -303,6 +426,12 @@ def main():
                     "hoverProvider": True,
                     "definitionProvider": True,
                     "referencesProvider": True,
+                    "documentSymbolProvider": True,
+                    "semanticTokensProvider": {
+                        "legend": {"tokenTypes": TOKEN_TYPES,
+                                   "tokenModifiers": []},
+                        "full": True,
+                    },
                 },
                 "serverInfo": {"name": "gama-lsp", "version": "2.0-core"},
             }})
@@ -351,6 +480,18 @@ def main():
             line = int(pos.get("line") or 0)
             ch = int(pos.get("character") or 0)
             send({"jsonrpc": "2.0", "id": mid, "result": references(uri, text, line, ch)})
+        elif method == "textDocument/documentSymbol":
+            td = params.get("textDocument") or {}
+            uri = td.get("uri") or ""
+            text = docs.get(uri, td.get("text") or "")
+            send({"jsonrpc": "2.0", "id": mid,
+                  "result": document_symbols(uri, text)})
+        elif method == "textDocument/semanticTokens/full":
+            td = params.get("textDocument") or {}
+            uri = td.get("uri") or ""
+            text = docs.get(uri, td.get("text") or "")
+            send({"jsonrpc": "2.0", "id": mid,
+                  "result": semantic_tokens(uri, text)})
         elif mid is not None:
             send({"jsonrpc": "2.0", "id": mid, "result": None})
 
