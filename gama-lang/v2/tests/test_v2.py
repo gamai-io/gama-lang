@@ -35,6 +35,24 @@ class V2Tests(unittest.TestCase):
     def test_if(self):
         it = G.run('let x = 5\nif x > 3 {\n print "big"\n} else {\n print "small"\n}\n')
         self.assertEqual(it.out, ['big'])
+    def test_import(self):
+        it = G.run_file(str(pathlib.Path(__file__).resolve().parents[1] / 'examples' / 'with_import.gm'))
+        self.assertEqual(it.out[0], '42')
+        self.assertTrue(it.env.get('_verify')['ok'])
+    def test_sqlite_read(self):
+        import os, sqlite3, tempfile
+        d = tempfile.mkdtemp(); p = os.path.join(d, 'demo.db')
+        con = sqlite3.connect(p)
+        con.execute('create table t (a int, b text)')
+        con.execute("insert into t values (1, 'x')")
+        con.commit(); con.close()
+        old = os.environ.get('GAMA_L_DB'); os.environ['GAMA_L_DB'] = p
+        try:
+            it = G.run('let r = sql("select a,b from t")\nprint r | count\n')
+            self.assertEqual(it.out, ['1'])
+        finally:
+            if old is None: os.environ.pop('GAMA_L_DB', None)
+            else: os.environ['GAMA_L_DB'] = old
     def test_function(self):
         it = G.run('fn add(a: Int, b: Int) -> Int effects {} {\n return a+b\n}\nprint add(2,3)\n')
         self.assertEqual(it.out, ['5'])

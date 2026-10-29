@@ -13,7 +13,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import pathlib
+import sqlite3
 import sys
+import urllib.request
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -33,7 +37,7 @@ class GamaRuntimeError(GamaError): pass
 # ------------------------------------------------------------------ lexer
 KEYWORDS = {"let", "fn", "if", "else", "return", "true", "false", "null",
             "prove", "verify", "print", "effects", "filter", "select", "sum",
-            "limit", "count", "map", "in"}
+            "limit", "count", "map", "in", "import"}
 
 @dataclass
 class Tok:
@@ -107,6 +111,8 @@ class Call: name: str; args: list; line: int; col: int
 @dataclass
 class Pipe: base: Any; stages: list; line: int; col: int
 @dataclass
+class Import: path: str; line: int; col: int
+@dataclass
 class Let: name: str; type_name: str | None; expr: Any; line: int; col: int
 @dataclass
 class Assign: name: str; expr: Any; line: int; col: int
@@ -157,6 +163,9 @@ class Parser:
         self.expect("OP", "}"); return out
     def statement(self):
         x = self.peek()
+        if x.kind == "KW" and x.val == "import":
+            self.take(); path = self.expect("STRING").val
+            return Import(path, x.line, x.col)
         if x.kind == "KW" and x.val == "let":
             self.take(); name = self.expect("IDENT").val; tn = None
             if self.at("OP", ":"): self.take(); tn = self.expect("IDENT").val
@@ -327,6 +336,8 @@ class Checker:
                 self.funcs[s.name] = s
         for s in stmts: self.stmt(s, None)
     def stmt(self, s, allowed):
+        if isinstance(s, Import):
+            raise GamaError("import requires check_file/run_file", s.line, s.col)
         if isinstance(s, Let):
             t = self.expr(s.expr)
             if s.type_name and not self.compat(t, s.type_name): raise GamaTypeError(f"{s.name}: {t} != {s.type_name}", s.line, s.col)
@@ -422,10 +433,36 @@ class Checker:
             return t
         return "Any"
 
+def _flatten(path: pathlib.Path, seen: set | None = None) -> list:
+    seen = seen or set()
+    path = path.resolve()
+    if path in seen:
+        raise GamaError("import cycle: %s" % path)
+    seen.add(path)
+    ast = parse(path.read_text(encoding="utf-8"))
+    out = []
+    for s in ast:
+        if isinstance(s, Import):
+            out.extend(_flatten((path.parent / s.path), seen))
+        else:
+            out.append(s)
+    seen.remove(path)
+    return out
+
+def load_file(path: str):
+    return _flatten(pathlib.Path(path))
+
 def check(src: str):
     ast = parse(src)
     Checker().program(ast)
     return ast
+
+def check_file(path: str):
+    ast = load_file(path); Checker().program(ast); return ast
+
+def run_file(path: str, interactive=False):
+    ast = check_file(path)
+    return Interpreter(interactive=interactive).run(ast)
 
 # ------------------------------------------------------------------ evaluator
 class ReturnSignal(Exception):
@@ -516,11 +553,35 @@ class Interpreter:
                     "==":lambda:a==b,"!=":lambda:a!=b,"<":lambda:a<b,"<=":lambda:a<=b,
                     ">":lambda:a>b,">=":lambda:a>=b}[e.op]()
         if isinstance(e, Call):
-            if e.name == "sql": return [dict(r) for r in DEMO_ROWS]
+            if e.name == "sql":
+                q = str(self.expr(e.args[0], env, row)) if e.args else ""
+                dbp = os.environ.get("GAMA_L_DB", "").strip()
+                if not dbp:
+                    return [dict(r) for r in DEMO_ROWS]
+                if not q.lstrip().lower().startswith(("select", "with")):
+                    raise GamaRuntimeError("GAMA_L_DB only allows SELECT/WITH", e.line, e.col)
+                con = sqlite3.connect("file:%s?mode=ro" % pathlib.Path(dbp).resolve(), uri=True)
+                try:
+                    cur = con.execute(q); rows = [dict(zip([d[0] for d in cur.description], r)) for r in cur.fetchall()]
+                finally:
+                    con.close()
+                return rows
             if e.name == "ask":
                 p = str(self.expr(e.args[0], env, row)) if e.args else ""
-                self.last_ask = {"model": "mock", "prompt_hash": hashlib.sha256(p.encode()).hexdigest()}
-                return "[mock-ai] " + p
+                url = os.environ.get("GAMA_L_ASK_URL", "").strip()
+                model = os.environ.get("GAMA_L_ASK_MODEL", "deepseek-chat")
+                if not url:
+                    self.last_ask = {"model": "mock", "prompt_hash": hashlib.sha256(p.encode()).hexdigest()}
+                    return "[mock-ai] " + p
+                body = json.dumps({"model": model, "messages": [{"role": "user", "content": p}]}).encode()
+                headers = {"Content-Type": "application/json"}
+                key = os.environ.get("GAMA_L_ASK_KEY", "")
+                if key: headers["Authorization"] = "Bearer " + key
+                req = urllib.request.Request(url.rstrip("/") + "/v1/chat/completions", data=body, headers=headers)
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    d = json.loads(r.read().decode())
+                self.last_ask = {"model": model, "prompt_hash": hashlib.sha256(p.encode()).hexdigest()}
+                return d["choices"][0]["message"]["content"]
             if e.name == "remember": self.memory[str(self.expr(e.args[0], env, row))] = self.expr(e.args[1], env, row); return True
             if e.name == "recall": return self.memory.get(str(self.expr(e.args[0], env, row)))
             if e.name == "wait_user": return bool(self.interactive and input(f"[GAMA-L] {self.expr(e.args[0], env, row)} ").strip().lower() in ("yes","y","da"))
@@ -569,8 +630,8 @@ def main(argv=None):
     src = open(a.file, encoding="utf-8").read()
     try:
         if a.cmd == "check":
-            check(src); print("OK"); return 0
-        it = run(src, interactive=a.interactive)
+            check_file(a.file); print("OK"); return 0
+        it = run_file(a.file, interactive=a.interactive)
         for line in it.out: print(line)
         return 0
     except GamaError as e:

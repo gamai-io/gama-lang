@@ -1,0 +1,5 @@
+# small library module
+fn add(a: Int, b: Int) -> Int effects {} {
+  return a + b
+}
+let lib_value = 41

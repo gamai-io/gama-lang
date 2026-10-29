@@ -13,13 +13,14 @@ python3 gamal2.py test
 
 ## Implemented
 
+- `import "file.gm"` with cycle detection (relative to the importing file)
 - `let` with optional type annotation, `:=` assignment
 - `fn` with typed parameters, return type, `effects { ... }`
 - `if` / `else` blocks, `return`
 - literals: text, int, decimal, bool, null, list, map
 - arithmetic/comparison/boolean operators
 - pipes: `filter`, `select`, `sum`, `limit`, `count`, `map`
-- `ask` (offline mock + prompt hash), `sql` (demo table), `remember/recall`
+- `ask` (offline mock, or OpenAI-compatible `GAMA_L_ASK_URL`), `sql` (demo table, or read-only SQLite via `GAMA_L_DB`), `remember/recall`
 - `wait_user` (non-interactive fails closed)
 - `prove` (hash-chained receipt) and `verify` (tamper detection)
 - static type errors and static effect violations
@@ -28,11 +29,12 @@ python3 gamal2.py test
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 10/10
+python3 -m unittest discover -s tests -v   # 13/13
 ```
 
 Conformance coverage is the T1-T5 subset from `SPEC_2.0.md`:
-arithmetic/pipes, type error, effect violation, HITL denial, proof/tamper.
+arithmetic/pipes, type error, effect violation, HITL denial, proof/tamper,
+plus imports and real read-only SQLite.
 
 ## Not implemented yet
 
