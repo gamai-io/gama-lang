@@ -5,7 +5,7 @@ Our **polymorphic programming paradigm** where **AI is built into the language**
 machines into AI-native terminals of our network.
 
 ```
-gama-lang/    GAMA-L: AI-first dataflow programming language (v0.1 runtime, 2.0 spec in SPEC_2.0.md)
+gama-lang/    GAMA-L: v0.1 transpiler + v2/ executable 2.0 core (parser/checker/interpreter)
 gama-os/      GAMA-OS: branded Linux appliance line (v0.1 scaffold, 2.0 roadmap in gama-os/ROADMAP_2.0.md)
 REPORT_*.md   THE "what is where" REPORT (start here!)
 ```
@@ -13,7 +13,8 @@ REPORT_*.md   THE "what is where" REPORT (start here!)
 ## Quick start
 1. Read `REPORT_what_is_where.md` — the map of the whole thing.
 2. `gama-lang/gamal.py` — transpiler (GAMA-L → Python).
-3. `gama-lang/gamal_runtime.py` — runtime (SQL + AI + mail + memory + pipes).
+3. `gama-lang/v2/gamal2.py` — executable 2.0 core (parser + type/effect checker + interpreter).
+4. `gama-lang/v2/examples/invoice.gm` — SQL → pipe → `prove` → `verify` demo.
 4. `gama-os/builder/gama-os.sh` — build every OS role (kiosk/terminal/pro/node).
 
 > Proprietary work. GAMA TRADE, 2026.
