@@ -60,7 +60,8 @@ class TableType(str):
 # ------------------------------------------------------------------ lexer
 KEYWORDS = {"let", "fn", "if", "else", "return", "true", "false", "null",
             "prove", "verify", "print", "effects", "filter", "select", "sum",
-            "limit", "count", "map", "in", "import", "make", "use", "wait"}
+            "limit", "count", "map", "in", "import", "make", "use", "wait",
+            "for", "while", "break", "continue"}
 
 @dataclass
 class Tok:
@@ -141,6 +142,16 @@ class Import: path: str; line: int; col: int
 @dataclass
 class Use: name: str; line: int; col: int
 @dataclass
+class For: name: str; iterable: Any; body: list; line: int; col: int
+@dataclass
+class While: cond: Any; body: list; line: int; col: int
+@dataclass
+class Break: line: int; col: int
+@dataclass
+class Continue: line: int; col: int
+@dataclass
+class Index: base: Any; index: Any; line: int; col: int
+@dataclass
 class Let: name: str; type_name: str | None; expr: Any; line: int; col: int
 @dataclass
 class Assign: name: str; expr: Any; line: int; col: int
@@ -204,6 +215,17 @@ class Parser:
             return Import(path, x.line, x.col)
         if x.kind == "KW" and x.val == "use":
             self.take(); return Use(self.expect("IDENT").val, x.line, x.col)
+        if x.kind == "KW" and x.val == "for":
+            self.take(); name = self.expect("IDENT").val
+            self.expect("KW", "in"); iterable = self.expr(); self.skip_nl()
+            return For(name, iterable, self.block(), x.line, x.col)
+        if x.kind == "KW" and x.val == "while":
+            self.take(); cond = self.expr(); self.skip_nl()
+            return While(cond, self.block(), x.line, x.col)
+        if x.kind == "KW" and x.val == "break":
+            self.take(); return Break(x.line, x.col)
+        if x.kind == "KW" and x.val == "continue":
+            self.take(); return Continue(x.line, x.col)
         if x.kind == "KW" and x.val == "let":
             self.take(); name = self.expect("IDENT").val; tn = None
             if self.at("OP", ":"): self.take(); tn = self.expect("IDENT").val
@@ -300,7 +322,13 @@ class Parser:
     def unary(self):
         if self.at("OP") and self.peek().val in ("!", "-"):
             x = self.take(); return Unary(x.val, self.unary(), x.line, x.col)
-        return self.primary()
+        return self.postfix()
+    def postfix(self):
+        e = self.primary()
+        while self.at("OP", "["):
+            x = self.take(); idx = self.expr(); self.expect("OP", "]")
+            e = Index(e, idx, x.line, x.col)
+        return e
     def primary(self):
         x = self.peek()
         if x.kind == "NUMBER": self.take(); return Literal(x.val, x.line, x.col)
@@ -451,6 +479,7 @@ class Checker:
         self.funcs: dict[str, Fn] = {}
         self.effects: set[str] = set()
         self.ret_type: str | None = None
+        self.loop_depth = 0
     def push(self): self.scope.append({})
     def pop(self): self.scope.pop()
     def get(self, n):
@@ -469,6 +498,22 @@ class Checker:
             raise GamaError("import requires check_file/run_file", s.line, s.col)
         if isinstance(s, Use):
             return
+        if isinstance(s, For):
+            t = self.expr(s.iterable)
+            if t not in ("List", "Table", "Text", "Any"):
+                raise GamaTypeError("for needs List/Table/Text", s.line, s.col)
+            self.push(); self.set(s.name, "Any"); self.loop_depth += 1
+            [self.stmt(x, allowed) for x in s.body]
+            self.loop_depth -= 1; self.pop()
+            return
+        if isinstance(s, While):
+            ct = self.expr(s.cond)
+            if ct != "Bool": raise GamaTypeError("while condition must be Bool", s.line, s.col)
+            self.loop_depth += 1; [self.stmt(x, allowed) for x in s.body]; self.loop_depth -= 1
+            return
+        if isinstance(s, (Break, Continue)):
+            if self.loop_depth <= 0: raise GamaTypeError("break/continue outside loop", s.line, s.col)
+            return
         if isinstance(s, Let):
             t = self.expr(s.expr)
             if s.type_name and not self.compat(t, s.type_name): raise GamaTypeError(f"{s.name}: {t} != {s.type_name}", s.line, s.col)
@@ -477,7 +522,7 @@ class Checker:
             t = self.expr(s.expr)
             cur = self.get(s.name)
             if cur is None: self.set(s.name, t)
-            elif not self.compat(t, cur): raise GamaTypeError(f"{s.name}: {t} != {cur}", s.line, s.col)
+            elif t != "Any" and not self.compat(t, cur): raise GamaTypeError(f"{s.name}: {t} != {cur}", s.line, s.col)
         elif isinstance(s, Fn):
             self.fn(s)
         elif isinstance(s, If):
@@ -515,6 +560,12 @@ class Checker:
             types = {self.expr(x, row) for x in e.items}
             return "Table" if types and types <= {"Json"} else "List"
         if isinstance(e, MapExpr): [self.expr(x, row) for x in e.items.values()]; return "Json"
+        if isinstance(e, Index):
+            bt = self.expr(e.base, row); it = self.expr(e.index, row)
+            if bt not in ("List", "Table", "Text", "Any"):
+                raise GamaTypeError("index needs List/Table/Text", e.line, e.col)
+            if it != "Int": raise GamaTypeError("index must be Int", e.line, e.col)
+            return "Text" if bt == "Text" else ("Json" if bt == "Table" else "Any")
         if isinstance(e, Attr):
             t = self.expr(e.base)
             if t not in ("Json", "Any", "Table"): raise GamaTypeError("field access needs Json/Table", e.line, e.col)
@@ -540,6 +591,7 @@ class Checker:
             a = self.expr(e.left, row); b = self.expr(e.right, row)
             if e.op in ("+", "-", "*", "/", "%"):
                 if e.op == "+" and a == b == "Text": return "Text"
+                if "Any" in (a, b): return "Any"
                 if a not in NUM or b not in NUM: raise GamaTypeError(f"{e.op} expects numbers", e.line, e.col)
                 return "Decimal" if "Decimal" in (a, b) or e.op == "/" else "Int"
             if e.op in ("<", "<=", ">", ">="):
@@ -707,6 +759,9 @@ def fmt_source(src: str) -> str:
 class ReturnSignal(Exception):
     def __init__(self, value): self.value = value
 
+class BreakSignal(Exception): pass
+class ContinueSignal(Exception): pass
+
 class Env:
     def __init__(self, parent=None): self.v = {}; self.parent = parent
     def get(self, n):
@@ -736,6 +791,28 @@ class Interpreter:
         if isinstance(s, Let): env.set(s.name, self.expr(s.expr, env))
         elif isinstance(s, Assign): env.assign(s.name, self.expr(s.expr, env))
         elif isinstance(s, Use): pass
+        elif isinstance(s, For):
+            seq = self.expr(s.iterable, env)
+            if isinstance(seq, str): seq = list(seq)
+            if not isinstance(seq, (list, tuple)): raise GamaRuntimeError("for needs list/text", s.line, s.col)
+            for item in seq:
+                local = Env(env); local.set(s.name, item)
+                try:
+                    for x in s.body: self.stmt(x, local)
+                except ContinueSignal: continue
+                except BreakSignal: break
+        elif isinstance(s, While):
+            n = 0
+            while self.truth(self.expr(s.cond, env)):
+                n += 1
+                if n > int(os.environ.get("GAMA_L_LOOP_LIMIT", "1000000")):
+                    raise GamaRuntimeError("loop limit exceeded", s.line, s.col)
+                try:
+                    for x in s.body: self.stmt(x, env)
+                except ContinueSignal: continue
+                except BreakSignal: break
+        elif isinstance(s, Break): raise BreakSignal()
+        elif isinstance(s, Continue): raise ContinueSignal()
         elif isinstance(s, Fn): self.funcs[s.name] = (s, env)
         elif isinstance(s, If):
             if self.truth(self.expr(s.cond, env)):
@@ -800,6 +877,12 @@ class Interpreter:
         if isinstance(e, Literal): return e.value
         if isinstance(e, ListExpr): return [self.expr(x, env, row) for x in e.items]
         if isinstance(e, MapExpr): return {k: self.expr(v, env, row) for k, v in e.items.items()}
+        if isinstance(e, Index):
+            base = self.expr(e.base, env, row); idx = self.expr(e.index, env, row)
+            try:
+                return base[int(idx)]
+            except (IndexError, KeyError, TypeError, ValueError):
+                raise GamaRuntimeError("index out of range or invalid", e.line, e.col) from None
         if isinstance(e, Attr):
             base = self.expr(e.base, env, row)
             if not isinstance(base, dict): raise GamaRuntimeError("field access needs Json/Table", e.line, e.col)
