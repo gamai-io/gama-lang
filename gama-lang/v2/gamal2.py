@@ -51,6 +51,13 @@ class Denied:
     def __str__(self): return "Denied"
     __repr__ = __str__
 
+class ResultVal:
+    """Runtime Result value: Ok(value) or Err(error)."""
+    def __init__(self, ok: bool, value): self.ok, self.value = ok, value
+    def __bool__(self): return self.ok
+    def __str__(self): return ("Ok(" if self.ok else "Err(") + str(self.value) + ")"
+    __repr__ = __str__
+
 class TableType(str):
     """String-compatible 'Table' type carrying an optional column set."""
     fields: set[str] | None
@@ -61,7 +68,7 @@ class TableType(str):
 KEYWORDS = {"let", "fn", "if", "else", "return", "true", "false", "null",
             "prove", "verify", "print", "effects", "filter", "select", "sum",
             "limit", "count", "map", "in", "import", "make", "use", "wait",
-            "for", "while", "break", "continue"}
+            "for", "while", "break", "continue", "match"}
 
 @dataclass
 class Tok:
@@ -160,6 +167,8 @@ class Param: name: str; type_name: str; default: Any = None
 @dataclass
 class Fn: name: str; params: list; ret: str | None; effects: set | None; body: list; line: int; col: int
 @dataclass
+class Match: expr: Any; arms: list; line: int; col: int
+@dataclass
 class If: cond: Any; then: list; other: list | None; line: int; col: int
 @dataclass
 class Return: expr: Any; line: int; col: int
@@ -231,6 +240,7 @@ class Parser:
             if self.at("OP", ":"): self.take(); tn = self.expect("IDENT").val
             self.expect("OP", "="); self.skip_nl(); return Let(name, tn, self.expr(), x.line, x.col)
         if x.kind == "KW" and x.val in ("fn", "make"): return self.fn()
+        if x.kind == "KW" and x.val == "match": return self.match_stmt()
         if x.kind == "KW" and x.val == "if": return self.if_stmt()
         if x.kind == "KW" and x.val == "return":
             self.take(); return Return(self.expr(), x.line, x.col)
@@ -284,6 +294,21 @@ class Parser:
         else:
             self.i = save
         return If(cond, then, other, x.line, x.col)
+    def match_stmt(self):
+        x = self.take(); subject = self.expr(); self.skip_nl(); self.expect("OP", "{")
+        arms = []
+        while not self.at("OP", "}"):
+            self.skip_seps()
+            if self.at("OP", "}"): break
+            arm = self.take()
+            if arm.kind != "IDENT" or arm.val not in ("Ok", "Err", "_"):
+                raise GamaError("match arm must be Ok(x), Err(e) or _", arm.line, arm.col)
+            var = None
+            if arm.val != "_":
+                self.expect("OP", "("); var = self.expect("IDENT").val; self.expect("OP", ")")
+            self.skip_nl(); body = self.block(); arms.append((arm.val, var, body)); self.skip_seps()
+        self.expect("OP", "}")
+        return Match(subject, arms, x.line, x.col)
     def expr(self): return self.pipe()
     def pipe(self):
         left = self.binary(0); stages = []
@@ -386,6 +411,7 @@ def parse(src: str):
 # ------------------------------------------------------------------ types / checker
 NUM = {"Int", "Decimal"}
 def tname(v) -> str:
+    if isinstance(v, ResultVal): return "Result"
     if v is None: return "Null"
     if isinstance(v, bool): return "Bool"
     if isinstance(v, int): return "Int"
@@ -411,6 +437,8 @@ BUILTINS = {
     "sql_write": ({"sql.write"}, "Bool"),
     "mail": ({"mail"}, "Bool"),
     "round": (set(), "Decimal"),
+    "Ok": (set(), "Result"),
+    "Err": (set(), "Result"),
 }
 
 def sqlite_schema() -> dict[str, set[str]] | None:
@@ -510,6 +538,16 @@ class Checker:
             ct = self.expr(s.cond)
             if ct != "Bool": raise GamaTypeError("while condition must be Bool", s.line, s.col)
             self.loop_depth += 1; [self.stmt(x, allowed) for x in s.body]; self.loop_depth -= 1
+            return
+        if isinstance(s, Match):
+            t = self.expr(s.expr)
+            if t not in ("Result", "Any"):
+                raise GamaTypeError("match expects Result", s.line, s.col)
+            for kind, var, body in s.arms:
+                self.push()
+                if var: self.set(var, "Any")
+                [self.stmt(x, allowed) for x in body]
+                self.pop()
             return
         if isinstance(s, (Break, Continue)):
             if self.loop_depth <= 0: raise GamaTypeError("break/continue outside loop", s.line, s.col)
@@ -811,6 +849,16 @@ class Interpreter:
                     for x in s.body: self.stmt(x, env)
                 except ContinueSignal: continue
                 except BreakSignal: break
+        elif isinstance(s, Match):
+            rv = self.expr(s.expr, env)
+            if not isinstance(rv, ResultVal): raise GamaRuntimeError("match expects Result", s.line, s.col)
+            for kind, var, body in s.arms:
+                if kind == "_" or (kind == "Ok" and rv.ok) or (kind == "Err" and not rv.ok):
+                    local = Env(env)
+                    if var: local.set(var, rv.value)
+                    for x in body: self.stmt(x, local)
+                    return
+            raise GamaRuntimeError("match: no arm matched", s.line, s.col)
         elif isinstance(s, Break): raise BreakSignal()
         elif isinstance(s, Continue): raise ContinueSignal()
         elif isinstance(s, Fn): self.funcs[s.name] = (s, env)
@@ -835,6 +883,7 @@ class Interpreter:
     def render(self, v):
         if isinstance(v, Decimal): return format(v, "f")
         if isinstance(v, (dict, list)): return json.dumps(v, ensure_ascii=False, default=str)
+        if isinstance(v, ResultVal): return str(v)
         return str(v)
     def prove(self, name, val):
         if name in self.proofs:
@@ -927,6 +976,9 @@ class Interpreter:
             except (ZeroDivisionError, ArithmeticError, TypeError, ValueError) as ex:
                 raise GamaRuntimeError(f"{e.op}: {ex}", e.line, e.col) from None
         if isinstance(e, Call):
+            if e.name in ("Ok", "Err"):
+                if len(e.args) != 1: raise GamaRuntimeError(f"{e.name} expects 1 arg", e.line, e.col)
+                return ResultVal(e.name == "Ok", self.expr(e.args[0], env, row))
             if e.name == "sql":
                 q = str(self.expr(e.args[0], env, row)) if e.args else ""
                 dbp = os.environ.get("GAMA_L_DB", "").strip()
