@@ -5,8 +5,8 @@ Our **polymorphic programming paradigm** where **AI is built into the language**
 machines into AI-native terminals of our network.
 
 ```
-gama-lang/    GAMA-L: AI-first dataflow programming language (v0.1)
-gama-os/      GAMA-OS: own operating-system product line (v0.1)
+gama-lang/    GAMA-L: AI-first dataflow programming language (v0.1 runtime, 2.0 spec in SPEC_2.0.md)
+gama-os/      GAMA-OS: branded Linux appliance line (v0.1 scaffold, 2.0 roadmap in gama-os/ROADMAP_2.0.md)
 REPORT_*.md   THE "what is where" REPORT (start here!)
 ```
 
