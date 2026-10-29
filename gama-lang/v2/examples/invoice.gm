@@ -1,0 +1,10 @@
+# GAMA-L 2.0 core demo: SQL table -> pipe -> proof
+let rows = sql("select konto, naziv, mjesto, neto from kupdob")
+let sarajevo = rows | filter mjesto == "Sarajevo" | select konto, naziv
+let n = sarajevo | count
+print n
+
+let total = 117.00
+prove invoice = { invoice: "MOCK-2026-001", count: n, total: total }
+print invoice
+verify invoice
