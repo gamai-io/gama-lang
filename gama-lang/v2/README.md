@@ -29,6 +29,15 @@ math = { path = "../math" }
 Installed modules go to `.gamal/modules/<name>` and are resolved by
 `import "name/file.gm"`. There is no remote registry yet.
 
+## Editor support (LSP, stdio)
+
+```bash
+python3 gamal2.py lsp
+```
+
+Minimal JSON-RPC language server: `initialize`, `didOpen/didChange/didSave`
+diagnostics, `shutdown`, `exit`. No completion/hover yet.
+
 ## Implemented
 
 - `import "file.gm"` with cycle detection (relative to the importing file)
@@ -42,12 +51,12 @@ Installed modules go to `.gamal/modules/<name>` and are resolved by
 - `wait_user` (non-interactive fails closed)
 - `prove` (hash-chained receipt) and `verify` (tamper detection)
 - static type errors and static effect violations
-- CLI `run`, `check`, `fmt`, `test`, `pkg`
+- CLI `run`, `check`, `fmt`, `test`, `pkg`, `lsp`
 
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 34/34
+python3 -m unittest discover -s tests -v   # 36/36
 ```
 
 Conformance coverage: arithmetic/pipes (20 cases), type errors, effect

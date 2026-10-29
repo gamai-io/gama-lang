@@ -117,6 +117,38 @@ class V2Tests(unittest.TestCase):
         finally:
             if old is None: os.environ.pop('GAMA_L_PROOF_KEY', None)
             else: os.environ['GAMA_L_PROOF_KEY'] = old
+    def test_real_sqlite_schema(self):
+        import os, sqlite3, tempfile, pathlib
+        db = pathlib.Path(tempfile.mkdtemp()) / 'x.db'
+        c = sqlite3.connect(db); c.execute('create table t(a int,b text)'); c.commit(); c.close()
+        old = os.environ.get('GAMA_L_DB'); os.environ['GAMA_L_DB'] = str(db)
+        try:
+            G.check('let r = sql("x")\nlet s = r | select a\n')
+            with self.assertRaises(G.GamaTypeError):
+                G.check('let r = sql("x")\nlet s = r | select z\n')
+        finally:
+            if old is None: os.environ.pop('GAMA_L_DB', None)
+            else: os.environ['GAMA_L_DB'] = old
+    def test_lsp_diagnostics(self):
+        import subprocess, json
+        p = subprocess.Popen(['python3', 'gama-lang/v2/gamal2.py', 'lsp'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        def send(o):
+            b = json.dumps(o).encode(); p.stdin.write(b'Content-Length: %d\r\n\r\n' % len(b) + b); p.stdin.flush()
+        def recv():
+            h = {}
+            while True:
+                l = p.stdout.readline()
+                if l in (b'\r\n', b'\n'): break
+                k, _, v = l.decode().partition(':'); h[k.lower()] = v.strip()
+            return json.loads(p.stdout.read(int(h['content-length'])))
+        try:
+            send({'jsonrpc':'2.0','id':1,'method':'initialize','params':{}}); recv()
+            send({'jsonrpc':'2.0','method':'textDocument/didOpen','params':{'textDocument':{'uri':'file:///tmp/x.gm','languageId':'gama-l','version':1,'text':'let x: Int = "s"\n'}}})
+            msg = recv(); self.assertTrue(msg['params']['diagnostics'])
+        finally:
+            try: send({'jsonrpc':'2.0','id':2,'method':'shutdown'}); recv(); send({'jsonrpc':'2.0','method':'exit'})
+            except Exception: pass
+            p.wait(timeout=5)
     def test_package_manager(self):
         import tempfile, pathlib
         root = pathlib.Path(tempfile.mkdtemp())

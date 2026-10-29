@@ -350,6 +350,19 @@ BUILTINS = {
     "mail": ({"mail"}, "Bool"),
 }
 
+def sqlite_schema() -> set[str] | None:
+    """Columns of the first table in GAMA_L_DB, if present (read-only)."""
+    db = os.environ.get("GAMA_L_DB", "")
+    if not db or not pathlib.Path(db).exists(): return None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        row = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT 1").fetchone()
+        if not row: con.close(); return None
+        cols = {r[1] for r in con.execute(f'PRAGMA table_info("{row[0]}")')}
+        con.close(); return cols or None
+    except Exception:
+        return None
+
 class Checker:
     def __init__(self):
         self.scope: list[dict[str, str]] = [{}]
@@ -461,8 +474,11 @@ class Checker:
                 eff, rt = BUILTINS[e.name]
                 self.effects |= eff
                 for a in e.args: self.expr(a, row)
-                if e.name == "sql" and not os.environ.get("GAMA_L_DB"):
-                    return TableType(DEMO_ROWS[0].keys())
+                if e.name == "sql":
+                    fields = sqlite_schema()
+                    if fields: return TableType(fields)
+                    if not os.environ.get("GAMA_L_DB"):
+                        return TableType(DEMO_ROWS[0].keys())
                 return rt
             f = self.funcs.get(e.name)
             if not f: raise GamaTypeError(f"unknown function {e.name}", e.line, e.col)
@@ -553,12 +569,36 @@ def run_file(path: str, interactive=False):
     ast = check_file(path)
     return Interpreter(interactive=interactive).run(ast)
 
+def _brace_delta(line: str) -> int:
+    """Net braces on a line, ignoring strings and comments."""
+    d = 0; i = 0; q = None; n = len(line)
+    while i < n:
+        c = line[i]
+        if q:
+            if c == "\\": i += 2; continue
+            if c == q: q = None
+        elif c in "\"'": q = c
+        elif c == "#": break
+        elif c == "{": d += 1
+        elif c == "}": d -= 1
+        i += 1
+    return d
+
 def fmt_source(src: str) -> str:
-    """Deterministic whitespace formatter (full AST formatting is later)."""
+    """Deterministic indentation formatter; preserves comments and line order."""
     lines = [ln.rstrip() for ln in src.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
     while lines and not lines[0]: lines.pop(0)
     while lines and not lines[-1]: lines.pop()
-    return "\n".join(lines) + "\n"
+    out = []; depth = 0
+    for raw in lines:
+        text = raw.strip()
+        if not text:
+            out.append(""); continue
+        starts = text[0] if text else ""
+        lead = 1 if (starts == "}" or text.startswith("else")) else 0
+        out.append("  " * max(0, depth - lead) + text)
+        depth = max(0, depth + _brace_delta(text))
+    return "\n".join(out) + "\n"
 
 # ------------------------------------------------------------------ evaluator
 class ReturnSignal(Exception):
@@ -842,10 +882,13 @@ def pkg_main(argv: list[str]) -> int:
 # ------------------------------------------------------------------ CLI
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "lsp":
+        import gama_lsp
+        return gama_lsp.main() or 0
     if argv and argv[0] == "pkg":
         return pkg_main(argv[1:])
     ap = argparse.ArgumentParser(prog="gamal2")
-    ap.add_argument("cmd", choices=["run", "check", "fmt", "test"], nargs="?", default="run")
+    ap.add_argument("cmd", choices=["run", "check", "fmt", "test", "lsp"], nargs="?", default="run")
     ap.add_argument("file", nargs="?")
     ap.add_argument("--interactive", action="store_true")
     a = ap.parse_args(argv)
