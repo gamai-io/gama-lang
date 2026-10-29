@@ -93,6 +93,7 @@ python3 gamal2.py fmt --write file.gm  # write in place
 - `let` with optional type annotation, `:=` assignment
 - `fn` and SPEC `make` with typed parameters, defaults, return type, `effects { ... }`
 - `if` / `else` blocks, `return`
+- `for x in list/text`, `while cond`, `break`/`continue`, list/text indexing
 - literals: text, int, decimal, bool, null, list, map
 - arithmetic/comparison/boolean operators
 - pipes: `filter`, `select`, `sum`, `limit`, `count`, `map`
@@ -112,7 +113,7 @@ python3 gamal2.py fmt --write file.gm  # write in place
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 204/204
+python3 -m unittest discover -s tests -v   # 211/211
 ```
 
 Conformance coverage: arithmetic/pipes (20 cases), type errors, effect
@@ -120,7 +121,8 @@ violations (including `sql.write`/`mail` stubs), HITL returns `Denied`,
 proof/tamper, duplicate proof keys, optional HMAC proof signatures (`GAMA_L_PROOF_KEY`; `GAMA_L_REQUIRE_SIG=1` requires them),
 imports/cycles/diamonds, multi-table SQLite schema checks, git/path package
 dependencies, LSP completion/hover/definition/references/symbols/tokens/code actions/
-rename/formatting/didChange, SPEC syntax aliases/defaults, VS Code LSP client,
+rename/formatting/didChange, SPEC syntax aliases/defaults, loops/indexing,
+VS Code LSP client,
 HTTP/local registry, AI connector, guarded SQL writes and SMTP mail, offline
 `ask` = `Unavailable`, 11 examples, canonical `fmt` check/write, doctor, and
 reproducible release metadata.
@@ -129,7 +131,7 @@ reproducible release metadata.
 
 - deployed/public package registry (the HTTP server is implemented and testable)
 - `Result`/`Ok`/`Err` errors-as-values and real namespace/export modules (`use` is currently a no-op)
-- `for`/`while`/`match`, indexing, lambdas/first-class functions
+- `match`, lambdas/first-class functions
 - persistent proof chain bound to intent/lease; IR/bytecode and runtime limits
 - full type inference, records/enums/generics
 - full AST formatter (current `fmt` is token-based, preserves comments and
