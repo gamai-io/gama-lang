@@ -40,9 +40,16 @@ python3 gamal2.py lsp
 ```
 
 JSON-RPC language server: `initialize`, `didOpen/didChange/didSave`
-diagnostics, completion, hover, `shutdown`, `exit`. Positions are converted
-between LSP UTF-16 and Python indexes. A syntax-only VS Code package is in
-`vscode/` (TextMate grammar + snippets); it does not start the LSP itself.
+diagnostics, completion, hover, definition, references, `shutdown`, `exit`.
+Positions are converted between LSP UTF-16 and Python indexes. A syntax-only
+VS Code package is in `vscode/` (TextMate grammar + snippets); it does not
+start the LSP itself.
+
+## Distribution
+
+`pyproject.toml` defines the `gama-l` package and console scripts `gama-l` and
+`gama-lsp`; modules are `gamal2`, `gama_lsp`, `gama_cli`, `gama_fmt`.
+The CLI wrapper is `gama_cli.py`. Build/install is not run in tests.
 
 ## Implemented
 
@@ -55,6 +62,7 @@ between LSP UTF-16 and Python indexes. A syntax-only VS Code package is in
 - pipes: `filter`, `select`, `sum`, `limit`, `count`, `map`
 - `ask` (offline mock, or OpenAI-compatible `GAMA_L_ASK_URL`), `sql` (demo table, or read-only SQLite via `GAMA_L_DB`), `remember/recall`
 - `wait_user` (non-interactive returns `Denied`; falsy)
+- guarded `sql_write` (INSERT/UPDATE/DELETE; needs `GAMA_L_ALLOW_WRITE=1`, rejects DDL/stacked statements)
 - `prove` (hash-chained receipt, optional HMAC via `GAMA_L_PROOF_KEY`) and `verify` (tamper detection)
 - static type errors and static effect violations
 - CLI `run`, `check`, `fmt`, `test`, `pkg`, `lsp`
@@ -62,24 +70,27 @@ between LSP UTF-16 and Python indexes. A syntax-only VS Code package is in
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 48/48
+python3 -m unittest discover -s tests -v   # 83/83
 ```
 
 Conformance coverage: arithmetic/pipes (20 cases), type errors, effect
 violations (including `sql.write`/`mail` stubs), HITL returns `Denied`,
 proof/tamper, duplicate proof keys, optional HMAC proof signatures (`GAMA_L_PROOF_KEY`; `GAMA_L_REQUIRE_SIG=1` requires them),
 imports/cycles/diamonds, multi-table SQLite schema checks, git/path package
-dependencies, LSP completion/hover/didChange, offline `ask` = `Unavailable`,
-10 examples, and deterministic `fmt`.
+dependencies, LSP completion/hover/definition/references/didChange, guarded
+SQL writes, offline `ask` = `Unavailable`, 10 examples, canonical `fmt`, and
+distribution metadata.
 
 ## Not implemented yet
 
 - central package registry (git and local dependencies work)
 - full type inference and generics
-- real SQL write/AI/mail connectors (read-only SQLite and optional `ask` work)
-- full AST formatter (current `fmt` indents and preserves comments)
-- LSP definition/references/code actions; VS Code package is syntax-only
-- distribution build
+- real AI/mail connectors (read-only SQLite, optional `ask`, and guarded
+  `sql_write` work)
+- full AST formatter (current `fmt` is token-based, preserves comments and
+  strings, but does not reformat multi-line strings)
+- LSP code actions and semantic tokens; VS Code package is syntax-only
+- publishing a built distribution
 
 The old v0.1 transpiler remains in `gama-lang/` for reference. Do not call this
 full 2.0 until the remaining conformance tests and connectors are done.

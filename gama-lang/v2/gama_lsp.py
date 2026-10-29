@@ -2,9 +2,10 @@
 """Minimal GAMA-L 2 language server (stdio JSON-RPC).
 
 Supports initialize, didOpen/didChange/didSave diagnostics, completion, hover,
-shutdown and exit.
+definition, references, shutdown and exit.
 """
 from __future__ import annotations
+import dataclasses
 import json
 import re
 import sys
@@ -164,6 +165,111 @@ def word_at(text: str, line: int, character: int):
     return None
 
 
+def _walk(node):
+    """Yield dataclass nodes recursively over all fields (list/dict/tuple aware)."""
+    if dataclasses.is_dataclass(node) and not isinstance(node, type):
+        yield node
+        for f in dataclasses.fields(node):
+            yield from _walk(getattr(node, f.name, None))
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            yield from _walk(item)
+    elif isinstance(node, dict):
+        for item in node.values():
+            yield from _walk(item)
+
+
+def _utf16_pos(line: str, index: int) -> int:
+    return utf16_len(line[:max(0, index)])
+
+
+def _name_pos(line: str, start_index: int, name: str):
+    """Character index of a whole-word `name` at/after start_index, or None."""
+    idx = line.find(name, max(0, start_index))
+    while idx != -1:
+        before = line[idx - 1] if idx > 0 else ""
+        after = line[idx + len(name)] if idx + len(name) < len(line) else ""
+        if not (before.isalnum() or before == "_") and not (after.isalnum() or after == "_"):
+            return idx
+        idx = line.find(name, idx + 1)
+    return None
+
+
+def _declarations(text: str):
+    """Return Let/Fn declaration nodes, or [] when parsing fails."""
+    try:
+        program = G.parse(text)
+    except Exception:
+        return []
+    return [n for n in _walk(program) if isinstance(n, (G.Let, G.Fn)) and n.name]
+
+
+def _decl_start(uri: str, text: str, node, name: str):
+    """Location of a declaration's name (start/end), or None."""
+    lines = (text or "").split("\n")
+    line0 = max(0, int(node.line) - 1)
+    if line0 >= len(lines):
+        return None
+    idx = _name_pos(lines[line0], max(0, int(node.col) - 1), name)
+    if idx is None:
+        return None
+    col = _utf16_pos(lines[line0], idx)
+    return {"uri": uri, "range": {
+        "start": {"line": line0, "character": col},
+        "end": {"line": line0, "character": col + utf16_len(name)},
+    }}
+
+
+def definition(uri: str, text: str, line: int, character: int):
+    name = word_at(text, line, character)
+    if not name:
+        return None
+    for node in _declarations(text):
+        if node.name == name:
+            loc = _decl_start(uri, text, node, name)
+            if loc is not None:
+                return loc
+    return None
+
+
+def references(uri: str, text: str, line: int, character: int):
+    name = word_at(text, line, character)
+    if not name:
+        return []
+    try:
+        program = G.parse(text)
+    except Exception:
+        return []
+    lines = (text or "").split("\n")
+    out = []
+    seen = set()
+
+    def add(line0: int, col: int):
+        if line0 < 0 or line0 >= len(lines):
+            return
+        key = (line0, col)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append({"uri": uri, "range": {
+            "start": {"line": line0, "character": col},
+            "end": {"line": line0, "character": col + 1},
+        }})
+
+    for node in _walk(program):
+        if isinstance(node, (G.Var, G.Call)) and getattr(node, "name", None) == name:
+            line0 = max(0, int(node.line) - 1)
+            if line0 < len(lines):
+                add(line0, _utf16_pos(lines[line0], int(node.col) - 1))
+        elif isinstance(node, (G.Let, G.Fn)) and getattr(node, "name", None) == name:
+            line0 = max(0, int(node.line) - 1)
+            if line0 < len(lines):
+                idx = _name_pos(lines[line0], max(0, int(node.col) - 1), name)
+                if idx is not None:
+                    add(line0, _utf16_pos(lines[line0], idx))
+    return out
+
+
 def hover(uri: str, text: str, line: int, character: int):
     name = word_at(text, line, character)
     if not name:
@@ -195,6 +301,8 @@ def main():
                     "textDocumentSync": 1,
                     "completionProvider": {"triggerCharacters": [" ", "|", "."]},
                     "hoverProvider": True,
+                    "definitionProvider": True,
+                    "referencesProvider": True,
                 },
                 "serverInfo": {"name": "gama-lsp", "version": "2.0-core"},
             }})
@@ -227,6 +335,22 @@ def main():
             line = int(pos.get("line") or 0)
             ch = int(pos.get("character") or 0)
             send({"jsonrpc": "2.0", "id": mid, "result": hover(uri, text, line, ch)})
+        elif method == "textDocument/definition":
+            td = params.get("textDocument") or {}
+            uri = td.get("uri") or ""
+            text = docs.get(uri, td.get("text") or "")
+            pos = params.get("position") or {}
+            line = int(pos.get("line") or 0)
+            ch = int(pos.get("character") or 0)
+            send({"jsonrpc": "2.0", "id": mid, "result": definition(uri, text, line, ch)})
+        elif method == "textDocument/references":
+            td = params.get("textDocument") or {}
+            uri = td.get("uri") or ""
+            text = docs.get(uri, td.get("text") or "")
+            pos = params.get("position") or {}
+            line = int(pos.get("line") or 0)
+            ch = int(pos.get("character") or 0)
+            send({"jsonrpc": "2.0", "id": mid, "result": references(uri, text, line, ch)})
         elif mid is not None:
             send({"jsonrpc": "2.0", "id": mid, "result": None})
 

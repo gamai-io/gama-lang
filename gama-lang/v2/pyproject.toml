@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gama-l"
+version = "0.2.0"
+description = "GAMA-L 2.0 core language: parser, type/effect checker, interpreter and LSP."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+[project.scripts]
+gama-l = "gama_cli:main"
+gama-lsp = "gama_lsp:main"
+
+[tool.setuptools]
+py-modules = ["gamal2", "gama_lsp", "gama_cli", "gama_fmt"]

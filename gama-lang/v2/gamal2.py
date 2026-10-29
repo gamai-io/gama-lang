@@ -374,6 +374,45 @@ def sql_fields(query: str) -> set[str] | None:
         return schema[m.group(1)]
     return set().union(*schema.values())
 
+_SQL_WRITE_RE = re.compile(r"^\s*(insert|update|delete)\b", re.I)
+
+def sql_write(query: str, line: int = 0, col: int = 0) -> bool:
+    """Execute exactly one INSERT/UPDATE/DELETE against GAMA_L_DB.
+
+    The language has no bind arguments yet, so the statement is sent as-is
+    (parameterless); callers must quote literals themselves. Writes are
+    disabled unless GAMA_L_ALLOW_WRITE=1. DDL and stacked statements are
+    rejected before touching the database; this is a guard, not a full SQL
+    parser.
+    """
+    dbp = os.environ.get("GAMA_L_DB", "").strip()
+    if not dbp:
+        raise GamaRuntimeError("sql_write: GAMA_L_DB is not set", line, col)
+    dbpath = pathlib.Path(dbp).resolve()
+    if not dbpath.is_file():
+        raise GamaRuntimeError("sql_write: database does not exist: %s" % dbpath, line, col)
+    if os.environ.get("GAMA_L_ALLOW_WRITE") != "1":
+        raise GamaRuntimeError(
+            "sql_write: writes disabled (set GAMA_L_ALLOW_WRITE=1)", line, col)
+    q = query.strip()
+    if q.endswith(";"):
+        q = q[:-1].rstrip()
+    if ";" in q:
+        raise GamaRuntimeError("sql_write: exactly one statement allowed", line, col)
+    if not _SQL_WRITE_RE.match(q):
+        raise GamaRuntimeError(
+            "sql_write: only INSERT/UPDATE/DELETE allowed", line, col)
+    try:
+        con = sqlite3.connect(f"file:{dbpath}?mode=rw", uri=True)
+        try:
+            con.execute(q)
+            con.commit()
+        finally:
+            con.close()
+    except sqlite3.Error as ex:
+        raise GamaRuntimeError("sql_write failed: %s" % ex, line, col) from None
+    return True
+
 class Checker:
     def __init__(self):
         self.scope: list[dict[str, str]] = [{}]
@@ -608,7 +647,12 @@ def _brace_delta(line: str) -> int:
     return d
 
 def fmt_source(src: str) -> str:
-    """Deterministic indentation formatter; preserves comments and line order."""
+    """Canonical formatter (falls back to indentation-only if module absent)."""
+    try:
+        from gama_fmt import format_source
+        return format_source(src)
+    except ImportError:
+        pass
     lines = [ln.rstrip() for ln in src.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
     while lines and not lines[0]: lines.pop(0)
     while lines and not lines[-1]: lines.pop()
@@ -810,7 +854,10 @@ class Interpreter:
                 return input(f"[GAMA-L] {self.expr(e.args[0], env, row)} ").strip().lower() in ("yes", "y", "da")
             if e.name == "len": return len(self.expr(e.args[0], env, row))
             if e.name == "text": return str(self.expr(e.args[0], env, row))
-            if e.name in ("sql_write", "mail"): raise GamaRuntimeError(f"{e.name}: connector not configured", e.line, e.col)
+            if e.name == "sql_write":
+                q = str(self.expr(e.args[0], env, row)) if e.args else ""
+                return sql_write(q, e.line, e.col)
+            if e.name == "mail": raise GamaRuntimeError("mail: connector not configured", e.line, e.col)
             if e.name == "number": return Decimal(str(self.expr(e.args[0], env, row)))
             if e.name in self.funcs:
                 fn, closure = self.funcs[e.name]
