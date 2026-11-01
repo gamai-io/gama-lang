@@ -19,4 +19,4 @@ REPORT_*.md   THE "what is where" REPORT (start here!)
 4. `gama-lang/v2/examples/invoice.gm` — SQL → pipe → `prove` → `verify` demo.
 4. `gama-os/builder/gama-os.sh` — build every OS role (kiosk/terminal/pro/node).
 
-> Proprietary work. GAMA TRADE, 2026.
+> Licensed under Apache-2.0. © 2026 gamAI.
