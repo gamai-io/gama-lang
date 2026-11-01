@@ -1,5 +1,7 @@
 [![CI](https://github.com/gamai-io/gama-lang/actions/workflows/ci.yml/badge.svg)](https://github.com/gamai-io/gama-lang/actions/workflows/ci.yml)
 
+> **Live evidence dashboard:** https://gamai-io.github.io/demo/
+
 # GAMA-L + GAMA-OS — AI-native programming language + own OS line
 
 Our **polymorphic programming paradigm** where **AI is built into the language**
