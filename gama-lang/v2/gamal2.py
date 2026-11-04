@@ -1438,10 +1438,66 @@ def _proof_payload(prev, raw, intent=None, lease=None):
     """Single canonical payload for both the hash chain and the HMAC signature."""
     return str(prev) + raw + _proof_binding(intent, lease)
 
+def _ledger_scan(data):
+    """Parse proof-ledger JSONL text and validate it as one hash chain.
+
+    Returns ``(records, problems)``. ``records`` holds every valid JSON object
+    in file order. ``problems`` is a deduplicated, stable list of integrity
+    codes:
+
+    - ``malformed_line``: a non-empty line is not a JSON object
+    - ``missing_sha``: a record has no usable ``sha256``
+    - ``broken_chain``: a ``prev`` is neither ``GENESIS`` on the first record
+      nor the immediately preceding record's hash (gap, reorder or tamper)
+    - ``forked_chain``: two records share a predecessor (the ledger branched)
+    """
+    records = []
+    problems = []
+    for line in (data or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except (ValueError, TypeError):
+            problems.append("malformed_line")
+            continue
+        if not isinstance(rec, dict):
+            problems.append("malformed_line")
+            continue
+        records.append(rec)
+    seen_sha = set()
+    prev_uses = {}
+    for i, rec in enumerate(records):
+        sha = str(rec.get("sha256", "") or "")
+        prev = rec.get("prev")
+        if not sha:
+            problems.append("missing_sha")
+        expected = "GENESIS" if i == 0 else str(records[i - 1].get("sha256", "") or "")
+        if prev != expected:
+            # Reusing an already-seen predecessor means the file branched;
+            # anything else is a gap, reorder or tamper.
+            if i > 0 and prev in seen_sha:
+                problems.append("forked_chain")
+            else:
+                problems.append("broken_chain")
+        if isinstance(prev, str):
+            prev_uses[prev] = prev_uses.get(prev, 0) + 1
+        if sha:
+            seen_sha.add(sha)
+    if any(n > 1 for n in prev_uses.values()):
+        problems.append("forked_chain")
+    out = []
+    for code in problems:
+        if code not in out:
+            out.append(code)
+    return records, out
+
 class Interpreter:
     def __init__(self, interactive=False):
         self.env = Env(); self.funcs = {}; self.out = []; self.memory = {}
         self.proofs = {}; self.proof_chain = []; self.prev_proof = "GENESIS"; self.interactive = interactive
+        self._ledger_records = []; self._ledger_problems = []
         self.last_ask = None
         self.call_depth = 0
         self.out_chars = 0
@@ -1451,36 +1507,71 @@ class Interpreter:
         if self.proof_ledger_path:
             self._load_proof_ledger()
     def _load_proof_ledger(self):
-        """Load persisted proof records so chains and idempotency survive a run."""
-        last_sha = "GENESIS"
-        try:
-            with open(self.proof_ledger_path, "r", encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except (ValueError, TypeError):
-                        continue
-                    if not isinstance(rec, dict):
-                        continue
-                    sha = str(rec.get("sha256", "") or "")
-                    if sha:
-                        self.proof_chain.append(sha)
-                        last_sha = sha
-                    name = rec.get("name")
-                    if isinstance(name, str) and name not in self.proofs:
-                        self.proofs[name] = rec
-        except FileNotFoundError:
-            pass
-        self.prev_proof = last_sha
-    def _append_proof_ledger(self, rec):
-        """Append one JSON line, flush+fsync, and take an fcntl lock if available."""
+        """Load persisted proof records so chains and idempotency survive a run.
+
+        Reads under a shared POSIX ``flock`` so it never observes a line that
+        another process is still writing. The whole chain is validated; a fork
+        or gap is recorded (``verify`` reports it, ``prove`` refuses to extend
+        it) rather than silently accepted.
+        """
         path = self.proof_ledger_path
-        if not path:
-            return
-        line = json.dumps(rec, ensure_ascii=False, separators=(",", ":"), default=str) + "\n"
+        records, problems, data = [], [], None
+        try:
+            import fcntl as _fcntl
+        except ImportError:
+            _fcntl = None
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                locked = False
+                if _fcntl is not None:
+                    try:
+                        _fcntl.flock(fh.fileno(), _fcntl.LOCK_SH)
+                        locked = True
+                    except OSError:
+                        locked = False
+                try:
+                    data = fh.read()
+                finally:
+                    if locked:
+                        try:
+                            _fcntl.flock(fh.fileno(), _fcntl.LOCK_UN)
+                        except OSError:
+                            pass
+        except FileNotFoundError:
+            data = None
+        if data is not None:
+            records, problems = _ledger_scan(data)
+        self._install_ledger_state(records)
+        self._ledger_problems = problems
+    def _install_ledger_state(self, records):
+        """Make ``records`` (in file order) the authoritative in-memory view."""
+        self._ledger_records = list(records)
+        chain = []
+        proofs = {}
+        for rec in records:
+            sha = str(rec.get("sha256", "") or "")
+            if sha:
+                chain.append(sha)
+            name = rec.get("name")
+            if isinstance(name, str) and name not in proofs:
+                proofs[name] = rec
+        self.proof_chain = chain
+        self.proofs = proofs
+        self.prev_proof = chain[-1] if chain else "GENESIS"
+        self._ledger_problems = []
+    def _ledger_prove(self, name, val, raw, intent, lease):
+        """Serialize load + tail-read + hash + append under one exclusive lock.
+
+        The lock spans re-reading the ledger, duplicate/binding checks, hash and
+        HMAC computation, and the append. Concurrent processes therefore cannot
+        both extend the same predecessor: each sees the other's already-committed
+        record and chains after it. A forked or malformed ledger is refused
+        instead of being extended.
+
+        Without ``fcntl`` (non-POSIX) the re-read still removes the common
+        read-then-write race, but cross-process atomicity becomes best-effort.
+        """
+        path = self.proof_ledger_path
         parent = os.path.dirname(os.path.abspath(path))
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -1488,7 +1579,7 @@ class Interpreter:
             import fcntl as _fcntl
         except ImportError:
             _fcntl = None
-        with open(path, "a", encoding="utf-8") as fh:
+        with open(path, "a+", encoding="utf-8") as fh:
             locked = False
             if _fcntl is not None:
                 try:
@@ -1497,9 +1588,44 @@ class Interpreter:
                 except OSError:
                     locked = False
             try:
-                fh.write(line)
+                fh.seek(0)
+                data = fh.read()
+                records, problems = _ledger_scan(data)
+                if problems:
+                    raise GamaRuntimeError(
+                        "prove: proof ledger is not a single valid chain ("
+                        + ", ".join(problems) + f"): {path}")
+                for old in records:
+                    if old.get("name") != name:
+                        continue
+                    self._check_proof_binding(name, old, intent, lease)
+                    if (old.get("value") == val
+                            or _proof_raw(old.get("name"), old.get("value")) == raw):
+                        self._install_ledger_state(records)
+                        return old
+                    raise GamaRuntimeError(
+                        f"prove: duplicate key {name!r} with different value")
+                prev = str(records[-1].get("sha256")) if records else "GENESIS"
+                payload = _proof_payload(prev, raw, intent, lease)
+                h = hashlib.sha256(payload.encode()).hexdigest()
+                rec = {"name": name, "value": val, "sha256": h, "prev": prev,
+                       "id": h[:16], "ts": __import__("time").time()}
+                if intent is not None:
+                    rec["intent"] = intent
+                if lease is not None:
+                    rec["lease"] = lease
+                key = os.environ.get("GAMA_L_PROOF_KEY", "").encode()
+                if key:
+                    rec["sig"] = hmac.new(
+                        key, payload.encode(), hashlib.sha256).hexdigest()
+                if data and not data.endswith("\n"):
+                    fh.write("\n")
+                fh.write(json.dumps(rec, ensure_ascii=False,
+                                    separators=(",", ":"), default=str) + "\n")
                 fh.flush()
                 os.fsync(fh.fileno())
+                self._install_ledger_state(records + [rec])
+                return rec
             finally:
                 if locked:
                     try:
@@ -1654,6 +1780,11 @@ class Interpreter:
         raw = _proof_raw(name, val)
         intent = _proof_env("GAMA_L_PROOF_INTENT")
         lease = _proof_env("GAMA_L_PROOF_LEASE")
+        if self.proof_ledger_path:
+            # The ledger is authoritative: load, duplicate check, tail read and
+            # append all happen under one exclusive lock, so concurrent runs
+            # cannot both extend the same predecessor.
+            return self._ledger_prove(name, val, raw, intent, lease)
         if name in self.proofs:
             old = self.proofs[name]
             if old.get("value") == val or _proof_raw(old.get("name"), old.get("value")) == raw:
@@ -1674,7 +1805,6 @@ class Interpreter:
         self.prev_proof = h
         self.proof_chain.append(h)
         self.proofs[name] = rec
-        self._append_proof_ledger(rec)
         return rec
     def verify(self, rec):
         if not isinstance(rec, dict) or "sha256" not in rec: return {"ok": False, "errors": ["not_a_proof"]}
@@ -1688,6 +1818,11 @@ class Interpreter:
         if not hmac.compare_digest(exp, str(rec.get("sha256"))): errs.append("hash_mismatch")
         if rec.get("prev") not in ("GENESIS",) and rec.get("prev") not in self.proof_chain:
             errs.append("untrusted_chain")
+        # A malformed or forked ledger is never silently usable: any verify in
+        # a process that loaded it reports the integrity failure.
+        for code in self._ledger_problems:
+            if code not in errs:
+                errs.append(code)
         key = os.environ.get("GAMA_L_PROOF_KEY", "").encode()
         sig = rec.get("sig")
         if sig:
