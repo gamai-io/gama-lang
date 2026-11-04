@@ -26,8 +26,11 @@ keys), enum variants ``Color.Red``, unary ``!``/``-``; binary ``+ - * / %``,
 comparisons ``== != < <= > >=`` and short-circuit ``&&``/``||``; indexing
 ``base[i]`` (list/text, with the reference interpreter's ``int`` coercion and
 Python-style negative indices); calls to *named, user-defined* functions
-(including recursion and default parameters); and the core builtins ``len``,
-``text``, ``number``, ``round`` and ``Ok``/``Err``.
+(including recursion and default parameters); the Result propagation operator
+``expr?`` (inside a function whose declared return type is ``Result`` or
+``Any``: ``Ok`` yields its payload, ``Err`` returns that ``Err`` from the
+enclosing function); and the core builtins ``len``, ``text``, ``number``,
+``round`` and ``Ok``/``Err``.
 
 Records and enums follow the reference runtime exactly: record values are
 nominal (type name plus declaration-ordered fields, value-based equality),
@@ -71,8 +74,15 @@ Limitations (raise ``IRUnsupported`` / documented runtime errors)
   backend resolves the longest dotted enum prefix. Named record construction
   with a dotted type name (``geo.Point { ... }``) is not accepted by the
   parser; positional construction ``geo.Point(1, 2)`` works.
-* Pipes, ``try``/``expr?`` and first-class function values (including reading a
-  namespaced function as a value).
+* Pipes and first-class function values (including reading a namespaced
+  function as a value) are unsupported.
+* ``?`` is accepted only inside a named function whose declared return type is
+  ``Result`` or ``Any``. Using it at the top level, in a function returning a
+  concrete non-``Result`` type, or inside a default-parameter expression is
+  rejected at compile time with :class:`IRUnsupported` (the checker raises the
+  matching ``GamaTypeError`` first when compiling checked source). If an
+  unchecked AST applies ``?`` to a non-``Result`` value, the VM raises
+  ``IRRuntimeError("? expects Result")`` on first use.
 * Builtins other than ``len``, ``text``, ``number``, ``round``, ``Ok``/``Err``
   (``sql``, ``ask``, ``upper``, result/text/collection helpers, ``mail``,
   ``remember``/``recall``, ``wait_user``, ...).
@@ -390,11 +400,15 @@ class _Compiler:
     default-argument expression).  Frames created by ``if`` branches are
     tracked so ``break``/``continue`` can unwind them precisely."""
 
-    def __init__(self, in_function: bool = False, records=None, enums=None):
+    def __init__(self, in_function: bool = False, records=None, enums=None,
+                 ret_type: str | None = None):
         self.code = Code()
         self.frame_depth = 0
         self.loops: list[dict] = []
         self.in_function = in_function
+        # Declared return type of the enclosing function (``None`` at top level
+        # and in default-argument expressions).  ``?`` needs ``Result``/``Any``.
+        self.ret_type = ret_type
         self.match_seq = 0
         # Nominal type tables used only to decide, at compile time, whether a
         # ``Call`` is a positional record constructor.  Dotted names and
@@ -640,6 +654,7 @@ class _Compiler:
             in_function=True,
             records=dict(self.records),
             enums=dict(self.enums),
+            ret_type=(stmt.ret or "Any"),
         )
         body.compile_statements(stmt.body)
         body.emit("CONST", None)
@@ -699,6 +714,21 @@ class _Compiler:
             self.compile_expr(expr.base)
             self.compile_expr(expr.index)
             self.emit("INDEX", (expr.line, expr.col))
+            return
+        if isinstance(expr, g2.Try):
+            # ``expr?`` is only meaningful inside a function that can return a
+            # ``Result``.  Mirror ``gamal2.Checker.expr`` so an unchecked AST is
+            # rejected with the same wording instead of silently diverging.
+            if not self.in_function:
+                raise IRUnsupported(
+                    f"IR does not support Try: ? outside function "
+                    f"(line {expr.line}, col {expr.col})")
+            if self.ret_type not in ("Result", "Any"):
+                raise IRUnsupported(
+                    f"IR does not support Try: ? requires function returning "
+                    f"Result (line {expr.line}, col {expr.col})")
+            self.compile_expr(expr.expr)
+            self.emit("TRY", (expr.line, expr.col))
             return
         if isinstance(expr, g2.Unary):
             if expr.op not in ("!", "-"):
@@ -988,6 +1018,20 @@ class _VM:
                 except (IndexError, KeyError, TypeError, ValueError):
                     raise IRRuntimeError(
                         "index out of range or invalid", line, col) from None
+            elif op == "TRY":
+                # Result propagation: ``Ok`` yields its payload; ``Err`` returns
+                # that Err from the enclosing function.  Because every function
+                # body is one ``_exec`` call, a plain return unwinds any active
+                # if/loop/match frames exactly like ``PropagateSignal`` does in
+                # the reference interpreter, without raising a Python exception.
+                line, col = arg
+                value = stack.pop()
+                if not isinstance(value, g2.ResultVal):
+                    raise IRRuntimeError("? expects Result", line, col)
+                if value.ok:
+                    stack.append(value.value)
+                else:
+                    return g2.ResultVal(False, value.value)
             elif op == "ITER_PREP":
                 line, col = arg
                 seq = stack.pop()
