@@ -151,6 +151,8 @@ class Binary: left: Any; op: str; right: Any; line: int; col: int
 @dataclass
 class Call: name: str; args: list; line: int; col: int
 @dataclass
+class CallExpr: callee: Any; args: list; line: int; col: int
+@dataclass
 class Pipe: base: Any; stages: list; line: int; col: int
 @dataclass
 class Import: path: str; line: int; col: int
@@ -194,6 +196,10 @@ class Print: expr: Any; line: int; col: int
 @dataclass
 class ExprStmt: expr: Any; line: int; col: int
 
+# Statements that end with a closing brace; a following statement may start
+# on the same line without an explicit separator.
+_BLOCK_STMT = (If, While, For, Match, Fn)
+
 # ------------------------------------------------------------------ parser
 class Parser:
     def __init__(self, toks: list[Tok]):
@@ -216,7 +222,8 @@ class Parser:
         out = []; self.skip_seps()
         while not self.at("EOF"):
             out.append(self.statement())
-            if not (self.at("NL") or self.at("OP", ";") or self.at("EOF")):
+            if not (self.at("NL") or self.at("OP", ";") or self.at("EOF")
+                    or isinstance(out[-1], _BLOCK_STMT)):
                 x = self.peek(); raise GamaError("expected end of statement", x.line, x.col)
             self.skip_seps()
         return out
@@ -226,7 +233,8 @@ class Parser:
             if self.at("EOF"):
                 x = self.peek(); raise GamaError("unterminated block", x.line, x.col)
             out.append(self.statement())
-            if not (self.at("NL") or self.at("OP", ";") or self.at("OP", "}")):
+            if not (self.at("NL") or self.at("OP", ";") or self.at("OP", "}")
+                    or isinstance(out[-1], _BLOCK_STMT)):
                 x = self.peek(); raise GamaError("expected end of statement", x.line, x.col)
             self.skip_seps()
         self.expect("OP", "}"); return out
@@ -386,7 +394,15 @@ class Parser:
     def postfix(self):
         e = self.primary()
         while True:
-            if self.at("OP", "["):
+            if self.at("OP", "("):
+                x = self.take(); self.skip_nl(); args = []
+                if not self.at("OP", ")"):
+                    while True:
+                        args.append(self.expr()); self.skip_nl()
+                        if not self.at("OP", ","): break
+                        self.take(); self.skip_nl()
+                self.expect("OP", ")"); e = CallExpr(e, args, x.line, x.col)
+            elif self.at("OP", "["):
                 x = self.take(); idx = self.expr(); self.expect("OP", "]")
                 e = Index(e, idx, x.line, x.col)
             elif self.at("OP", "?"):
@@ -766,9 +782,18 @@ class Checker:
             if self.loop_depth <= 0: raise GamaTypeError("break/continue outside loop", s.line, s.col)
             return
         if isinstance(s, Let):
-            t = self.expr(s.expr)
-            if s.type_name and not self.compat(t, s.type_name): raise GamaTypeError(f"{s.name}: {t} != {s.type_name}", s.line, s.col)
-            self.set(s.name, s.type_name or t)
+            # Bind the name before checking a lambda body so recursive
+            # lambdas can refer to themselves.
+            if isinstance(s.expr, Lambda):
+                self.set(s.name, s.type_name or "Function")
+                t = self.expr(s.expr)
+                if s.type_name and not self.compat(t, s.type_name):
+                    raise GamaTypeError(f"{s.name}: {t} != {s.type_name}", s.line, s.col)
+                self.set(s.name, s.type_name or t)
+            else:
+                t = self.expr(s.expr)
+                if s.type_name and not self.compat(t, s.type_name): raise GamaTypeError(f"{s.name}: {t} != {s.type_name}", s.line, s.col)
+                self.set(s.name, s.type_name or t)
         elif isinstance(s, Assign):
             t = self.expr(s.expr)
             cur = self.get(s.name)
@@ -847,6 +872,8 @@ class Checker:
         if isinstance(e, Var):
             t = self.get(e.name)
             if t is not None: return t
+            # A named function used as a value has type Function.
+            if e.name in self.funcs: return "Function"
             if "." in e.name:
                 parts = e.name.split(".")
                 for i in range(len(parts) - 1, 0, -1):
@@ -911,6 +938,36 @@ class Checker:
                 if not self.compat(at, p.type_name): raise GamaTypeError(f"{e.name}: {p.name} {at} != {p.type_name}", e.line, e.col)
             self.effects |= (f.effects or set())
             return f.ret or "Any"
+        if isinstance(e, CallExpr):
+            ct = self.expr(e.callee)
+            if ct not in ("Function", "Any"):
+                raise GamaTypeError("expression is not callable", e.line, e.col)
+            callee = e.callee
+            if isinstance(callee, Lambda):
+                required = sum(1 for p in callee.params if p.default is None)
+                if not (required <= len(e.args) <= len(callee.params)):
+                    raise GamaTypeError(
+                        f"lambda expects {required}..{len(callee.params)} args, got {len(e.args)}",
+                        e.line, e.col)
+                for p, a in zip(callee.params, e.args):
+                    at = self.expr(a)
+                    if not self.compat(at, p.type_name):
+                        raise GamaTypeError(f"lambda: {p.name} {at} != {p.type_name}", e.line, e.col)
+                return callee.ret or "Any"
+            if isinstance(callee, Var) and callee.name in self.funcs:
+                f = self.funcs[callee.name]
+                required = sum(1 for p in f.params if p.default is None)
+                if not (required <= len(e.args) <= len(f.params)):
+                    raise GamaTypeError(
+                        f"{callee.name} expects {required}..{len(f.params)} args, got {len(e.args)}",
+                        e.line, e.col)
+                for p, a in zip(f.params, e.args):
+                    at = self.expr(a)
+                    if not self.compat(at, p.type_name):
+                        raise GamaTypeError(f"{callee.name}: {p.name} {at} != {p.type_name}", e.line, e.col)
+                return f.ret or "Any"
+            for a in e.args: self.expr(a)
+            return "Any"
         if isinstance(e, Pipe):
             t = self.expr(e.base, row)
             if t not in ("List", "Table", "Any"):
@@ -1283,6 +1340,9 @@ class Interpreter:
             try:
                 return env.get(e.name)
             except GamaRuntimeError:
+                if e.name in self.funcs:
+                    fn, closure = self.funcs[e.name]
+                    return FunctionVal(fn.params, fn.ret, fn.effects, fn.body, closure, fn.name)
                 if "." not in e.name: raise
                 parts = e.name.split(".")
                 base_n = None
@@ -1412,6 +1472,12 @@ class Interpreter:
                 raise GamaRuntimeError(
                     f"{e.name} is not callable ({tname(fnval)})", e.line, e.col)
             raise GamaRuntimeError(f"unknown function {e.name}", e.line, e.col)
+        if isinstance(e, CallExpr):
+            fnval = self.expr(e.callee, env, row)
+            if not isinstance(fnval, FunctionVal):
+                raise GamaRuntimeError(
+                    f"expression is not callable ({tname(fnval)})", e.line, e.col)
+            return self.invoke(fnval, e.args, env, row, e.line, e.col)
         if isinstance(e, Pipe):
             value = self.expr(e.base, env, row)
             for stage, args in e.stages:
