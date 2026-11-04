@@ -1,0 +1,11 @@
+# formatter fixture: Result propagation, comments and multiline strings
+fn f() -> Result effects {} {
+  let x = Ok(1)? # inline comment: { } ? stays
+  return Ok(x)
+}
+
+fn g() -> Result effects {} {
+  let s = "first { ? # line
+second } inside # = + -"
+  return Ok(s)
+}

@@ -8,6 +8,8 @@ Guarantees:
   * ``}`` and a leading ``else`` are outdented.
   * Whitespace normalization around operators only in code, never inside
     strings or comments, and never touching unary ``-``.
+  * ``?`` is a postfix operator: it is kept attached to its operand
+    (``Ok(1) ?`` -> ``Ok(1)?``) and is never dropped.
   * Line order and comment text are preserved; no token is added or removed.
 
 Safety policy (documented trade-off):
@@ -28,6 +30,10 @@ NORMALIZE = {
 }
 # Operators that are unary in GAMA-L; they must not get a space after them.
 UNARY = {"-", "!"}
+# Postfix operators bind tightly to the expression on their left.  ``?`` is
+# Result propagation (parser: ``postfix``), so ``Ok(1) ?`` is canonicalized to
+# ``Ok(1)?``; no whitespace is introduced before or after it.
+POSTFIX = {"?"}
 # Token values that put a following "-" / "!" into a unary position.
 OPEN_TOKENS = {
     "(", "[", "{", ",", ":", ";", "|", "=", ":=", "->", "==", "!=", "<=",
@@ -113,6 +119,13 @@ def _render(toks: list[tuple[str, str]]) -> tuple[str, int, bool]:
             if pieces and pieces[-1] != " ":
                 pieces.append(" ")
             pieces.append(tok)
+            pending_space = False
+            continue
+        if kind == "op" and tok in POSTFIX:
+            while pieces and pieces[-1] == " ":
+                pieces.pop()
+            pieces.append(tok)
+            prev = (kind, tok)
             pending_space = False
             continue
         if kind == "op":
