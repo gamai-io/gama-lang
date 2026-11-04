@@ -145,7 +145,7 @@ python3 gamal2.py fmt --write file.gm  # write in place
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 692/692
+python3 -m unittest discover -s tests -v   # 707/707
 python3 gamal2.py doctor --json                # 8/8 checks
 ```
 
