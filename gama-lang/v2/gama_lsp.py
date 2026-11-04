@@ -165,6 +165,73 @@ def _check_disk_aware(path: Path, text: str):
                 pass
 
 
+_IMPORT_SITE_RE = re.compile(r'(?m)^[ \t]*(import[ \t]+"([^"]+)")')
+
+
+def _import_targets(path: Path, root: Path, rel: str):
+    """Candidate resolved paths for an import, mirroring gamal2._flatten."""
+    for c in (path.parent / rel,
+              root / ".gamal" / "modules" / rel,
+              root / "gama_modules" / rel):
+        try:
+            if c.exists():
+                return c.resolve()
+        except OSError:
+            continue
+    return None
+
+
+def _imports_in_text(text: str):
+    for m in _IMPORT_SITE_RE.finditer(text or ""):
+        yield m, m.group(2)
+
+
+def _module_reaches(start: Path, root: Path, target: Path, seen=None) -> bool:
+    """True when ``start`` (transitively) imports ``target``."""
+    try:
+        start = start.resolve()
+    except OSError:
+        return False
+    if start == target:
+        return True
+    if seen is None:
+        seen = set()
+    if start in seen:
+        return False
+    seen.add(start)
+    try:
+        source = start.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    for _m, rel in _imports_in_text(source):
+        nxt = _import_targets(start, root, rel)
+        if nxt is not None and _module_reaches(nxt, root, target, seen):
+            return True
+    return False
+
+
+def _site_position(text: str, match):
+    pos = match.start(1)
+    line = (text or "")[:pos].count("\n")
+    line_start = (text or "").rfind("\n", 0, pos) + 1
+    return line, utf16_len((text or "")[line_start:pos])
+
+
+def _import_site(path: Path, text: str, src: Path):
+    """Return (line, character, import_path) of the main import that pulls
+    in ``src``, preferring direct imports but following nested ones."""
+    root = G._project_root(path)
+    first = None
+    for m, rel in _imports_in_text(text):
+        target = _import_targets(path, root, rel)
+        pos = _site_position(text, m)
+        if first is None:
+            first = (pos[0], pos[1], rel)
+        if target is not None and _module_reaches(target, root, src):
+            return pos[0], pos[1], rel
+    return first
+
+
 def diagnostics(uri: str, text: str):
     text = text if isinstance(text, str) else ("" if text is None else str(text))
     path = _file_backed(uri)
@@ -179,6 +246,32 @@ def diagnostics(uri: str, text: str):
         # import complaint is spurious there. Other syntax/type errors pass.
         if path is None and e.msg == IMPORT_IN_MEMORY_MSG:
             return []
+        src = getattr(e, "src", None)
+        if src is not None and path is not None:
+            try:
+                src_path = Path(src).resolve()
+            except OSError:
+                src_path = None
+            if src_path is not None:
+                site = _import_site(path, text, src_path)
+                if site is not None:
+                    line, col, rel = site
+                    try:
+                        display = str(src_path.relative_to(G._project_root(path)))
+                    except (ValueError, OSError):
+                        display = src_path.name
+                    msg = "%s (in %s:%d:%d)" % (
+                        e.msg, display, int(e.line or 0), int(e.col or 0))
+                    rows = (text or "").split("\n") or [""]
+                    line = min(max(0, line), len(rows) - 1)
+                    end_col = min(col + 1, utf16_len(rows[line]))
+                    return [{
+                        "range": {"start": {"line": line, "character": col},
+                                  "end": {"line": line, "character": end_col}},
+                        "severity": 1,
+                        "source": "gama-l",
+                        "message": msg,
+                    }]
         rows = (text or "").split("\n") or [""]
         line = max(0, int(e.line or 1) - 1)
         # Clamp to the last line: EOF/unterminated errors can point past it.

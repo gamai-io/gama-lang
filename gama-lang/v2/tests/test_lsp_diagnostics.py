@@ -56,6 +56,45 @@ class LspDiagnosticsImportTests(unittest.TestCase):
         diag = self.open(MAIN)
         self.assertEqual(diag["params"]["diagnostics"], [])
 
+    def test_valid_import_yields_no_diagnostics(self):
+        text = 'import "lib.gm"\nprint add(2, 3)\n'
+        self.main.write_text(text, encoding="utf-8")
+        diag = self.open(text)
+        self.assertEqual(diag["params"]["diagnostics"], [])
+
+    def test_imported_syntax_error_maps_to_import_line(self):
+        (self.root / "lib.gm").write_text(
+            "fn add(a: Int) -> Int effects {} { return a + }\n",
+            encoding="utf-8")
+        text = 'import "lib.gm"\nlet total = add(1)\nprint total\n'
+        self.main.write_text(text, encoding="utf-8")
+        diag = self.open(text)
+        items = diag["params"]["diagnostics"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["range"]["start"]["line"], 0)
+        self.assertIn("lib.gm:1:", items[0]["message"])
+
+    def test_imported_type_error_maps_to_import_line(self):
+        (self.root / "lib.gm").write_text(
+            'fn add(a: Int) -> Int effects {} { return "s" }\n',
+            encoding="utf-8")
+        text = 'import "lib.gm"\nprint 1\n'
+        self.main.write_text(text, encoding="utf-8")
+        diag = self.open(text)
+        items = diag["params"]["diagnostics"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["range"]["start"]["line"], 0)
+        self.assertIn("lib.gm:1:", items[0]["message"])
+
+    def test_main_syntax_error_stays_at_exact_position(self):
+        text = 'import "lib.gm"\nlet = 1\n'
+        self.main.write_text(text, encoding="utf-8")
+        diag = self.open(text)
+        items = diag["params"]["diagnostics"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["range"]["start"]["line"], 1)
+        self.assertNotIn("lib.gm", items[0]["message"])
+
     def test_broken_import_still_reports_an_error(self):
         broken = 'import "missing.gm"\nprint 1\n'
         self.main.write_text(broken, encoding="utf-8")

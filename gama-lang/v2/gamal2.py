@@ -39,6 +39,9 @@ class GamaError(Exception):
     def __init__(self, msg: str, line: int = 0, col: int = 0):
         super().__init__(msg)
         self.msg, self.line, self.col = msg, line, col
+        # Set for errors that originate in an imported file so tooling can map
+        # them back to the import statement instead of the importing file.
+        self.src: str | None = None
     def __str__(self):
         return f"{self.msg} (line {self.line}, col {self.col})"
 
@@ -922,9 +925,18 @@ class Checker:
     def program(self, stmts):
         for s in stmts:
             if isinstance(s, Fn):
-                if s.name in self.funcs: raise GamaTypeError("duplicate function", s.line, s.col)
+                if s.name in self.funcs:
+                    e = GamaTypeError("duplicate function", s.line, s.col)
+                    e.src = getattr(s, "_src", None)
+                    raise e
                 self.funcs[s.name] = s
-        for s in stmts: self.stmt(s, None)
+        for s in stmts:
+            try:
+                self.stmt(s, None)
+            except GamaError as e:
+                if e.src is None:
+                    e.src = getattr(s, "_src", None)
+                raise
     def stmt(self, s, allowed):
         if isinstance(s, Import):
             raise GamaError("import requires check_file/run_file", s.line, s.col)
@@ -1248,8 +1260,17 @@ def _rename_refs(node, mapping):
             return replace(node, **changes)
     return node
 
+def _mark_src(node, path) -> None:
+    """Record the file a top-level statement came from (tooling provenance)."""
+    try:
+        node._src = str(path)
+    except (AttributeError, TypeError):
+        pass
+
+
 def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
-             seen: set | None = None, loaded: set | None = None) -> list:
+             seen: set | None = None, loaded: set | None = None,
+             _top: bool = True) -> list:
     path = path.resolve(); root = (root or _project_root(path)).resolve()
     if seen is None: seen = set()
     if loaded is None: loaded = set()
@@ -1267,9 +1288,15 @@ def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
         raise GamaError("import depth limit exceeded")
     seen.add(path)
     try:
-        ast = parse(path.read_text(encoding="utf-8"))
+        source = path.read_text(encoding="utf-8")
     except OSError as ex:
         raise GamaError("cannot import %s: %s" % (path, ex)) from None
+    try:
+        ast = parse(source)
+    except GamaError as ex:
+        if not _top and ex.src is None:
+            ex.src = str(path)
+        raise
     # Top-level names declared in this file. Aliases must not shadow them and
     # generated `alias.fn` names must not clash with them.
     declared = set()
@@ -1287,7 +1314,7 @@ def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
             if target is None:
                 raise GamaError("cannot import %s" % s.path, s.line, s.col)
             if s.alias is None:
-                sub = _flatten(target, root, seen, loaded)
+                sub = _flatten(target, root, seen, loaded, _top=False)
                 for st in sub:
                     out.append(st)
                     if isinstance(st, Fn):
@@ -1306,8 +1333,13 @@ def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
             # Expand the module with a fresh `loaded` set: the same module may
             # be imported under two different aliases. `seen` is shared so
             # cycles are still detected.
-            sub = _flatten(target, root, seen, set())
-            _check_alias_toplevel(sub, s.alias)
+            sub = _flatten(target, root, seen, set(), _top=False)
+            try:
+                _check_alias_toplevel(sub, s.alias)
+            except GamaError as ex:
+                if ex.src is None:
+                    ex.src = str(target)
+                raise
             sub_fns = [st for st in sub if isinstance(st, Fn)]
             mapping = {st.name: s.alias + "." + st.name for st in sub_fns}
             for st in sub_fns:
@@ -1317,8 +1349,12 @@ def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
                         "import alias %r produces duplicate name %r"
                         % (s.alias, new_name), s.line, s.col)
                 declared.add(new_name)
-                out.append(replace(_rename_refs(st, mapping), name=new_name))
+                renamed = replace(_rename_refs(st, mapping), name=new_name)
+                _mark_src(renamed, getattr(st, "_src", target))
+                out.append(renamed)
         else:
+            if not _top:
+                _mark_src(s, path)
             out.append(s)
     seen.discard(path); loaded.add(path)
     return out
