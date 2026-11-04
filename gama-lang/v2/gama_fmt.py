@@ -311,9 +311,9 @@ class _SpanParser(_G.Parser if _G is not None else object):
         super().__init__(toks)
         self.spans = {}
 
-    def statement(self):
+    def statement(self, top=False):
         start = self.i
-        node = super().statement()
+        node = super().statement(top=top)
         self.spans[id(node)] = (start, self.i)
         return node
 
@@ -584,7 +584,8 @@ class _AstFormatter:
             return
         if isinstance(s, G.Let):
             tn = (": " + s.type_name) if s.type_name else ""
-            self._emit(ind + "let " + s.name + tn + " = " +
+            prefix = "export " if getattr(s, "exported", False) else ""
+            self._emit(ind + prefix + "let " + s.name + tn + " = " +
                        self._expr(s.expr), [s.line], suffix=semi)
             return
         if isinstance(s, G.Assign):
@@ -663,15 +664,17 @@ class _AstFormatter:
     def _fn_header(self, s, keyword="fn", named=True) -> str:
         name = (" " + s.name) if named else ""
         ret = (" -> " + s.ret) if s.ret else ""
-        return keyword + name + "(" + self._params_text(s.params) + ")" + \
+        prefix = "export " if getattr(s, "exported", False) else ""
+        return prefix + keyword + name + "(" + self._params_text(s.params) + ")" + \
             ret + self._effects_text(s.effects)
 
     @staticmethod
     def _record_text(s) -> str:
+        prefix = "export " if getattr(s, "exported", False) else ""
         if not s.fields:
-            return "record " + s.name + " { }"
+            return prefix + "record " + s.name + " { }"
         fields = [fn + ": " + ft for fn, ft in s.fields]
-        return "record " + s.name + " { " + ", ".join(fields) + " }"
+        return prefix + "record " + s.name + " { " + ", ".join(fields) + " }"
 
     @staticmethod
     def _enum_text(s) -> str:
@@ -992,7 +995,8 @@ class _AstFormatter:
         G = _G
         if isinstance(s, G.Let):
             tn = (": " + s.type_name) if s.type_name else ""
-            return "let " + s.name + tn + " = " + self._expr(s.expr)
+            prefix = "export " if getattr(s, "exported", False) else ""
+            return prefix + "let " + s.name + tn + " = " + self._expr(s.expr)
         if isinstance(s, G.Assign):
             return s.name + " := " + self._expr(s.expr)
         if isinstance(s, G.Return):

@@ -254,19 +254,19 @@ class Continue: line: int; col: int
 @dataclass
 class Index: base: Any; index: Any; line: int; col: int
 @dataclass
-class Let: name: str; type_name: str | None; expr: Any; line: int; col: int
+class Let: name: str; type_name: str | None; expr: Any; line: int; col: int; exported: bool = False
 @dataclass
 class Assign: name: str; expr: Any; line: int; col: int
 @dataclass
 class Param: name: str; type_name: str; default: Any = None
 @dataclass
-class Fn: name: str; params: list; ret: str | None; effects: set | None; body: list; line: int; col: int
+class Fn: name: str; params: list; ret: str | None; effects: set | None; body: list; line: int; col: int; exported: bool = False
 @dataclass
 class Lambda: params: list; ret: str | None; effects: set | None; body: list; line: int; col: int
 @dataclass
 class Match: expr: Any; arms: list; line: int; col: int
 @dataclass
-class EnumDecl: name: str; variants: list; line: int; col: int
+class EnumDecl: name: str; variants: list; line: int; col: int; exported: bool = False
 @dataclass
 class If: cond: Any; then: list; other: list | None; line: int; col: int
 @dataclass
@@ -278,7 +278,7 @@ class Verify: expr: Any; line: int; col: int
 @dataclass
 class Try: expr: Any; line: int; col: int
 @dataclass
-class RecordDecl: name: str; fields: list; line: int; col: int
+class RecordDecl: name: str; fields: list; line: int; col: int; exported: bool = False
 @dataclass
 class RecordLit: name: str; fields: list; line: int; col: int
 
@@ -321,25 +321,56 @@ class Parser:
     def program(self):
         out = []; self.skip_seps()
         while not self.at("EOF"):
-            out.append(self.statement())
+            out.append(self.statement(top=True))
             if not (self.at("NL") or self.at("OP", ";") or self.at("EOF")
                     or isinstance(out[-1], _BLOCK_STMT)):
                 x = self.peek(); raise GamaError("expected end of statement", x.line, x.col)
             self.skip_seps()
+        self._reject_duplicate_exports(out)
         return out
+    def _reject_duplicate_exports(self, stmts):
+        seen = {}
+        for s in stmts:
+            if not getattr(s, "exported", False):
+                continue
+            name = getattr(s, "name", None)
+            if name is None:
+                continue
+            if name in seen:
+                raise GamaError("duplicate export %r" % name, s.line, s.col)
+            seen[name] = s
     def block(self):
         self.expect("OP", "{"); self.skip_seps(); out = []
         while not self.at("OP", "}"):
             if self.at("EOF"):
                 x = self.peek(); raise GamaError("unterminated block", x.line, x.col)
-            out.append(self.statement())
+            out.append(self.statement(top=False))
             if not (self.at("NL") or self.at("OP", ";") or self.at("OP", "}")
                     or isinstance(out[-1], _BLOCK_STMT)):
                 x = self.peek(); raise GamaError("expected end of statement", x.line, x.col)
             self.skip_seps()
         self.expect("OP", "}"); return out
-    def statement(self):
+    def statement(self, top=False):
         x = self.peek()
+        if x.kind == "IDENT" and x.val == "export":
+            nxt = self.peek(1)
+            is_decl = (
+                (nxt.kind == "KW" and nxt.val in ("fn", "make", "let", "enum"))
+                or (nxt.kind == "IDENT" and nxt.val == "record"
+                    and self.peek(2).kind == "IDENT")
+            )
+            if not is_decl:
+                raise GamaError(
+                    "export must be followed by fn, let, record or enum",
+                    x.line, x.col)
+            if not top:
+                raise GamaError("export is only allowed at top level",
+                                x.line, x.col)
+            self.take()
+            inner = self.statement(top=True)
+            if isinstance(inner, EnumDecl):
+                raise GamaError("export enum is not supported", x.line, x.col)
+            return replace(inner, exported=True)
         if (x.kind == "IDENT" and x.val == "record"
                 and self.peek(1).kind == "IDENT"
                 and self.peek(2).kind == "OP" and self.peek(2).val == "{"):
@@ -1657,6 +1688,9 @@ def _rename_refs(node, mapping):
             type_name=(mapping.get(node.type_name, node.type_name)
                        if node.type_name else node.type_name),
             expr=_rename_refs(node.expr, mapping))
+    if isinstance(node, Assign):
+        return replace(node, name=mapping.get(node.name, node.name),
+                       expr=_rename_refs(node.expr, mapping))
     if isinstance(node, Param):
         return replace(
             node, type_name=mapping.get(node.type_name, node.type_name),
@@ -1766,18 +1800,42 @@ def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
                 if ex.src is None:
                     ex.src = str(target)
                 raise
-            # Every exported declaration is renamed to `alias.name`; the
-            # mapping is also applied inside each node so module functions and
-            # constants keep referring to their siblings through the namespace.
+            # Explicit exports filter the alias surface. Modules without any
+            # `export` keep the legacy behaviour: every top-level fn/let/record
+            # is visible through the alias (backward compatibility).
+            exported = {st.name for st in sub
+                        if getattr(st, "exported", False)
+                        and isinstance(st, (Fn, Let, RecordDecl))}
+            if exported:
+                names = {}
+                for st in sub:
+                    if (isinstance(st, (Fn, Let, RecordDecl))
+                            and st.name in exported):
+                        if st.name in names:
+                            raise GamaError(
+                                "duplicate export %r in imported module %r"
+                                % (st.name, s.path), st.line, st.col)
+                        names[st.name] = st
             sub_decls = [st for st in sub if isinstance(st, (Fn, Let, RecordDecl))]
-            mapping = {st.name: s.alias + "." + st.name for st in sub_decls}
+            mapping = {}
+            for st in sub_decls:
+                if exported and st.name not in exported:
+                    # Private declaration: keep it callable inside the module
+                    # but unreachable as `alias.name`. A separate character
+                    # (`:`) cannot be spelled in a source identifier, so this
+                    # internal name cannot collide with user code.
+                    mapping[st.name] = "%s::private::%s" % (s.alias, st.name)
+                else:
+                    mapping[st.name] = s.alias + "." + st.name
             for st in sub_decls:
                 new_name = mapping[st.name]
-                if new_name in declared:
-                    raise GamaError(
-                        "import alias %r produces duplicate name %r"
-                        % (s.alias, new_name), s.line, s.col)
-                declared.add(new_name)
+                public = not exported or st.name in exported
+                if public:
+                    if new_name in declared:
+                        raise GamaError(
+                            "import alias %r produces duplicate name %r"
+                            % (s.alias, new_name), s.line, s.col)
+                    declared.add(new_name)
                 renamed = replace(_rename_refs(st, mapping), name=new_name)
                 _mark_src(renamed, getattr(st, "_src", target))
                 out.append(renamed)

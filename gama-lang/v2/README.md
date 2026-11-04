@@ -184,6 +184,7 @@ error messages keep the interpreter's text and line/col.
 
 - `import "file.gm"` with cycle detection (relative to the importing file)
 - module namespaces: `import "lib.gm" as math`, then `math.add(2,3)` and `math.pi`; plain imports still flatten (including top-level `let`); aliased modules expose top-level `let` constants and `fn` definitions, evaluated at import time, and reject side-effect top-level statements (`use` is allowed as a harmless no-op)
+- explicit module exports: `export fn`, `export let` and `export record` mark the alias-visible surface; other top-level declarations stay private but remain callable inside the module. A module with at least one `export` exposes only exported names through `import ... as`; a module with no `export` keeps the legacy behaviour (all top-level `fn`/`let`/`record` visible). Plain imports always flatten all declarations for compatibility. `export` is only allowed at top level, duplicate export names are rejected, and `export enum` is currently rejected (enums stay module-global).
 - `let` with optional type annotation, `:=` assignment
 - `fn` and SPEC `make` with typed parameters, defaults, return type, `effects { ... }`
 - first-class functions and lambdas: `fn(x: Int) -> Int { ... }`, `let f = ...`, `f(41)`, passing functions as values, named functions as values after definition, IIFE `(fn...)(41)`, and recursive lambdas
@@ -240,7 +241,7 @@ Conformance: see `CONFORMANCE.md` (SPEC 2.0 T1–T10: **PASS 10/10**, including 
 ## Not implemented yet
 
 - deployed/public package registry (the HTTP server is implemented and testable)
-- full export lists/renamed exports; aliased modules export only `fn` definitions and top-level `let` constants, while side-effect top-level statements are rejected (`use` stays a no-op)
+- renamed exports (`export fn a as b`), `export enum`, and selective re-exports; explicit export lists mark the alias surface, but modules without any `export` keep the legacy all-visible alias behaviour
 - external intent/lease registry with expiry/revocation (env-bound intent/lease receipts are implemented; there is no external registry)
 - full type inference and generics; multi-payload/generic enum variants; record methods/field update/structural subtyping
 - formatter remaining edges: comments inside expressions may move to a safe position, and long expressions are not line-wrapped

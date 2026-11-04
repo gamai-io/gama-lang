@@ -51,10 +51,12 @@ These are outside the T1–T10 checks or only partially covered; see
    no external registry, expiry, or revocation; the ledger is append-only with
    no compaction or key rotation (the separate `gama_ledger.py` tool can verify
    and explicitly truncate to a valid prefix, never silently).
-2. **Full export lists / renamed exports.** Aliased imports expose top-level
-   `fn` definitions and `let` constants; side-effect top-level statements are
-   rejected and `use` remains a no-op. Explicit export lists and renamed exports
-   are not implemented.
+2. **Renamed exports and `export enum`.** Explicit `export fn`/`export let`/
+   `export record` lists are implemented (alias imports show only exported
+   declarations; modules without `export` keep the legacy all-visible alias
+   behaviour, and plain imports always flatten). Renamed exports and
+   `export enum` are not implemented; side-effect top-level statements remain
+   rejected and `use` remains a no-op.
 3. **Compiler/IR integration and production resource budget.** A standalone
    bytecode IR prototype (`gama_ir.py`) covers a documented subset and is
    exposed via the opt-in `gamal2 ir run|compile` CLI, but it is not the
