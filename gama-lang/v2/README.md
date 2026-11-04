@@ -141,7 +141,7 @@ Conformance: see `CONFORMANCE.md` (SPEC 2.0 T1–T10: **PASS 10/10**, including 
 
 - deployed/public package registry (the HTTP server is implemented and testable)
 - full export lists/renamed exports; aliased modules expose `fn` definitions and ignore other top-level statements
-- proof chain bound to intent/lease; IR/bytecode and a global step limit
+- external intent/lease registry with expiry/revocation; IR/bytecode and expression-level step accounting
 - full type inference, records/enums/generics
 - full AST formatter (current `fmt` is token-based, preserves comments and
   strings, but does not reformat multi-line strings)
