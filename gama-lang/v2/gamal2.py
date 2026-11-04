@@ -1240,6 +1240,7 @@ class Interpreter:
         self.call_depth = 0
         self.out_chars = 0
         self.steps = 0
+        self.expr_steps = 0
         self.proof_ledger_path = (os.environ.get("GAMA_L_PROOF_LEDGER") or "").strip() or None
         if self.proof_ledger_path:
             self._load_proof_ledger()
@@ -1328,6 +1329,16 @@ class Interpreter:
         if limit is not None and self.steps > limit:
             raise GamaRuntimeError(
                 f"step limit exceeded: {self.steps} > GAMA_L_MAX_STEPS={limit}",
+                line, col)
+    def _expr_step_limit(self):
+        return self._env_optional_int("GAMA_L_MAX_EXPR_STEPS")
+    def _expr_tick(self, line=0, col=0):
+        """Count one Interpreter.expr evaluation (nested evaluations count separately)."""
+        self.expr_steps += 1
+        limit = self._expr_step_limit()
+        if limit is not None and self.expr_steps > limit:
+            raise GamaRuntimeError(
+                f"expression step limit exceeded: {self.expr_steps} > GAMA_L_MAX_EXPR_STEPS={limit}",
                 line, col)
     def _emit(self, text):
         """Append one rendered output line, enforcing the output char cap."""
@@ -1523,6 +1534,14 @@ class Interpreter:
         finally:
             self.call_depth -= 1
     def expr(self, e, env, row=None):
+        """Evaluate one expression node and count it as one expression step.
+
+        Nested evaluations (operands, arguments, list/map items, pipe stages,
+        function arguments/defaults, etc.) recurse through this method and are
+        therefore counted individually.  The cap is disabled by default and is
+        independent of GAMA_L_MAX_STEPS.
+        """
+        self._expr_tick(getattr(e, "line", 0), getattr(e, "col", 0))
         if isinstance(e, Literal): return e.value
         if isinstance(e, Lambda):
             return FunctionVal(e.params, e.ret, e.effects, e.body, env)
