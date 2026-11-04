@@ -217,10 +217,52 @@ error messages keep the interpreter's text and line/col.
 - static type errors and static effect violations
 - CLI `run`, `check`, `fmt`, `test`, `pkg`, `lsp`, `ir`
 
+## Benchmark (reproducible, offline)
+
+`scripts/bench.py` measures the existing parse/check/run pipeline without
+modifying the interpreter, IR prototype, or CLI. It uses only the Python
+standard library and never touches the network.
+
+```bash
+python3 scripts/bench.py --runs 5 --seed 0
+python3 scripts/bench.py --runs 5 --json
+```
+
+What is measured (separately, so the numbers add up):
+
+- `parse_ms` — lexer + parser only (`gamal2.parse`).
+- `check_ms` — static checker on a pre-parsed AST (parse excluded).
+- `run_ms` — tree-walking interpreter on a checked AST (parse/check excluded).
+- IR (only for the documented IR subset) — `compile_ms` and `run_ms` are
+  reported separately; `speedup` is interpreter `run` median / IR `run` median.
+  Programs outside the IR subset are listed with the concrete
+  `IRUnsupported` reason, not skipped or faked. Where IR runs, its output is
+  compared against the interpreter's output (`outputs_match`).
+- Startup/import — inside-child import times for `gamal2` and `gamal2+gama_ir`,
+  plus cold Python process startup.
+- Memory — `resource.ru_maxrss` from a fresh child after importing both
+  modules (process high-water mark, not per-program memory; unavailable on
+  platforms without `resource`).
+- Formatter — end-to-end `gamal2.fmt_source` on a mixed sample.
+
+Methodology: `--runs N` timed samples per measurement and `--warmup W` untimed
+iterations; median/min/max (and raw samples in JSON). Program execution order is
+shuffled with `--seed` (results are sorted by name); the same seed/arguments
+produce the same structure and IR outputs. JSON includes `schema`, `tool`,
+`runs`, `warmup`, `seed`, one entry per program, and explicit `notes`.
+
+Limits (do not overclaim): the programs are small and are not a representative
+workload or a general language-performance claim; timings are single-machine
+micro-benchmarks and include CPython overhead; the IR is an opt-in prototype,
+not the default backend; peak RSS is a whole-process high-water mark; and a
+faster number here is not a conformance or correctness result. Use more runs
+and a quiet machine for comparisons, and read medians rather than single
+samples.
+
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 1420/1420
+python3 -m unittest discover -s tests -v   # 1479/1479
 python3 gamal2.py doctor --json                # 8/8 checks
 ../../scripts/ci_local.sh                      # py_compile + tests + doctor + VS Code JSON/smoke
 ```
