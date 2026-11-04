@@ -22,8 +22,10 @@ Supported expressions
 Literals: ``Int``, ``Decimal``, ``Text``, ``Bool``, ``null``, list literals
 ``[a, b]`` and map literals ``{k: v}``.
 Record construction (positional ``Point(1, 2)`` and named
-``Point { x: 1, y: 2 }``), field access ``p.x`` (walking record fields and map
-keys), enum variants ``Color.Red`` and payload constructors ``Some(5)`` /
+``Point { x: 1, y: 2 }``), record copy/``with`` updates
+(``p with { x = 3 }``, shallow, producing a new value of the same nominal
+type), field access ``p.x`` (walking record fields and map keys), enum
+variants ``Color.Red`` and payload constructors ``Some(5)`` /
 ``Option.Some(5)`` (bare when unambiguous), unary ``!``/``-``; binary ``+ - * / %``,
 comparisons ``== != < <= > >=`` and short-circuit ``&&``/``||``; indexing
 ``base[i]`` (list/text, with the reference interpreter's ``int`` coercion and
@@ -65,18 +67,21 @@ Limitations (raise ``IRUnsupported`` / documented runtime errors)
   exposes module declarations as dotted names (``math.add``, ``math.pi``,
   ``geo.Point``) and this backend resolves them against the same function,
   global and nominal-type tables it uses for local names.
-* Record copy/`with` updates (``p with { x = 3 }``) and in-place field
-  assignment are interpreter-only; the compiler rejects them with
-  :class:`IRUnsupported` instead of silently dropping updates.
+* In-place record field assignment (``p.x := 3``) is interpreter-only; the
+  compiler rejects it with :class:`IRUnsupported` instead of silently creating
+  a shadow variable. Record copy/``with`` updates *are* supported: an
+  ``expr with { field = value, ... }`` compiles to a shallow copy of the
+  receiver with the named fields replaced (declaration order preserved), and
+  the original value is left untouched.
 * Enum payload variants are supported for declarations, constructors and
   ``match`` bindings, including aliased imports: the core loader namespaces
   declarations and references (``geo.Color`` / ``geo.Color.Red`` /
   ``geo.Option.Some``) and this backend resolves the longest dotted enum
-  prefix.  Constructors are ``Some(5)`` (bare when unique), ``Option.Some(5)``
+  prefix. Constructors are ``Some(5)`` (bare when unique), ``Option.Some(5)``
   and namespaced forms; match arms bind every payload (``Some(v)``,
-  ``Pair(a, b)``, ``geo.Option.Some(v, s)``).  A payload variant used as a bare
+  ``Pair(a, b)``, ``geo.Option.Some(v, s)``). A payload variant used as a bare
   value and a nullary variant called with ``()`` raise the reference runtime's
-  messages.  Named record construction with a dotted type name
+  messages. Named record construction with a dotted type name
   (``geo.Point { ... }``) is not accepted by the parser; positional
   construction ``geo.Point(1, 2)`` works.
 * Pipes and first-class function values (including reading a namespaced
@@ -811,9 +816,16 @@ class _Compiler:
             self.emit("BUILD_RECORD", (expr.name, names, expr.line, expr.col))
             return
         if isinstance(expr, g2.RecordUpdate):
-            # No IR opcode exists for copy-with; reject loudly instead of
-            # compiling the base and silently dropping the field updates.
-            _unsupported(expr, "record copy/with")
+            # Copy-with evaluates the receiver first, then each replacement in
+            # source order, exactly like the reference interpreter.  The VM
+            # builds a fresh record of the receiver's nominal type, preserving
+            # declaration order and leaving the receiver (and its aliases)
+            # untouched (shallow copies share unchanged nested values).
+            names = tuple(str(k) for k, _v in expr.fields)
+            self.compile_expr(expr.base)
+            for _k, value in expr.fields:
+                self.compile_expr(value)
+            self.emit("COPY_RECORD_WITH", (names, expr.line, expr.col))
             return
         if isinstance(expr, g2.ListExpr):
             for item in expr.items:
@@ -1072,6 +1084,36 @@ class _VM:
                 + ", ".join(missing), line, col)
         return g2.RecordVal(name, {fn: values[fn] for fn in decl})
 
+    def _copy_record_with(self, base: Any, field_names: tuple[str, ...],
+                          values: list, line: int, col: int) -> Any:
+        """Apply ``base with { field = value, ... }`` like the interpreter.
+
+        The result is a new :class:`gamal2.RecordVal` of the receiver's nominal
+        type, with fields in declaration order.  The copy is shallow: the
+        top-level field mapping is new, but unchanged nested record/container
+        values are shared with the receiver.  Unknown or duplicate update
+        fields are reported here (the checker normally rejects them first) so
+        an unchecked AST cannot silently drop or double-apply an update.
+        """
+        if not isinstance(base, g2.RecordVal):
+            raise IRRuntimeError("with expects a record value", line, col)
+        decl = self.records.get(base.type_name)
+        if decl is None:
+            raise IRRuntimeError(f"unknown record {base.type_name}", line, col)
+        updated = dict(base.fields)
+        seen: set[str] = set()
+        for key, value in zip(field_names, values):
+            if key in seen:
+                raise IRRuntimeError(
+                    f"{base.type_name}: duplicate field {key} in with", line, col)
+            seen.add(key)
+            if key not in decl:
+                raise IRRuntimeError(
+                    f"{base.type_name}: unknown field {key} in with", line, col)
+            updated[key] = value
+        return g2.RecordVal(
+            base.type_name, {fn: updated[fn] for fn in decl})
+
     # -- interpreter loop ------------------------------------------------
     def _exec(self, code: Code, frame: Frame) -> Any:
         instrs = code.instrs
@@ -1143,6 +1185,15 @@ class _VM:
                     raise IRRuntimeError(
                         f"{name} expects {len(decl)} fields, got {argc}", line, col)
                 stack.append(g2.RecordVal(name, dict(zip(decl, values))))
+            elif op == "COPY_RECORD_WITH":
+                field_names, line, col = arg
+                count = len(field_names)
+                values = stack[-count:] if count else []
+                if count:
+                    del stack[-count:]
+                base = stack.pop()
+                stack.append(self._copy_record_with(
+                    base, field_names, values, line, col))
             elif op == "INDEX":
                 line, col = arg
                 index = stack.pop()

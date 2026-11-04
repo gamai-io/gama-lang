@@ -77,9 +77,10 @@ These are outside the T1–T10 checks or only partially covered; see
    unchanged nested record values are shallow-copied (shared) and updating a
    replaced field does not affect the receiver. Generics, generic enum
    variants, record methods, and structural subtyping are missing; the IR
-   prototype supports records and nullary enums for its documented subset
-   (field assignment and copy/`with` are interpreter-only and rejected by the
-   IR with `IRUnsupported`).
+   prototype supports records, nullary enums and copy/`with` updates (same
+   shallow, declaration-ordered semantics) for its documented subset, while
+   in-place field assignment remains interpreter-only and is rejected by the
+   IR with `IRUnsupported`.
 5. **Formatter edges.** `fmt` is AST-based; it preserves comments and strings,
    is idempotent, and wraps at a configurable width (default 88,
    `fmt --width`): expressions (list/map/record literals, calls, binary chains,

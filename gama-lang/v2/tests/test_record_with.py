@@ -12,8 +12,8 @@ Semantics under test:
   value through the copy is therefore visible through the receiver, while a
   field that was replaced by the update is independent.
 * The checker enforces a record receiver, known fields, no duplicates and
-  compatible value types (``GamaTypeError``); the IR backend rejects the
-  construct with ``IRUnsupported`` instead of silently dropping updates.
+  compatible value types (``GamaTypeError``); the IR backend implements the
+  same copy semantics (see ``tests/test_ir_record_with.py``).
 * Namespaced records work through aliased imports when constructed with
   ``geo.Point(...)`` or when updating an exported constant; named construction
   with a dotted name (``geo.Point { ... }``) remains parser-unsupported.
@@ -249,19 +249,16 @@ class RecordWithTests(unittest.TestCase):
         self.assertEqual(out, gama_fmt.format_source(out))
         self.assertEqual(G.run(out).out, G.run(src).out)
 
-    def test_ir_rejects_record_with(self):
+    def test_ir_matches_interpreter_record_with(self):
         import gama_ir as IR
-        ast = G.check(
+        src = (
             'record Point { x: Int, y: Int }\n'
             'let p = Point(1, 2)\n'
             'let q = p with { x = 3 }\n'
+            'print p\n'
             'print q\n')
-        with self.assertRaisesRegex(
-                IR.IRUnsupported, r"record copy/with"):
-            IR.compile_program(ast)
-        with self.assertRaisesRegex(
-                IR.IRUnsupported, r"record copy/with"):
-            IR.run_program(ast)
+        self.assertEqual(
+            IR.run_program(G.check(src)).out, G.run(src).out)
 
 
 if __name__ == "__main__":
