@@ -58,6 +58,14 @@ class ResultVal:
     def __str__(self): return ("Ok(" if self.ok else "Err(") + str(self.value) + ")"
     __repr__ = __str__
 
+class FunctionVal:
+    """Runtime callable value: a lambda bound to its defining environment."""
+    def __init__(self, params, ret, effects, body, closure, name="<lambda>"):
+        self.params, self.ret, self.effects = params, ret, effects
+        self.body, self.closure, self.name = body, closure, name
+    def __str__(self): return f"<fn {self.name}>"
+    __repr__ = __str__
+
 class TableType(str):
     """String-compatible 'Table' type carrying an optional column set."""
     fields: set[str] | None
@@ -166,6 +174,8 @@ class Assign: name: str; expr: Any; line: int; col: int
 class Param: name: str; type_name: str; default: Any = None
 @dataclass
 class Fn: name: str; params: list; ret: str | None; effects: set | None; body: list; line: int; col: int
+@dataclass
+class Lambda: params: list; ret: str | None; effects: set | None; body: list; line: int; col: int
 @dataclass
 class Match: expr: Any; arms: list; line: int; col: int
 @dataclass
@@ -288,6 +298,28 @@ class Parser:
                 if self.at("OP", ","): self.take(); self.skip_nl()
             self.expect("OP", "}")
         return Fn(name, params, ret, effects, self.block(), x.line, x.col)
+    def lambda_expr(self):
+        x = self.take(); self.expect("OP", "("); self.skip_nl()
+        params = []
+        if not self.at("OP", ")"):
+            while True:
+                pn = self.expect("IDENT").val; self.expect("OP", ":"); pt = self.expect("IDENT").val
+                default = None
+                if self.at("OP", "="):
+                    self.take(); self.skip_nl(); default = self.expr()
+                params.append(Param(pn, pt, default)); self.skip_nl()
+                if not self.at("OP", ","): break
+                self.take(); self.skip_nl()
+        self.expect("OP", ")"); ret = None
+        if self.at("OP", "->"): self.take(); self.skip_nl(); ret = self.expect("IDENT").val
+        effects = None
+        if self.at("KW", "effects"):
+            self.take(); self.expect("OP", "{"); self.skip_nl(); effects = set()
+            while not self.at("OP", "}"):
+                effects.add(self.expect("IDENT").val); self.skip_nl()
+                if self.at("OP", ","): self.take(); self.skip_nl()
+            self.expect("OP", "}")
+        return Lambda(params, ret, effects, self.block(), x.line, x.col)
     def if_stmt(self):
         x = self.take(); cond = self.expr(); self.skip_nl(); then = self.block(); other = None
         save = self.i; self.skip_seps()
@@ -364,6 +396,8 @@ class Parser:
         return e
     def primary(self):
         x = self.peek()
+        if x.kind == "KW" and x.val == "fn" and self.peek(1).kind == "OP" and self.peek(1).val == "(":
+            return self.lambda_expr()
         if x.kind == "NUMBER": self.take(); return Literal(x.val, x.line, x.col)
         if x.kind == "STRING": self.take(); return Literal(x.val, x.line, x.col)
         if x.kind == "KW" and x.val in ("true", "false", "null"):
@@ -420,6 +454,7 @@ def parse(src: str):
 NUM = {"Int", "Decimal"}
 def tname(v) -> str:
     if isinstance(v, ResultVal): return "Result"
+    if isinstance(v, FunctionVal): return "Function"
     if v is None: return "Null"
     if isinstance(v, bool): return "Bool"
     if isinstance(v, int): return "Int"
@@ -750,7 +785,7 @@ class Checker:
         elif isinstance(s, Return):
             if self.ret_type is None: raise GamaTypeError("return outside function", s.line, s.col)
             rt = self.expr(s.expr)
-            if not self.compat(rt, self.ret_type): raise GamaTypeError(f"return {rt} != {self.ret_type}", s.line, s.col)
+            if rt != "Any" and not self.compat(rt, self.ret_type): raise GamaTypeError(f"return {rt} != {self.ret_type}", s.line, s.col)
         elif isinstance(s, Prove):
             self.expr(s.expr); self.effects.add("proof.write")
             self.set(s.name, "Json")
@@ -772,6 +807,20 @@ class Checker:
         return want in ("Any", got) or (want in NUM and got in NUM) or (want == "List" and got in ("List", "Table"))
     def expr(self, e, row=None) -> str:
         if isinstance(e, Literal): return tname(e.value)
+        if isinstance(e, Lambda):
+            self.push()
+            for p in e.params: self.set(p.name, p.type_name)
+            old = self.effects; self.effects = set()
+            old_ret = self.ret_type; self.ret_type = e.ret or "Any"
+            for s in e.body: self.stmt(s, e.effects or set())
+            used = set(self.effects); self.effects = old; self.ret_type = old_ret
+            allowed = e.effects or set()
+            self.pop()
+            bad = used - allowed
+            if bad:
+                raise GamaEffectError(
+                    "lambda uses undeclared effects: " + ",".join(sorted(bad)), e.line, e.col)
+            return "Function"
         if isinstance(e, ListExpr):
             types = {self.expr(x, row) for x in e.items}
             return "Table" if types and types <= {"Json"} else "List"
@@ -846,7 +895,14 @@ class Checker:
                     return TableType(None)
                 return rt
             f = self.funcs.get(e.name)
-            if not f: raise GamaTypeError(f"unknown function {e.name}", e.line, e.col)
+            if not f:
+                vt = self.get(e.name)
+                if vt == "Function":
+                    for a in e.args: self.expr(a)
+                    return "Any"
+                if vt is not None:
+                    raise GamaTypeError(f"{e.name} is not callable ({vt})", e.line, e.col)
+                raise GamaTypeError(f"unknown function {e.name}", e.line, e.col)
             required = sum(1 for p in f.params if p.default is None)
             if not (required <= len(e.args) <= len(f.params)):
                 raise GamaTypeError(f"{e.name} expects {required}..{len(f.params)} args", e.line, e.col)
@@ -1117,8 +1173,28 @@ class Interpreter:
         elif os.environ.get("GAMA_L_REQUIRE_SIG") == "1":
             errs.append("missing_signature")
         return {"ok": not errs, "expected": exp, "errors": errs}
+    def invoke(self, fv, args, env, row, line, col):
+        required = sum(1 for p in fv.params if p.default is None)
+        if not (required <= len(args) <= len(fv.params)):
+            raise GamaRuntimeError(
+                f"{fv.name} expects {required}..{len(fv.params)} args, got {len(args)}",
+                line, col)
+        local = Env(fv.closure)
+        for i, p in enumerate(fv.params):
+            if i < len(args):
+                value = self.expr(args[i], env, row)
+            else:
+                value = self.expr(p.default, fv.closure)
+            local.set(p.name, value)
+        try:
+            for s in fv.body: self.stmt(s, local)
+        except ReturnSignal as r: return r.value
+        except PropagateSignal as p: return ResultVal(False, p.value)
+        return None
     def expr(self, e, env, row=None):
         if isinstance(e, Literal): return e.value
+        if isinstance(e, Lambda):
+            return FunctionVal(e.params, e.ret, e.effects, e.body, env)
         if isinstance(e, ListExpr): return [self.expr(x, env, row) for x in e.items]
         if isinstance(e, MapExpr): return {k: self.expr(v, env, row) for k, v in e.items.items()}
         if isinstance(e, Index):
@@ -1259,15 +1335,18 @@ class Interpreter:
                 return value.quantize(Decimal(1).scaleb(-digits))
             if e.name in self.funcs:
                 fn, closure = self.funcs[e.name]
-                local = Env(closure)
-                for i, p in enumerate(fn.params):
-                    value = self.expr(e.args[i], env, row) if i < len(e.args) else self.expr(p.default, closure)
-                    local.set(p.name, value)
-                try:
-                    for s in fn.body: self.stmt(s, local)
-                except ReturnSignal as r: return r.value
-                except PropagateSignal as p: return ResultVal(False, p.value)
-                return None
+                return self.invoke(
+                    FunctionVal(fn.params, fn.ret, fn.effects, fn.body, closure, fn.name),
+                    e.args, env, row, e.line, e.col)
+            try:
+                fnval = env.get(e.name)
+            except GamaRuntimeError:
+                fnval = None
+            if isinstance(fnval, FunctionVal):
+                return self.invoke(fnval, e.args, env, row, e.line, e.col)
+            if fnval is not None:
+                raise GamaRuntimeError(
+                    f"{e.name} is not callable ({tname(fnval)})", e.line, e.col)
             raise GamaRuntimeError(f"unknown function {e.name}", e.line, e.col)
         if isinstance(e, Pipe):
             value = self.expr(e.base, env, row)
