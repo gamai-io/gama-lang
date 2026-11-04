@@ -33,9 +33,10 @@ Guarantees of the AST formatter:
     multi-line bodies survive exactly.  A block that opens on the same source
     line as a multi-line string opener keeps that first statement on the
     header line, so the continuation line cannot desynchronise block depth.
-  * Record and enum declarations are canonicalised to one line
-    (``record Name { field: Type, ... }`` / ``enum Name { Variant, ... }``);
-    named record literals (``Point { x: 1, y: 2 }``) keep field order.
+  * Record and enum declarations are canonicalised to one line when they fit
+    and carry no interior comments (``record Name { field: Type, ... }`` /
+    ``enum Name { Variant, ... }``); named record literals
+    (``Point { x: 1, y: 2 }``) keep field order.
 
 Line wrapping (added in this revision):
   * Expressions longer than ``width`` (default 88) are wrapped deterministically
@@ -44,26 +45,41 @@ Line wrapping (added in this revision):
     with the opening expression, binary chains break after the operator, and
     pipes put each ``| stage`` on its own line.  Short constructs are emitted
     exactly as before (one line).
+  * The same width applies to declarations and structural headers:
+    ``record``/``enum`` declarations put one field/variant per line with the
+    closing ``}`` at the declaration indent; ``fn``/``make`` headers put one
+    parameter (and a long default expression) per line, keep
+    ``) -> Ret effects {...}`` together and break a long ``effects`` set one
+    name per line; ``if``/``while``/``for``/``match`` headers wrap their
+    expression; ``prove name = expr`` / ``prove name { ... }`` wraps ``expr``.
   * No token is added or removed by wrapping (no trailing commas, no extra
     parentheses), so the semantic token stream is unchanged.  Binary wrapping
-    relies on the parser accepting a newline after a binary operator.
-  * Comments inside a wrapped literal/call stay on the entry they annotate
-    (``1, # one``).  Comments between binary operands stay after the operator
-    line they followed, and comments on their own line are emitted just before
-    the next entry at the continuation indent.  Comments in an expression that
-    is *not* wrapped, and comments inside pipe stages, are still moved to the
-    nearest safe position (end of the statement / before the next statement);
-    that is the only unavoidable movement.
+    relies on the parser accepting a newline after a binary operator, and
+    header wrapping on the parser accepting newlines inside parameter and
+    declaration braces.
+  * Comments inside a wrapped literal/call/declaration stay on the entry they
+    annotate (``1, # one``).  Comments between binary operands stay after the
+    operator line they followed, comments inside a pipe stage stay on that
+    stage, and comments on their own line are emitted just before the next
+    entry at the continuation indent.  A short construct whose only reason to
+    expand is an interior comment is expanded (``[1, # one`` and
+    ``x | # c`` no longer force a safe-position move).
   * Comments on the closing delimiter line stay with the statement (trailing
     comment), as before.
 
 Known limitations (documented, not hidden):
-  * Comments inside a *short* expression (e.g. ``[1, # one`` on one physical
-    line) are moved to the end of that statement or to the following statement
-    line (safe position) unless the construct is expanded for other reasons.
-  * Comments inside ``|`` pipe stages are not attached per stage; the pipe is
-    wrapped but the comments use the safe-position fallback.
-  * ``record``/``enum`` declarations and ``fn`` headers are not width-wrapped.
+  * A comment with no legal line break at its position still moves to the
+    nearest safe attachment point: after ``|`` and before a stage keyword
+    (moves to the base line), before a binary operator (moves to the preceding
+    operator/operand line), or between ``let x =`` and its expression (moves to
+    the end of that statement or the next statement).  Comments are never
+    dropped or duplicated.
+  * Comments inside a ``fn`` ``effects`` block or an inline lambda body use the
+    safe-position fallback; the construct itself still wraps.
+  * Inline lambdas (``fn(...) { ... }`` used as an expression) are not
+    width-wrapped; their comments use the safe-position fallback.
+  * Indivisible tokens (a single identifier or string longer than ``width``)
+    still overflow.
   * Map keys are re-rendered from their decoded string value: a quoted
     identifier key (``"total"``) becomes a bare key (``total``).  The map entry
     and lookup semantics are identical.
@@ -676,7 +692,11 @@ class _AstFormatter:
                 return (self._stmt_end_line(node.body[-1]), 10 ** 6)
             return (node.line, 10 ** 6)
         if isinstance(node, G.Pipe):
-            return (node.line, 10 ** 6)
+            try:
+                end, _stages = self._pipe_positions(node)
+                return end
+            except ValueError:
+                return (node.line, 10 ** 6)
         return (getattr(node, "line", 0), 10 ** 6)
 
     def _interior_comments(self, span):
@@ -768,14 +788,30 @@ class _AstFormatter:
                     return True
         return False
 
-    def _force_expand(self, node) -> bool:
+    def _expr_has_comment(self, node) -> bool:
+        """True if an expansion can keep an interior comment in place.
+
+        A container (list/map/record/call) owns every comment between its
+        delimiters, a binary owns comments around its operators, and a pipe
+        owns comments between its stages.  Binary children are checked
+        recursively so a comment inside a nested container still forces the
+        enclosing binary to expand (the container is then expanded by
+        ``_wrap``), instead of being moved to a safe position.
+        """
         G = _G
         span = self._span_for_container(node)
         if span is not None and self._interior_comments(span):
             return True
-        if isinstance(node, G.Binary) and self._binary_has_comment(node):
-            return True
+        if isinstance(node, G.Binary):
+            return (self._binary_has_comment(node)
+                    or self._expr_has_comment(node.left)
+                    or self._expr_has_comment(node.right))
+        if isinstance(node, G.Pipe):
+            return self._pipe_has_comment(node)
         return False
+
+    def _force_expand(self, node) -> bool:
+        return self._expr_has_comment(node)
 
     def _wrap(self, node, close_indent: int, base_col: int,
               minp: int = 0) -> str:
@@ -889,22 +925,126 @@ class _AstFormatter:
             lines.extend(rl)
         return "\n".join(lines)
 
-    def _wrap_pipe(self, node, close_indent, base_col, minp) -> str:
+    def _sig_index_after(self, pos) -> int:
+        for i, t in enumerate(self.sig):
+            if self._pos_lt(pos, (t.line, t.col)):
+                return i
+        return len(self.sig)
+
+    def _pipe_positions(self, node):
+        """Return ``(end_pos, stages)`` with token positions for a pipe.
+
+        Each stage entry is ``(stage, args, stage_token, end_pos)``.  Inner
+        stages of a parenthesised nested pipe are included first, so the tail
+        of the list always matches ``node.stages``.
+        """
+        if isinstance(node.base, _G.Pipe):
+            cursor, out = self._pipe_positions(node.base)
+        else:
+            cursor = self._expr_end_pos(node.base)
+            out = []
+        for stage, args in node.stages:
+            idx = self._sig_index_after(cursor)
+            if (idx >= len(self.sig)
+                    or self.sig[idx].kind != "OP"
+                    or self.sig[idx].val != "|"):
+                raise ValueError("pipe token not found")
+            idx += 1
+            if idx >= len(self.sig):
+                raise ValueError("pipe stage token not found")
+            stage_tok = self.sig[idx]
+            if stage_tok.val != stage:
+                raise ValueError("pipe stage mismatch")
+            scan = idx
+            if stage in ("filter", "limit"):
+                end = self._expr_end_pos(args[0])
+            elif stage in ("select", "sum", "map"):
+                names = list(args)
+                for name in names:
+                    scan += 1
+                    while (scan < len(self.sig)
+                           and self.sig[scan].val != name):
+                        scan += 1
+                    if scan >= len(self.sig):
+                        raise ValueError("pipe argument token not found")
+                    tok = self.sig[scan]
+                    end = (tok.line, tok.col + len(tok.val))
+            else:  # count
+                end = (stage_tok.line,
+                       stage_tok.col + len(stage_tok.val))
+            out.append((stage, args, stage_tok, end))
+            cursor = end
+        return cursor, out
+
+    def _pipe_has_comment(self, node) -> bool:
+        try:
+            end, _stages = self._pipe_positions(node)
+        except ValueError:
+            return False
+        start = self._expr_start_pos(node.base)
+        for idx, c in enumerate(self.comments):
+            if idx in self.used:
+                continue
+            pos = (c.line, c.col)
+            if self._pos_lt(start, pos) and self._pos_lt(pos, end):
+                return True
+        return False
+
+    def _wrap_pipe(self, node, close_indent, base_col, minp,
+                   _paren: bool = False) -> str:
         if _PIPE_PREC < minp:
-            return self._expr(node, minp)
+            if _paren:
+                return self._expr(node, minp)
+            body = self._wrap_pipe(node, close_indent, base_col + 1, 0,
+                                   _paren=True)
+            lines = body.split("\n")
+            lines[0] = "(" + lines[0]
+            lines[-1] += ")"
+            return "\n".join(lines)
         cont = close_indent + 2
         text = self._wrap(node.base, close_indent, base_col, 1)
         lines = text.split("\n")
-        for stage, args in node.stages:
+        inline_lines: set[int] = set()
+        base_end = self._expr_end_pos(node.base)
+        try:
+            _end, positions = self._pipe_positions(node)
+        except ValueError:
+            positions = None
+        if positions is not None:
+            positions = positions[-len(node.stages):] if node.stages else []
+        cursor = base_end
+        prev_line = len(lines) - 1
+        prev_src = cursor[0]
+        for i, (stage, args) in enumerate(node.stages):
+            stage_tok = stage_end = None
+            if positions is not None and i < len(positions):
+                _s, _a, stage_tok, stage_end = positions[i]
+            stage_pos = ((stage_tok.line, stage_tok.col)
+                         if stage_tok is not None else None)
+            if stage_pos is not None:
+                self._flush_comment_range(
+                    cursor, stage_pos, cont, lines, inline_lines,
+                    attach_line=prev_line, attach_src_line=prev_src)
             if stage in ("filter", "limit"):
-                part = stage + " " + self._expr(args[0])
+                arg_base = cont + len("| " + stage + " ")
+                part = stage + " " + self._wrap(args[0], cont,
+                                                arg_base, 0)
             elif stage == "select":
                 part = "select " + ", ".join(args)
             elif stage in ("sum", "map"):
                 part = stage + " " + args[0]
             else:
                 part = stage
-            lines.append(" " * cont + "| " + part)
+            block = " " * cont + "| " + part
+            lines.extend(block.split("\n"))
+            if stage_pos is not None and stage_end is not None:
+                self._flush_comment_range(
+                    stage_pos, stage_end, cont, lines, inline_lines,
+                    attach_line=len(lines) - 1,
+                    attach_src_line=stage_end[0])
+                cursor = stage_end
+                prev_src = stage_end[0]
+            prev_line = len(lines) - 1
         return "\n".join(lines)
 
     def _emit_expr_stmt(self, ind, prefix, stmt, indent, semi):
@@ -972,13 +1112,13 @@ class _AstFormatter:
             self._emit_expr_stmt(ind, "verify ", s, indent, semi)
             return
         if isinstance(s, G.Prove):
-            self._emit(ind + self._prove_text(s), [s.line], suffix=semi)
+            self._render_prove(s, indent, semi)
             return
         if isinstance(s, G.RecordDecl):
-            self._emit(ind + self._record_text(s), [s.line], suffix=semi)
+            self._render_record(s, indent, semi)
             return
         if isinstance(s, G.EnumDecl):
-            self._emit(ind + self._enum_text(s), [s.line], suffix=semi)
+            self._render_enum(s, indent, semi)
             return
         if isinstance(s, G.Fn):
             self._render_fn_stmt(s, indent, semi)
@@ -1035,6 +1175,162 @@ class _AstFormatter:
         return prefix + keyword + name + "(" + self._params_text(s.params) + ")" + \
             ret + self._effects_text(s.effects)
 
+    def _param_positions(self, s):
+        """Token spans ``(start, end)`` for each fn parameter, in order."""
+        span = self._span(s)
+        if not span or not s.params:
+            return []
+        toks = self.toks[span[0]:span[1]]
+        i = 0
+        while i < len(toks) and not (toks[i].kind == "OP"
+                                     and toks[i].val == "("):
+            i += 1
+        i += 1
+        out = []
+        for p in s.params:
+            while i < len(toks) and toks[i].kind == "NL":
+                i += 1
+            while i < len(toks) and not (toks[i].kind == "IDENT"
+                                         and toks[i].val == p.name):
+                if toks[i].kind == "OP" and toks[i].val == ")":
+                    return out
+                i += 1
+            if i >= len(toks):
+                return out
+            start = (toks[i].line, toks[i].col)
+            i += 1
+            while i < len(toks) and toks[i].kind == "NL":
+                i += 1
+            if not (i < len(toks) and toks[i].kind == "OP"
+                    and toks[i].val == ":"):
+                return out
+            i += 1
+            while i < len(toks) and toks[i].kind == "NL":
+                i += 1
+            if not (i < len(toks) and toks[i].kind == "IDENT"):
+                return out
+            type_tok = toks[i]
+            i += 1
+            end = (type_tok.line, type_tok.col + len(type_tok.val))
+            if p.default is not None:
+                end = self._expr_end_pos(p.default)
+                while (i < len(toks)
+                       and not self._pos_lt(
+                           end, (toks[i].line, toks[i].col))):
+                    i += 1
+            out.append((start, end))
+        return out
+
+    def _fn_header_text(self, s, indent: int, keyword="fn",
+                        named=True) -> str:
+        """Render a fn header, breaking the parameter list when too long.
+
+        ``indent`` is the statement indentation level; continuation lines carry
+        absolute indentation.  The closing ``) -> Ret effects {...}`` stays on
+        one line because the parser requires ``->``/``effects`` directly after
+        ``)``.  Default values are wrapped with the normal expression wrapper.
+        """
+        ind = _UNIT * indent
+        single = self._fn_header(s, keyword, named)
+        if self._fits(single + " {", len(ind)):
+            return single
+        name = (" " + s.name) if named else ""
+        ret = (" -> " + s.ret) if s.ret else ""
+        prefix = "export " if getattr(s, "exported", False) else ""
+        inner = len(ind) + 2
+        effects = s.effects
+        if not s.params:
+            first = prefix + keyword + name + "()" + ret
+            if not effects:
+                return single
+            names = sorted(effects)
+            one = " effects {" + ", ".join(names) + "}"
+            if self._fits(first + one + " {", len(ind)) or len(names) == 1:
+                return first + one
+            lines = [first + " effects {"]
+            for i, nm in enumerate(names):
+                part = " " * inner + nm
+                if i < len(names) - 1:
+                    part += ","
+                lines.append(part)
+            lines.append(" " * len(ind) + "}")
+            return "\n".join(lines)
+        lines = [prefix + keyword + name + "("]
+        texts = []
+        for p in s.params:
+            text = p.name + ": " + p.type_name
+            if p.default is not None:
+                text += " = " + self._wrap(
+                    p.default, inner, inner + len(text) + 3)
+            parts = text.split("\n")
+            parts[0] = " " * inner + parts[0]
+            texts.append(parts)
+        positions = self._param_positions(s)
+        span = self._delim_span("(", s.line, s.col)
+        if span is not None and len(positions) == len(s.params):
+            cursor = (span[0], span[1])
+            close_pos = (span[2], span[3])
+            inline_lines: set[int] = set()
+            prev_line = 0
+            prev_src = s.line
+            for i, parts in enumerate(texts):
+                start, end = positions[i]
+                self._flush_comment_range(
+                    cursor, start, inner, lines, inline_lines,
+                    attach_line=prev_line, attach_src_line=prev_src)
+                lines.extend(parts)
+                if i < len(texts) - 1:
+                    lines[-1] += ","
+                self._flush_comment_range(
+                    start, end, inner, lines, inline_lines,
+                    attach_line=len(lines) - 1,
+                    attach_src_line=end[0])
+                cursor = end
+                prev_line = len(lines) - 1
+                prev_src = end[0]
+            self._flush_comment_range(
+                cursor, close_pos, inner, lines, inline_lines,
+                attach_line=prev_line, attach_src_line=prev_src)
+        else:
+            for i, parts in enumerate(texts):
+                lines.extend(parts)
+                if i < len(texts) - 1:
+                    lines[-1] += ","
+        close = " " * len(ind) + ")" + ret
+        if effects is None:
+            lines.append(close)
+        elif not effects:
+            lines.append(close + " effects {}")
+        else:
+            names = sorted(effects)
+            one = " effects {" + ", ".join(names) + "}"
+            if self._fits(close + one + " {", len(ind)):
+                lines.append(close + one)
+            else:
+                lines.append(close + " effects {")
+                for i, nm in enumerate(names):
+                    part = " " * inner + nm
+                    if i < len(names) - 1:
+                        part += ","
+                    lines.append(part)
+                lines.append(" " * len(ind) + "}")
+        return "\n".join(lines)
+
+    def _header_expr(self, prefix: str, node, indent: int,
+                     minp: int = 0) -> str:
+        """Render ``prefix + expression`` for a control-flow header.
+
+        The trailing ``{`` is accounted for in the width check, so a header is
+        only kept on one line when the opener fits too.  ``{`` is appended by
+        the caller to the last line.
+        """
+        ind = _UNIT * indent
+        base_col = len(ind) + len(prefix)
+        text = self._expr(node, minp)
+        if self._fits(text + " {", base_col) and not self._force_expand(node):
+            return prefix + text
+        return prefix + self._wrap(node, len(ind), base_col + 2, minp)
+
     @staticmethod
     def _record_text(s) -> str:
         prefix = "export " if getattr(s, "exported", False) else ""
@@ -1044,21 +1340,212 @@ class _AstFormatter:
         return prefix + "record " + s.name + " { " + ", ".join(fields) + " }"
 
     @staticmethod
-    def _enum_text(s) -> str:
-        parts = []
-        for v in s.variants:
-            if isinstance(v, tuple):
-                name = v[0]
-                payload = v[1] if len(v) > 1 else None
-            else:
-                name, payload = v, None
-            if isinstance(payload, tuple):
-                parts.append(name + "(" + ", ".join(payload) + ")")
-            else:
-                parts.append(name + ("(" + payload + ")" if payload else ""))
+    def _enum_variant_text(v) -> str:
+        if isinstance(v, tuple):
+            name = v[0]
+            payload = v[1] if len(v) > 1 else None
+        else:
+            name, payload = v, None
+        if isinstance(payload, tuple):
+            return name + "(" + ", ".join(payload) + ")"
+        return name + ("(" + payload + ")" if payload else "")
+
+    @classmethod
+    def _enum_text(cls, s) -> str:
+        parts = [cls._enum_variant_text(v) for v in s.variants]
         if not parts:
             return "enum " + s.name + " { }"
         return "enum " + s.name + " { " + ", ".join(parts) + " }"
+
+    def _record_field_positions(self, s):
+        """Token spans ``(start, end)`` for each record field, in order."""
+        span = self._span(s)
+        if not span:
+            return []
+        toks = self.toks[span[0]:span[1]]
+        i = 0
+        while i < len(toks) and not (toks[i].kind == "OP"
+                                     and toks[i].val == "{"):
+            i += 1
+        i += 1
+        out = []
+        while i < len(toks):
+            t = toks[i]
+            if t.kind == "OP" and t.val == "}":
+                break
+            if t.kind == "NL" or (t.kind == "OP" and t.val in ",;"):
+                i += 1
+                continue
+            if t.kind == "IDENT":
+                j = i + 1
+                while j < len(toks) and toks[j].kind == "NL":
+                    j += 1
+                if (j < len(toks) and toks[j].kind == "OP"
+                        and toks[j].val == ":"):
+                    k = j + 1
+                    while k < len(toks) and toks[k].kind == "NL":
+                        k += 1
+                    if k < len(toks) and toks[k].kind == "IDENT":
+                        ft = toks[k]
+                        out.append(((t.line, t.col),
+                                    (ft.line,
+                                     ft.col + len(ft.val))))
+                        i = k + 1
+                        continue
+            i += 1
+        return out
+
+    def _enum_variant_positions(self, s):
+        """Token spans ``(start, end)`` for each enum variant, in order."""
+        span = self._span(s)
+        if not span:
+            return []
+        toks = self.toks[span[0]:span[1]]
+        i = 0
+        while i < len(toks) and not (toks[i].kind == "OP"
+                                     and toks[i].val == "{"):
+            i += 1
+        i += 1
+        out = []
+        while i < len(toks):
+            t = toks[i]
+            if t.kind == "OP" and t.val == "}":
+                break
+            if t.kind == "NL" or (t.kind == "OP" and t.val in ",;"):
+                i += 1
+                continue
+            if t.kind != "IDENT":
+                i += 1
+                continue
+            start = (t.line, t.col)
+            end = (t.line, t.col + len(t.val))
+            i += 1
+            j = i
+            while j < len(toks) and toks[j].kind == "NL":
+                j += 1
+            if j < len(toks) and toks[j].kind == "OP" and toks[j].val == "(":
+                depth = 0
+                while j < len(toks):
+                    u = toks[j]
+                    if u.kind == "OP" and u.val == "(":
+                        depth += 1
+                    elif u.kind == "OP" and u.val == ")":
+                        depth -= 1
+                        if depth == 0:
+                            end = (u.line, u.col + 1)
+                            j += 1
+                            break
+                    j += 1
+                i = j
+            out.append((start, end))
+        return out
+
+    def _decl_has_comment(self, s) -> bool:
+        span = self._delim_span("{", s.line, s.col)
+        return bool(span and self._interior_comments(span))
+
+    def _render_record(self, s, indent: int, semi: str):
+        ind = _UNIT * indent
+        text = self._record_text(s)
+        has_comment = self._decl_has_comment(s)
+        if (not has_comment and not s.fields) or (
+                not has_comment and self._fits(text, len(ind))):
+            self._emit(ind + text, [s.line], suffix=semi)
+            return
+        prefix = "export " if getattr(s, "exported", False) else ""
+        inner = len(ind) + 2
+        lines = [prefix + "record " + s.name + " {"]
+        self._render_decl_body(
+            s, s.fields, self._record_field_positions(s),
+            [fn + ": " + ft for fn, ft in s.fields],
+            lines, indent, inner, semi, close_text="}")
+
+    def _render_enum(self, s, indent: int, semi: str):
+        ind = _UNIT * indent
+        text = self._enum_text(s)
+        has_comment = self._decl_has_comment(s)
+        if (not has_comment and not s.variants) or (
+                not has_comment and self._fits(text, len(ind))):
+            self._emit(ind + text, [s.line], suffix=semi)
+            return
+        inner = len(ind) + 2
+        lines = ["enum " + s.name + " {"]
+        self._render_decl_body(
+            s, s.variants, self._enum_variant_positions(s),
+            [self._enum_variant_text(v) for v in s.variants],
+            lines, indent, inner, semi, close_text="}")
+
+    def _separator_text(self, after_pos, before_pos) -> str:
+        """Original separator token between two declaration entries.
+
+        Record and enum entries may be separated by ``,``, ``;`` or just a
+        newline; the wrapped form reuses the original separator so no token is
+        added or removed.
+        """
+        comma = semi = False
+        for t in self.sig:
+            tpos = (t.line, t.col)
+            if self._pos_lt(tpos, after_pos):
+                continue
+            if not self._pos_lt(tpos, before_pos):
+                break
+            if t.kind == "OP" and t.val == ",":
+                comma = True
+            elif t.kind == "OP" and t.val == ";":
+                semi = True
+        if comma:
+            return ","
+        if semi:
+            return ";"
+        return ""
+
+    def _render_decl_body(self, s, entries, positions, texts, lines,
+                          indent, inner, semi, close_text):
+        """Vertical declaration body with comments kept on their entry."""
+        ind = _UNIT * indent
+        span = self._delim_span("{", s.line, s.col)
+        if span is None or len(positions) != len(entries):
+            for i, text in enumerate(texts):
+                line = " " * inner + text
+                if i < len(entries) - 1:
+                    line += ","
+                lines.append(line)
+            lines.append(" " * len(ind) + close_text)
+            self._emit("\n".join(lines), [s.line], suffix=semi)
+            return
+        seps = [
+            self._separator_text(positions[i][1], positions[i + 1][0])
+            for i in range(len(positions) - 1)
+        ]
+        cursor = (span[0], span[1])
+        close_pos = (span[2], span[3])
+        inline_lines: set[int] = set()
+        prev_line = 0
+        prev_src = s.line
+        for i, (start, end) in enumerate(positions):
+            self._flush_comment_range(
+                cursor, start, inner, lines, inline_lines,
+                attach_line=prev_line, attach_src_line=prev_src)
+            line = " " * inner + texts[i]
+            if i < len(seps):
+                line += seps[i]
+            lines.append(line)
+            self._flush_comment_range(
+                start, end, inner, lines, inline_lines,
+                attach_line=len(lines) - 1,
+                attach_src_line=end[0])
+            cursor = end
+            prev_line = len(lines) - 1
+            prev_src = end[0]
+        self._flush_comment_range(
+            cursor, close_pos, inner, lines, inline_lines,
+            attach_line=prev_line, attach_src_line=prev_src)
+        lines.append(" " * len(ind) + close_text + semi)
+        end_line = self._stmt_end_line(s)
+        self._flush_comment_range(
+            close_pos, (end_line + 1, 0), inner, lines, inline_lines,
+            attach_line=len(lines) - 1, attach_src_line=end_line)
+        self._emit("\n".join(lines), attach=False)
 
     def _multiline_lead(self, stmts, brace_line: int):
         """Inline text for a first statement that shares the opener line.
@@ -1081,7 +1568,8 @@ class _AstFormatter:
         nxt = self._next_line(s)
         pairs = self._pairs(s.line, nxt)
         body = self._pick_body_pair(pairs, s.body)
-        header = self._fn_header(s, self._fn_keyword(s)) + " {"
+        header = self._fn_header_text(
+            s, indent, self._fn_keyword(s)) + " {"
         header_end = body[0].line + 1 if body else s.line + 1
         if body and s.body and body[0].line == body[1].line:
             # A function body written entirely on one source line stays on one
@@ -1113,9 +1601,10 @@ class _AstFormatter:
         pairs = self._pairs(s.line, nxt)
         body = self._pick_body_pair(pairs, s.body)
         if kind == "while":
-            header = "while " + self._expr(s.cond)
+            header = self._header_expr("while ", s.cond, indent)
         else:
-            header = "for " + s.name + " in " + self._expr(s.iterable)
+            header = self._header_expr(
+                "for " + s.name + " in ", s.iterable, indent)
         header += " {"
         header_end = body[0].line + 1 if body else s.line + 1
         lead = self._multiline_lead(s.body, body[0].line) if body else None
@@ -1142,7 +1631,8 @@ class _AstFormatter:
         then_pair = self._pick_body_pair(pairs, s.then)
         if then_pair is None and pairs:
             then_pair = pairs[0]
-        header = "if " + self._expr(s.cond) + " {"
+        header = self._header_expr(
+            prefix + "if ", s.cond, indent) + " {"
         head_lines = list(range(s.line, (then_pair[0].line + 1)
                                 if then_pair else s.line + 1))
         head_lines.extend(extra_lines)
@@ -1153,12 +1643,12 @@ class _AstFormatter:
             lead_semi = ";" if self._has_semicolon(first) else ""
             first_end = self._stmt_end_line(first)
             lead_lines = list(range(s.line, first_end + 1)) + list(extra_lines)
-            self._emit(ind + prefix + header + " " + lead + lead_semi,
+            self._emit(ind + header + " " + lead + lead_semi,
                        lead_lines)
             self.render_block(s.then[1:], indent + 1,
                               first_end, then_pair[1].line)
         else:
-            self._emit(ind + prefix + header, head_lines)
+            self._emit(ind + header, head_lines)
             if then_pair:
                 self.render_block(s.then, indent + 1,
                                   then_pair[0].line, then_pair[1].line)
@@ -1208,7 +1698,7 @@ class _AstFormatter:
         nxt = self._next_line(s)
         pairs = self._pairs(s.line, nxt)
         outer = pairs[-1] if pairs else None
-        header = "match " + self._expr(s.expr) + " {"
+        header = self._header_expr("match ", s.expr, indent) + " {"
         header_end = outer[0].line + 1 if outer else s.line + 1
         self._emit(ind + header, range(s.line, header_end))
         if outer is not None:
@@ -1240,20 +1730,28 @@ class _AstFormatter:
         self._emit(ind + "}",
                    [outer[1].line] if outer else [s.line], suffix=semi)
 
-    def _prove_text(self, s) -> str:
+    def _prove_uses_eq(self, s) -> bool:
         span = self._span(s)
-        used_eq = False
-        if span:
-            start, end = span
-            idx = start + 2  # skip ``prove`` and the name
-            while idx < end and self.toks[idx].kind == "NL":
-                idx += 1
-            if idx < end and self.toks[idx].kind == "OP" \
-                    and self.toks[idx].val == "=":
-                used_eq = True
+        if not span:
+            return False
+        start, end = span
+        idx = start + 2  # skip ``prove`` and the name
+        while idx < end and self.toks[idx].kind == "NL":
+            idx += 1
+        return (idx < end and self.toks[idx].kind == "OP"
+                and self.toks[idx].val == "=")
+
+    def _prove_text(self, s) -> str:
         name = "prove " + s.name
         expr = self._expr(s.expr)
-        return name + (" = " if used_eq else " ") + expr
+        return name + (" = " if self._prove_uses_eq(s) else " ") + expr
+
+    def _render_prove(self, s, indent: int, semi: str):
+        ind = _UNIT * indent
+        prefix = "prove " + s.name + (" = " if self._prove_uses_eq(s) else " ")
+        text = self._wrap(s.expr, len(ind), len(ind) + len(prefix))
+        end_line = self._stmt_end_line(s)
+        self._emit(ind + prefix + text, [s.line, end_line], suffix=semi)
 
     def _import_path_text(self, s) -> str:
         span = self._span(s)

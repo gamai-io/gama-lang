@@ -277,6 +277,240 @@ class ExpressionCommentTests(WrapBase):
         self.assertEqual(out.count("# before gamma"), 1)
 
 
+class LongHeaderTests(WrapBase):
+    def test_long_fn_header_wraps_parameters(self):
+        src = (
+            "fn calculate_total_of_all_things(alpha_one: Int, "
+            "beta_two: Int, gamma_three: Int, delta_four: Int, "
+            "epsilon_five: Int) -> Int effects {io, net} {\n"
+            "return alpha_one\n"
+            "}\n"
+            "print 1\n"
+        )
+        out = self.roundtrip(src)
+        lines = out.splitlines()
+        self.assertEqual(lines[0], "fn calculate_total_of_all_things(")
+        self.assertIn("  alpha_one: Int,", out)
+        self.assertIn("  epsilon_five: Int", out)
+        self.assertIn(") -> Int effects {io, net} {", out)
+        for line in lines:
+            self.assertLessEqual(len(line), 88, line)
+
+    def test_long_fn_default_wraps_inside_parameter(self):
+        src = (
+            "fn long_function_name("
+            "alpha: Int = 100000 + 200000 + 300000 + 400000 + 500000 + "
+            "600000 + 700000, beta: Int = 1) -> Int { return alpha }\n"
+            "print long_function_name()\n"
+        )
+        out = self.roundtrip(src)
+        self.assertEqual(out.splitlines()[0], "fn long_function_name(")
+        self.assertIn("  alpha: Int = 100000 +", out)
+        self.assertIn("  beta: Int = 1", out)
+        self.assertIn(") -> Int { return alpha }", out)
+
+    def test_long_record_and_enum_declarations_wrap(self):
+        src = (
+            "record VeryLongRecordName { alpha_field: Int, beta_field: Text, "
+            "gamma_field: Decimal, delta_field: Bool, epsilon_field: Int }\n"
+            "enum VeryLongEnumerationName { AlphaVariant, BetaVariant, "
+            "GammaVariant, DeltaVariant, EpsilonVariant, ZetaVariant }\n"
+            "print 1\n"
+        )
+        out = self.roundtrip(src)
+        self.assertIn("record VeryLongRecordName {", out)
+        self.assertIn("  alpha_field: Int,", out)
+        self.assertIn("  epsilon_field: Int\n}", out)
+        self.assertIn("enum VeryLongEnumerationName {", out)
+        self.assertIn("  AlphaVariant,", out)
+        self.assertIn("  ZetaVariant\n}", out)
+
+    def test_short_declarations_stay_on_one_line(self):
+        src = (
+            "record Point { x: Int, y: Int }\n"
+            "enum Color { Red, Green }\n"
+            "fn add(a: Int, b: Int) -> Int { return a }\n"
+            "print add(1, 2)\n"
+        )
+        self.assertEqual(gama_fmt.format_source(src), src)
+
+    def test_long_control_flow_headers_wrap(self):
+        src = (
+            "let x = 1\n"
+            "if x == 1 && x == 2 && x == 3 && x == 4 && x == 5 && "
+            "x == 6 && x == 7 && x == 8 && x == 9 && x == 10 && "
+            "x == 11 {\n"
+            "print x\n"
+            "}\n"
+            "while 100000 + 200000 + 300000 + 400000 + 500000 + "
+            "600000 + 700000 + 800000 + 900000 + 1000000 > 0 {\n"
+            "break\n"
+            "}\n"
+            "for i in [100000, 200000, 300000, 400000, 500000, "
+            "600000, 700000, 800000, 900000, 1000000] {\n"
+            "print i\n"
+            "}\n"
+        )
+        out = self.roundtrip(src)
+        self.assertIn("if x == 1 &&\n  x == 2 &&", out)
+        self.assertIn("while 100000 +\n  200000 +", out)
+        self.assertIn("for i in [\n  100000,", out)
+
+    def test_long_match_subject_wraps(self):
+        src = (
+            "match Ok(100000 + 200000 + 300000 + 400000 + 500000 + "
+            "600000 + 700000 + 800000 + 900000) {\n"
+            "Ok(x) { print x }\n"
+            "_ { print 0 }\n"
+            "}\n"
+        )
+        out = self.roundtrip(src)
+        self.assertIn("match Ok(\n  100000 +", out)
+        self.assertIn(") {", out)
+
+    def test_long_prove_wraps_expression(self):
+        src = (
+            "prove long_name = {\n"
+            "alpha: 100000, beta: 200000, gamma: 300000, delta: 400000, "
+            "epsilon: 500000, zeta: 600000, eta: 700000\n"
+            "}\n"
+            "verify long_name\n"
+        )
+        out = self.roundtrip(src)
+        self.assertEqual(out.splitlines()[0], "prove long_name = {")
+        self.assertIn("  alpha: 100000,", out)
+        self.assertIn("  eta: 700000\n}\nverify long_name", out)
+
+        brace = (
+            "prove long_name {\n"
+            "alpha: 100000, beta: 200000, gamma: 300000, delta: 400000, "
+            "epsilon: 500000, zeta: 600000, eta: 700000\n"
+            "}\n"
+            "verify long_name\n"
+        )
+        out = self.roundtrip(brace)
+        self.assertEqual(out.splitlines()[0], "prove long_name {")
+        self.assertIn("  eta: 700000\n}\nverify long_name", out)
+
+    def test_width_option_applies_to_headers(self):
+        src = (
+            "fn add(a: Int, b: Int, c: Int, d: Int, e: Int) -> Int "
+            "{ return a }\n"
+            "print add(1, 2, 3, 4, 5)\n"
+        )
+        wide = gama_fmt.format_source(src, width=200)
+        narrow = gama_fmt.format_source(src, width=40)
+        self.assertNotIn("\n  ", wide)
+        self.assertIn("add(\n  a: Int,", narrow)
+        self.assertEqual(wide, gama_fmt.format_source(wide, width=200))
+        self.assertEqual(narrow, gama_fmt.format_source(narrow, width=40))
+        self.assertEqual(shape(G.parse(src)), shape(G.parse(narrow)))
+        self.assertEqual(tokens(src), tokens(narrow))
+
+
+class PipeStageCommentTests(WrapBase):
+    def test_comments_between_stages_stay_with_their_stage(self):
+        src = (
+            'let r = sql("select neto from customers where neto > 0")\n'
+            "# before filter\n"
+            "| filter neto > 100000 # after filter\n"
+            "| select neto, konto\n"
+            "| sum neto\n"
+            "print r\n"
+        )
+        out = self.roundtrip(src)
+        self.assertIn(
+            "  # before filter\n  | filter neto > 100000 # after filter", out)
+        self.assertIn("  | select neto, konto", out)
+        self.assertIn("  | sum neto", out)
+
+    def test_comment_after_pipe_bar_is_kept(self):
+        src = "let r = [1, 2, 3] | # bar note\n count\nprint r\n"
+        out = self.roundtrip(src)
+        self.assertEqual(out.count("# bar note"), 1)
+        self.assertIn("  | count", out)
+        self.assertIn("# bar note", out)
+
+    def test_comment_inside_filter_stage_stays_on_operator(self):
+        src = (
+            'let r = sql("select neto from customers where neto > 0") '
+            "| filter neto + # sum note\n 0 > 0 | count\n"
+            "print r\n"
+        )
+        out = self.roundtrip(src)
+        self.assertIn("| filter neto + # sum note", out)
+        self.assertIn("  | count", out)
+
+    def test_comment_inside_count_pipe_stays_on_statement(self):
+        src = "let r = [1, 2, 3] | count # tail\nprint r\n"
+        out = self.roundtrip(src)
+        self.assertIn("[1, 2, 3] | count # tail", out)
+
+    def test_nested_pipe_stage_comments_stay_in_place(self):
+        src = (
+            'let r = (sql("select neto from customers where neto > 0")\n'
+            "# inner stage\n"
+            "| filter neto > 0) | # outer stage\n"
+            " count\n"
+            "print r\n"
+        )
+        out = self.roundtrip(src, width=40)
+        self.assertIn("  # inner stage", out)
+        self.assertIn("| filter neto > 0) # outer stage", out)
+        self.assertIn("  | count", out)
+
+
+class ShortExpressionCommentTests(WrapBase):
+    def test_short_record_with_inner_comment_expands(self):
+        src = (
+            "record P {\n"
+            "  # field note\n"
+            "  x: Int, # x tail\n"
+            "  y: Int\n"
+            "}\n"
+            "print 1\n"
+        )
+        out = self.roundtrip(src)
+        self.assertEqual(out.splitlines()[0], "record P {")
+        self.assertIn("  # field note", out)
+        self.assertIn("  x: Int, # x tail", out)
+
+    def test_short_enum_with_inner_comment_expands(self):
+        src = (
+            "enum C {\n"
+            "  # variant note\n"
+            "  Red, # red tail\n"
+            "  Green\n"
+            "}\n"
+            "print 1\n"
+        )
+        out = self.roundtrip(src)
+        self.assertEqual(out.splitlines()[0], "enum C {")
+        self.assertIn("  # variant note", out)
+        self.assertIn("  Red, # red tail", out)
+
+    def test_short_if_condition_list_comment_stays_on_item(self):
+        src = (
+            "if [1, # one\n 2] == [1, 2] {\n"
+            "print 1\n"
+            "}\n"
+        )
+        out = self.roundtrip(src)
+        self.assertIn("  1, # one", out)
+        self.assertIn("  2", out)
+
+    def test_short_binary_own_line_comment_uses_operator_position(self):
+        src = "let x = 1 +\n # between\n 2\nprint x\n"
+        out = self.roundtrip(src)
+        self.assertIn("let x = 1 +", out)
+        self.assertIn("  # between", out)
+
+    def test_comment_before_short_expression_is_not_dropped(self):
+        src = "let x =\n # before value\n 1\nprint x\n"
+        out = self.roundtrip(src)
+        self.assertEqual(out.count("# before value"), 1)
+
+
 class DeterminismTests(WrapBase):
     def test_wrapped_output_is_stable(self):
         src = ("let data = [100000, 200000, 300000, 400000, 500000, "

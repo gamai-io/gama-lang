@@ -31,7 +31,7 @@ clock, and every `GAMA_L_*` environment variable is stripped for each case.
 | **T7** — module import cycle rejected with a clear error | **PASS** | `T7ImportCycles.test_t7_import_cycle_rejected` | Temp project (`a.gm` ↔ `b.gm`) raises `GamaError: import cycle: …` before execution. |
 | **T8** — `ask` records prompt hash and model; offline returns `Unavailable` | **PASS** | `T8AskMetadata.test_t8_offline_ask_unavailable_with_metadata` | Offline: output `Unavailable`, `last_ask.model == "mock"`, `last_ask.prompt_hash == sha256(prompt)`. |
 | **T9** — 10 example programs run from a clean checkout without network | **PASS** | `T9ExamplesOffline.test_t9_examples_run_offline` | All 11 shipped examples run with every `GAMA_L_*` network/env knob removed (contract requires ≥10). |
-| **T10** — `gamal check` and `gamal fmt` are deterministic | **PASS** (current formatter) | `T10Determinism.test_t10_fmt_deterministic_and_idempotent`, `..._check_deterministic`, `..._preserves_multiline_string` | `fmt` output is identical across calls and idempotent, and formatted output still checks. Errors are byte-identical across repeated `check` calls. The formatter is AST-based and now wraps long list/map/record/call/binary/pipe expressions at a configurable width (default 88), keeping expression comments on their entry/operator line where possible. Caveat: comments in short (unwrapped) expressions and in pipe stages still use the safe-position fallback. |
+| **T10** — `gamal check` and `gamal fmt` are deterministic | **PASS** (current formatter) | `T10Determinism.test_t10_fmt_deterministic_and_idempotent`, `..._check_deterministic`, `..._preserves_multiline_string` | `fmt` output is identical across calls and idempotent, and formatted output still checks. Errors are byte-identical across repeated `check` calls. The formatter is AST-based and wraps long expressions at a configurable width (default 88): list/map/record/call/binary/pipe expressions, `record`/`enum` declarations, `fn`/`make` headers and parameters, `if`/`while`/`for`/`match` headers, and `prove`. Expression, pipe-stage, parameter and declaration comments stay on their entry/stage where possible; only comments with no legal line-break position use the safe-position fallback (see `README.md` → *Not implemented yet*). |
 
 ## Summary
 
@@ -76,11 +76,15 @@ These are outside the T1–T10 checks or only partially covered; see
    prototype supports records and nullary enums for its documented subset
    (field assignment is interpreter-only).
 5. **Formatter edges.** `fmt` is AST-based; it preserves comments and strings,
-   is idempotent, and wraps long list/map/record/call/binary/pipe expressions
-   at a configurable width (default 88, `fmt --width`). Comments in short
-   (unwrapped) expressions and inside pipe stages still move to a safe
-   position; declarations, `fn` headers, control-flow headers and `prove` are
-   not width-wrapped (T10 still passes).
+   is idempotent, and wraps at a configurable width (default 88,
+   `fmt --width`): expressions (list/map/record literals, calls, binary chains,
+   pipes), `record`/`enum` declarations, `fn`/`make` headers and parameters,
+   `if`/`while`/`for`/`match` headers, and `prove`. Comments stay on their
+   entry/stage/parameter/declaration line where a legal line break exists;
+   comments with no legal position (after `|` before a stage keyword, before a
+   binary operator, between `let x =` and its expression), comments inside a
+   `fn` effects set, or inside inline lambdas still move to a safe position.
+   Indivisible tokens longer than the width still overflow (T10 still passes).
 6. **Deployed public registry, marketplace signing, published release.**
    Build/checksums and a local HTTP registry exist; publishing does not.
 7. **Full standard library.** `sql`, `mail`, `memory`, and `proof` are present
