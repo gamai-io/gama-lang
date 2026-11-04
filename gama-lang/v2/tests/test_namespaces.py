@@ -21,18 +21,50 @@ class NamespaceTests(unittest.TestCase):
         p.write_text(text, encoding="utf-8")
         return p
 
-    def test_namespaced_call_and_non_fn_ignored(self):
+    def test_namespaced_call_works(self):
         self._write(
             "lib.gm",
-            'let hidden = 7\n'
-            'print "MODULE SIDE EFFECT"\n'
             'fn add(a: Int, b: Int) -> Int effects {} { return a + b }\n',
         )
         self._write("main.gm", 'import "lib.gm" as math\nprint math.add(2,3)\n')
         it = G.run_file(str(self.root / "main.gm"))
-        # Only the caller's print runs; the module's top-level print/let are
-        # ignored by the bounded MVP.
         self.assertEqual(it.out, ["5"])
+
+    def test_alias_rejects_top_level_let(self):
+        self._write("lib.gm", 'let hidden = 7\n')
+        self._write("main.gm", 'import "lib.gm" as math\nprint math.add(2,3)\n')
+        with self.assertRaisesRegex(
+            G.GamaError,
+            r"aliased import 'math'.*unsupported top-level statement 'let'",
+        ):
+            G.run_file(str(self.root / "main.gm"))
+
+    def test_alias_rejects_top_level_print(self):
+        self._write("lib.gm", 'print "MODULE SIDE EFFECT"\n')
+        self._write("main.gm", 'import "lib.gm" as math\nprint 1\n')
+        with self.assertRaisesRegex(
+            G.GamaError,
+            r"aliased import 'math'.*unsupported top-level statement 'print'",
+        ):
+            G.run_file(str(self.root / "main.gm"))
+
+    def test_alias_rejects_top_level_prove(self):
+        self._write("lib.gm", 'prove total = 2 + 2\n')
+        self._write("main.gm", 'import "lib.gm" as math\nprint 1\n')
+        with self.assertRaisesRegex(
+            G.GamaError,
+            r"aliased import 'math'.*unsupported top-level statement 'prove'",
+        ):
+            G.run_file(str(self.root / "main.gm"))
+
+    def test_alias_rejects_top_level_verify(self):
+        self._write("lib.gm", 'verify true\n')
+        self._write("main.gm", 'import "lib.gm" as math\nprint 1\n')
+        with self.assertRaisesRegex(
+            G.GamaError,
+            r"aliased import 'math'.*unsupported top-level statement 'verify'",
+        ):
+            G.run_file(str(self.root / "main.gm"))
 
     def test_alias_isolation_same_fn_name(self):
         self._write("one.gm", 'fn value() -> Int effects {} { return 1 }\n')
@@ -50,7 +82,6 @@ class NamespaceTests(unittest.TestCase):
     def test_missing_export_is_rejected(self):
         self._write(
             "lib.gm",
-            'let value = 5\n'
             'fn add(a: Int, b: Int) -> Int effects {} { return a + b }\n',
         )
         self._write("main.gm", 'import "lib.gm" as math\nprint math.nope()\n')
@@ -60,7 +91,13 @@ class NamespaceTests(unittest.TestCase):
     def test_top_level_let_not_exposed_under_alias(self):
         self._write("lib.gm", 'let value = 5\n')
         self._write("main.gm", 'import "lib.gm" as math\nprint math.value\n')
-        with self.assertRaises(G.GamaTypeError):
+        # A module-level `let` is no longer silently dropped: the alias now
+        # fails loudly, naming the alias, the statement kind and its position.
+        with self.assertRaisesRegex(
+            G.GamaError,
+            r"aliased import 'math'.*unsupported top-level statement 'let'.*"
+            r"line 1, col 1",
+        ):
             G.run_file(str(self.root / "main.gm"))
 
     def test_no_alias_keeps_flatten_behavior(self):
@@ -75,6 +112,26 @@ class NamespaceTests(unittest.TestCase):
         )
         it = G.run_file(str(self.root / "main.gm"))
         self.assertEqual(it.out, ["5", "41"])
+
+    def test_plain_import_allows_top_level_let(self):
+        self._write("lib.gm", 'let answer = 42\n')
+        self._write("main.gm", 'import "lib.gm"\nprint answer\n')
+        it = G.run_file(str(self.root / "main.gm"))
+        self.assertEqual(it.out, ["42"])
+
+    def test_alias_module_with_only_fn_and_import_works(self):
+        self._write("helper.gm", 'fn triple(x: Int) -> Int effects {} { return x * 3 }\n')
+        self._write(
+            "lib.gm",
+            'import "helper.gm"\n'
+            'fn add(a: Int, b: Int) -> Int effects {} { return a + b }\n',
+        )
+        self._write(
+            "main.gm",
+            'import "lib.gm" as math\nprint math.add(2,3)\nprint math.triple(3)\n',
+        )
+        it = G.run_file(str(self.root / "main.gm"))
+        self.assertEqual(it.out, ["5", "9"])
 
     def test_module_own_imports_and_sibling_calls(self):
         self._write("helper.gm", 'fn twice(x: Int) -> Int effects {} { return x * 2 }\n')

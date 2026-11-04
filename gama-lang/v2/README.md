@@ -66,8 +66,9 @@ Signature help works for known builtins, user `fn`/lambda-typed `let` values,
 and namespaced module functions.
 
 Tooling limitations: namespaced completion does not follow re-exported imports
-and never exposes a module's top-level `let` values (the core exposes only
-functions). Builtin parameter names are LSP-only labels, since the core has no
+and never exposes a module's top-level `let` values; the core rejects any
+non-`fn` top-level statement under an alias (`use` is allowed as a no-op).
+Builtin parameter names are LSP-only labels, since the core has no
 builtin parameter names. Diagnostics still use the in-memory `check(text)`
 path, so a document with an `import` reports the core's "import requires
 check_file/run_file" message even though the file would check/run fine on
@@ -111,7 +112,7 @@ python3 gamal2.py fmt --write file.gm  # write in place
 ## Implemented
 
 - `import "file.gm"` with cycle detection (relative to the importing file)
-- module namespaces: `import "lib.gm" as math`, then `math.add(2,3)`; plain imports still flatten
+- module namespaces: `import "lib.gm" as math`, then `math.add(2,3)`; plain imports still flatten (including top-level `let`); aliased modules expose only `fn` definitions and reject other top-level statements (`use` is allowed as a harmless no-op)
 - `let` with optional type annotation, `:=` assignment
 - `fn` and SPEC `make` with typed parameters, defaults, return type, `effects { ... }`
 - first-class functions and lambdas: `fn(x: Int) -> Int { ... }`, `let f = ...`, `f(41)`, passing functions as values, named functions as values after definition, IIFE `(fn...)(41)`, and recursive lambdas
@@ -164,7 +165,7 @@ Conformance: see `CONFORMANCE.md` (SPEC 2.0 T1–T10: **PASS 10/10**, including 
 ## Not implemented yet
 
 - deployed/public package registry (the HTTP server is implemented and testable)
-- full export lists/renamed exports; aliased modules expose `fn` definitions and ignore other top-level statements
+- full export lists/renamed exports; aliased modules reject non-`fn` top-level statements instead of exporting module state (`use` stays a no-op)
 - external intent/lease registry with expiry/revocation; IR/bytecode and expression-level step accounting
 - full type inference, records/enums/generics
 - full AST formatter (current `fmt` is token-based, preserves comments and

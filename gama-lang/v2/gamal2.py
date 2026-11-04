@@ -1194,6 +1194,29 @@ def _project_root(entry: pathlib.Path) -> pathlib.Path:
 
 _ALIAS_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# Aliased modules expose only `fn` definitions. Everything else at the top
+# level would be silently dropped by the bounded namespace MVP, which turns
+# module-level state into a confusing runtime error later on. Reject it up
+# front instead. `use` is allowed because it is a harmless no-op in both the
+# checker and the interpreter.
+_ALIAS_ALLOWED_TOPLEVEL = (Fn, Import, Use)
+_STMT_KIND = {Let: "let", Assign: "assignment", Print: "print",
+              Prove: "prove", Verify: "verify",
+              ExprStmt: "expression statement"}
+
+def _alias_toplevel_error(stmt, alias: str) -> GamaError:
+    kind = _STMT_KIND.get(type(stmt), type(stmt).__name__.lower())
+    return GamaError(
+        "aliased import %r: unsupported top-level statement %r "
+        "(only fn definitions, plain imports, and use are allowed)"
+        % (alias, kind),
+        getattr(stmt, "line", 0), getattr(stmt, "col", 0))
+
+def _check_alias_toplevel(stmts, alias: str) -> None:
+    for st in stmts:
+        if not isinstance(st, _ALIAS_ALLOWED_TOPLEVEL):
+            raise _alias_toplevel_error(st, alias)
+
 def _rename_refs(node, mapping):
     """Rename module-local function uses (calls and value refs) in the AST.
 
@@ -1284,6 +1307,7 @@ def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
             # be imported under two different aliases. `seen` is shared so
             # cycles are still detected.
             sub = _flatten(target, root, seen, set())
+            _check_alias_toplevel(sub, s.alias)
             sub_fns = [st for st in sub if isinstance(st, Fn)]
             mapping = {st.name: s.alias + "." + st.name for st in sub_fns}
             for st in sub_fns:
