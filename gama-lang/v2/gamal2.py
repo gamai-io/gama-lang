@@ -1206,6 +1206,8 @@ class Interpreter:
         self.env = Env(); self.funcs = {}; self.out = []; self.memory = {}
         self.proofs = {}; self.proof_chain = []; self.prev_proof = "GENESIS"; self.interactive = interactive
         self.last_ask = None
+        self.call_depth = 0
+        self.out_chars = 0
         self.proof_ledger_path = (os.environ.get("GAMA_L_PROOF_LEDGER") or "").strip() or None
         if self.proof_ledger_path:
             self._load_proof_ledger()
@@ -1265,6 +1267,25 @@ class Interpreter:
                         _fcntl.flock(fh.fileno(), _fcntl.LOCK_UN)
                     except OSError:
                         pass
+    @staticmethod
+    def _env_int(name, default):
+        raw = os.environ.get(name)
+        if raw is None or not raw.strip():
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            return default
+    def _emit(self, text):
+        """Append one rendered output line, enforcing the output char cap."""
+        text = str(text)
+        limit = self._env_int("GAMA_L_MAX_OUTPUT_CHARS", 1000000)
+        total = self.out_chars + len(text)
+        if total > limit:
+            raise GamaRuntimeError(
+                f"output limit exceeded: {total} chars > GAMA_L_MAX_OUTPUT_CHARS={limit}")
+        self.out.append(text)
+        self.out_chars = total
     def run(self, stmts):
         try:
             for s in stmts: self.stmt(s, self.env)
@@ -1322,8 +1343,8 @@ class Interpreter:
             env.set(s.name, rec); self.proofs[s.name] = rec
         elif isinstance(s, Verify):
             _v = self.verify(self.expr(s.expr, env))
-            env.set("_verify", _v); self.out.append(self.render(_v))
-        elif isinstance(s, Print): self.out.append(self.render(self.expr(s.expr, env)))
+            env.set("_verify", _v); self._emit(self.render(_v))
+        elif isinstance(s, Print): self._emit(self.render(self.expr(s.expr, env)))
         elif isinstance(s, ExprStmt): self.expr(s.expr, env)
     def truth(self, v): return bool(v)
     def render(self, v):
@@ -1369,23 +1390,32 @@ class Interpreter:
             errs.append("missing_signature")
         return {"ok": not errs, "expected": exp, "errors": errs}
     def invoke(self, fv, args, env, row, line, col):
-        required = sum(1 for p in fv.params if p.default is None)
-        if not (required <= len(args) <= len(fv.params)):
-            raise GamaRuntimeError(
-                f"{fv.name} expects {required}..{len(fv.params)} args, got {len(args)}",
-                line, col)
-        local = Env(fv.closure)
-        for i, p in enumerate(fv.params):
-            if i < len(args):
-                value = self.expr(args[i], env, row)
-            else:
-                value = self.expr(p.default, fv.closure)
-            local.set(p.name, value)
+        depth_limit = self._env_int("GAMA_L_MAX_CALL_DEPTH", 1000)
+        self.call_depth += 1
         try:
-            for s in fv.body: self.stmt(s, local)
-        except ReturnSignal as r: return r.value
-        except PropagateSignal as p: return ResultVal(False, p.value)
-        return None
+            if self.call_depth > depth_limit:
+                raise GamaRuntimeError(
+                    f"call depth limit exceeded: {self.call_depth} > GAMA_L_MAX_CALL_DEPTH={depth_limit}",
+                    line, col)
+            required = sum(1 for p in fv.params if p.default is None)
+            if not (required <= len(args) <= len(fv.params)):
+                raise GamaRuntimeError(
+                    f"{fv.name} expects {required}..{len(fv.params)} args, got {len(args)}",
+                    line, col)
+            local = Env(fv.closure)
+            for i, p in enumerate(fv.params):
+                if i < len(args):
+                    value = self.expr(args[i], env, row)
+                else:
+                    value = self.expr(p.default, fv.closure)
+                local.set(p.name, value)
+            try:
+                for s in fv.body: self.stmt(s, local)
+            except ReturnSignal as r: return r.value
+            except PropagateSignal as p: return ResultVal(False, p.value)
+            return None
+        finally:
+            self.call_depth -= 1
     def expr(self, e, env, row=None):
         if isinstance(e, Literal): return e.value
         if isinstance(e, Lambda):
