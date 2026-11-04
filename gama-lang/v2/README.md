@@ -112,6 +112,51 @@ python3 gamal2.py fmt --check file.gm  # rc 1 if unformatted
 python3 gamal2.py fmt --write file.gm  # write in place
 ```
 
+## Opt-in bytecode IR (CLI)
+
+The standalone bytecode IR prototype in `gama_ir.py` is exposed as an **opt-in**
+CLI path. The default `run` command keeps using the reference tree-walking
+interpreter; nothing about that backend changes.
+
+```bash
+python3 gamal2.py ir run FILE.gm        # compile on gama_ir and run on the IR VM
+python3 gamal2.py ir compile FILE.gm    # print the instruction listing
+python3 gamal2.py ir disasm FILE.gm     # alias for compile
+python3 gamal2.py ir compile --json FILE.gm
+```
+
+`ir run` parses and type-checks the file with the normal front end, compiles the
+checked AST with `gama_ir`, and prints the VM output. A construct outside the IR
+subset exits nonzero with `IRUnsupported: IR does not support ... (line, col)`;
+an IR runtime failure reports `IRRuntimeError`; parse/check/file errors keep
+their usual message. `compile`/`disasm` print one `index  OPCODE [arg]` line per
+instruction (or `{"file": ..., "instructions": [...]}` with `--json`). This is
+also reachable as `gama-l ir ...` through the packaged console script.
+
+Exact supported subset:
+
+- Statements: `let`/`:=`, `print`, `if`/`else` (incl. `else if` chains),
+  `while`, `for` over list/text, `break`, `continue`, `match` on `Ok`/`Err`,
+  named `fn` definitions, `return` (inside functions), expression statements,
+  and `use` as a no-op.
+- Expressions: `Int`/`Decimal`/`Text`/`Bool`/`null`, list `[a, b]` and map
+  `{k: v}` literals, variables, `!`/`-`, `+ - * / %`, `== != < <= > >=`,
+  short-circuit `&&`/`||`, indexing `base[i]` (list/text, reference `int`
+  coercion, negative indices), and calls to named user-defined functions
+  (recursion and default parameters included).
+- Builtins: `len`, `text`, `number`, `round`, `Ok`, `Err` only.
+
+Not supported (raises `IRUnsupported`; the normal interpreter still supports
+them): `prove`/`verify`, `import`, field access `a.b`, namespaced/dotted calls,
+pipes, `try`/`expr?`, lambdas and first-class/expression callees, structural
+matching beyond the `Ok`/`Err` arms, and all other builtins (`sql`, `ask`,
+`split`, `unwrap`, `wait_user`, mail, remember/recall, ...). The IR also does
+not enforce `GAMA_L_MAX_STEPS`/`GAMA_L_LOOP_LIMIT` (it does honour
+`GAMA_L_MAX_CALL_DEPTH`); it is a prototype, not a hardened runtime. Map
+literals are JSON values, so text-keyed maps are not indexable. Successful
+programs produce byte-for-byte the same output as the interpreter, and runtime
+error messages keep the interpreter's text and line/col.
+
 ## Implemented
 
 - `import "file.gm"` with cycle detection (relative to the importing file)
@@ -141,14 +186,14 @@ python3 gamal2.py fmt --write file.gm  # write in place
 - runtime limits via `GAMA_L_MAX_CALL_DEPTH` (default 200; the effective cap is additionally clamped to `(sys.getrecursionlimit() - 100) // 4`, so an explicit higher value cannot exhaust the CPython stack — deep recursion raises `GamaError`, never `RecursionError`) and `GAMA_L_MAX_OUTPUT_CHARS` (default 1000000)
 - optional global step limit via `GAMA_L_MAX_STEPS` (unset, blank, malformed, or negative = disabled): counts every executed statement dispatch (including nested block and function-body statements) plus one tick per `for`/`while` body iteration; expression evaluation and the function call itself are not counted separately. On exceed raises `GamaRuntimeError` with the count, the limit, and the source line/col. `GAMA_L_LOOP_LIMIT` (default 1000000) still bounds `while` iterations independently; a present but blank or non-integer value raises `GamaRuntimeError` instead of leaking `ValueError`
 - optional expression step limit via `GAMA_L_MAX_EXPR_STEPS` (unset, blank, malformed, or negative = disabled): counts every `Interpreter.expr` evaluation; nested calls count individually (e.g. `1 + 2` is three steps: the `Binary` plus both `Literal`s). On exceed raises `GamaRuntimeError` with the count, the limit, and the source line/col. It is independent of `GAMA_L_MAX_STEPS`, call depth, output, and loop limits, and remains counted when the cap is disabled
-- standalone bytecode IR prototype (`gama_ir.py`) for a documented subset: statements/expressions, `if`/`else if`, `while`, `for`, list/map literals and indexing, `break`/`continue`, `fn`, `Ok`/`Err` + `match`, and the core builtins `len`/`text`/`number`/`round`; not integrated into the interpreter/CLI
+- standalone bytecode IR prototype (`gama_ir.py`) for a documented subset: statements/expressions, `if`/`else if`, `while`, `for`, list/map literals and indexing, `break`/`continue`, `fn`, `Ok`/`Err` + `match`, and the core builtins `len`/`text`/`number`/`round`; opt-in via `gamal2 ir run|compile` (see above), the interpreter and default `run` backend are unchanged
 - static type errors and static effect violations
-- CLI `run`, `check`, `fmt`, `test`, `pkg`, `lsp`
+- CLI `run`, `check`, `fmt`, `test`, `pkg`, `lsp`, `ir`
 
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 1027/1027
+python3 -m unittest discover -s tests -v   # 1035/1035
 python3 gamal2.py doctor --json                # 8/8 checks
 ```
 

@@ -2432,6 +2432,61 @@ def pkg_main(argv: list[str]) -> int:
         return 0
     print("usage: gamal2.py pkg init|install|update|list|search|resolve|add ..."); return 2
 
+# ------------------------------------------------------------------ IR CLI
+def ir_main(argv):
+    """Opt-in entry point for the standalone bytecode IR prototype.
+
+    ``gamal2 ir run FILE.gm`` compiles the checked AST with :mod:`gama_ir` and
+    executes it on the IR VM; ``gamal2 ir compile FILE.gm`` (alias ``disasm``)
+    prints the listing.  The default ``run`` backend is untouched.
+    """
+    # ``gama_ir`` imports ``gamal2`` for its AST classes.  When this file is
+    # executed as a script the module lives under ``__main__``, so alias it
+    # first: otherwise ``gama_ir`` would load a second copy and ``isinstance``
+    # checks against its AST nodes would fail.
+    if __name__ != "gamal2" and "gamal2" not in sys.modules:
+        sys.modules["gamal2"] = sys.modules[__name__]
+    import gama_ir
+
+    ap = argparse.ArgumentParser(prog="gamal2 ir")
+    ap.add_argument("action", choices=["run", "compile", "disasm"])
+    ap.add_argument("file")
+    ap.add_argument("--json", action="store_true",
+                    help="compile/disasm: emit the listing as JSON")
+    a = ap.parse_args(argv)
+    try:
+        ast = check_file(a.file)
+        program = gama_ir.compile_program(ast)
+        if a.action in ("compile", "disasm"):
+            if a.json:
+                listing = [
+                    {"index": i, "op": ins.op,
+                     "arg": None if ins.arg is None else repr(ins.arg)}
+                    for i, ins in enumerate(program.main.instrs)
+                ]
+                print(json.dumps({"file": a.file, "instructions": listing}))
+            else:
+                print(program.disassemble())
+            return 0
+        result = gama_ir.run_program(program)
+        for line in result.out:
+            print(line)
+        return 0
+    except gama_ir.IRUnsupported as e:
+        print(f"IRUnsupported: {e}", file=sys.stderr)
+        return 1
+    except gama_ir.IRRuntimeError as e:
+        print(f"IRRuntimeError: {e}", file=sys.stderr)
+        return 1
+    except gama_ir.IRError as e:
+        print(f"IRError: {e}", file=sys.stderr)
+        return 1
+    except (GamaError, OSError, TypeError, IndexError, ZeroDivisionError,
+            ValueError) as e:
+        print(f"{type(e).__name__}: {e}", file=sys.stderr)
+        return 1
+
+
 # ------------------------------------------------------------------ CLI
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -2443,6 +2498,8 @@ def main(argv=None):
         return gama_lsp.main() or 0
     if argv and argv[0] == "pkg":
         return pkg_main(argv[1:])
+    if argv and argv[0] == "ir":
+        return ir_main(argv[1:])
     ap = argparse.ArgumentParser(prog="gamal2")
     ap.add_argument("cmd", choices=["run", "check", "fmt", "test", "lsp", "doctor"], nargs="?", default="run")
     ap.add_argument("file", nargs="?")

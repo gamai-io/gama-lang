@@ -50,8 +50,10 @@ These are outside the T1–T10 checks or only partially covered; see
    still roadmap. The ledger is append-only with no compaction or key rotation.
 2. **Real namespaced modules/exports.** `use` is currently a no-op; only
    `import "file.gm"` is implemented.
-3. **Compiler pipeline / IR / bytecode and runtime limits.** The runtime is a
-   tree-walking interpreter; there is no IR stage or production resource budget.
+3. **Compiler pipeline / IR / bytecode and runtime limits.** The default runtime
+   is a tree-walking interpreter. An opt-in standalone bytecode IR prototype
+   (`gama_ir.py`, `gamal2 ir run|compile`) covers a documented subset but is not
+   the production path and has no production resource budget.
 4. **Full type system.** No full inference; records/enums/generics are missing.
 5. **Full AST formatter.** `fmt` is token-based; it preserves comments and
    strings but does not reflow multi-line strings (T10 still passes on
