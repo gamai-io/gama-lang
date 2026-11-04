@@ -202,15 +202,22 @@ class AliasEnumTests(unittest.TestCase):
         expected = G.run_file(str(self.main)).out
         self.assertEqual(IR.run_file(str(self.main)).out, expected)
 
-    def test_ir_rejects_alias_payload_enums_instead_of_miscompiling(self):
-        self._write('lib.gm', 'enum Option { Some(Int), None }\n')
+    def test_ir_runs_alias_payload_enums_like_interpreter(self):
+        self._write('lib.gm', 'enum Option { Some(Int, Text), None }\n')
         self._write(
             'main.gm',
             'import "lib.gm" as geo\n'
-            'print geo.Option.Some(1)\n',
+            'let o: geo.Option = geo.Option.Some(1, "a")\n'
+            'print o\n'
+            'match o {\n'
+            '  geo.Option.Some(v, s) => { print v\n print s },\n'
+            '  geo.Option.None => { print "none" }\n'
+            '}\n',
         )
-        with self.assertRaisesRegex(IR.IRUnsupported, "enum payload variants"):
-            IR.run_file(str(self.main))
+        expected = G.run_file(str(self.main)).out
+        self.assertEqual(IR.run_file(str(self.main)).out, expected)
+        self.assertEqual(
+            expected, ['geo.Option.Some(1, "a")', '1', 'a'])
 
 
 if __name__ == "__main__":

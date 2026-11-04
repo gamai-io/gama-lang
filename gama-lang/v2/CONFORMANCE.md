@@ -62,9 +62,9 @@ These are outside the T1–T10 checks or only partially covered; see
    exposed via the opt-in `gamal2 ir run|compile` CLI, but it is not the
    production run path. File entry points (`gama_ir.compile_file`/`run_file`)
    flatten plain and aliased imports through the core loader; aliased functions,
-   constants, records and enums (dotted names) are supported. Nullary enums
-   compile; enum payload declarations are rejected explicitly by the IR
-   (`IRUnsupported`) rather than silently miscompiled.
+   constants, records and enums (dotted names) are supported. Nullary and
+   payload enums compile, including constructors and payload-binding match
+   arms, locally and through aliases.
    Runtime limits are enforced (call depth, output, statement/expression steps,
    loop limit); there is no production resource budget or cost model.
 4. **Full type system.** No full inference. Nominal records with typed fields,

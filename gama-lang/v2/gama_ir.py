@@ -12,9 +12,10 @@ Supported statements
 --------------------
 ``let`` / ``:=`` (assign), ``print``, ``if``/``else`` (including ``else if``
 chains), ``while``, ``for`` (list/text iteration), ``break``, ``continue``,
-``match`` on ``Ok``/``Err`` results and nullary enum variants, ``record`` and
-``enum`` declarations, ``fn`` (named function definitions), ``return`` (inside
-functions only), and expression statements.
+``match`` on ``Ok``/``Err`` results and enum variants (nullary, one-payload and
+multi-payload patterns), ``record`` and ``enum`` declarations (including payload
+variants), ``fn`` (named function definitions), ``return`` (inside functions
+only), and expression statements.
 
 Supported expressions
 ---------------------
@@ -22,7 +23,8 @@ Literals: ``Int``, ``Decimal``, ``Text``, ``Bool``, ``null``, list literals
 ``[a, b]`` and map literals ``{k: v}``.
 Record construction (positional ``Point(1, 2)`` and named
 ``Point { x: 1, y: 2 }``), field access ``p.x`` (walking record fields and map
-keys), enum variants ``Color.Red``, unary ``!``/``-``; binary ``+ - * / %``,
+keys), enum variants ``Color.Red`` and payload constructors ``Some(5)`` /
+``Option.Some(5)`` (bare when unambiguous), unary ``!``/``-``; binary ``+ - * / %``,
 comparisons ``== != < <= > >=`` and short-circuit ``&&``/``||``; indexing
 ``base[i]`` (list/text, with the reference interpreter's ``int`` coercion and
 Python-style negative indices); calls to *named, user-defined* functions
@@ -34,8 +36,8 @@ enclosing function); and the core builtins ``len``, ``text``, ``number``,
 
 Records and enums follow the reference runtime exactly: record values are
 nominal (type name plus declaration-ordered fields, value-based equality),
-enums are nullary ``Enum.Variant`` values, and both reuse the reference value
-classes for rendering.  Declarations are registered before the program runs
+enum values are ``Enum.Variant`` (nullary) or ``Enum.Variant(payload, ...)``,
+and both reuse the reference value classes for rendering.  Declarations are registered before the program runs
 (so functions may refer to records/enums declared later) and nested record
 declarations take effect when execution reaches them, mirroring
 ``gamal2.Interpreter``.
@@ -66,14 +68,17 @@ Limitations (raise ``IRUnsupported`` / documented runtime errors)
 * Record copy/`with` updates (``p with { x = 3 }``) and in-place field
   assignment are interpreter-only; the compiler rejects them with
   :class:`IRUnsupported` instead of silently dropping updates.
-* Enum *payload* variants are rejected instead of being miscompiled: a
-  declaration such as ``enum Option { Some(Int), None }`` raises
-  ``IRUnsupported`` ("enum payload variants"), local or imported. Nullary
-  enums work, including aliased imports: the core loader namespaces
-  declarations and references (``geo.Color`` / ``geo.Color.Red``) and this
-  backend resolves the longest dotted enum prefix. Named record construction
-  with a dotted type name (``geo.Point { ... }``) is not accepted by the
-  parser; positional construction ``geo.Point(1, 2)`` works.
+* Enum payload variants are supported for declarations, constructors and
+  ``match`` bindings, including aliased imports: the core loader namespaces
+  declarations and references (``geo.Color`` / ``geo.Color.Red`` /
+  ``geo.Option.Some``) and this backend resolves the longest dotted enum
+  prefix.  Constructors are ``Some(5)`` (bare when unique), ``Option.Some(5)``
+  and namespaced forms; match arms bind every payload (``Some(v)``,
+  ``Pair(a, b)``, ``geo.Option.Some(v, s)``).  A payload variant used as a bare
+  value and a nullary variant called with ``()`` raise the reference runtime's
+  messages.  Named record construction with a dotted type name
+  (``geo.Point { ... }``) is not accepted by the parser; positional
+  construction ``geo.Point(1, 2)`` works.
 * Pipes and first-class function values (including reading a namespaced
   function as a value) are unsupported.
 * ``?`` is accepted only inside a named function whose declared return type is
@@ -86,9 +91,10 @@ Limitations (raise ``IRUnsupported`` / documented runtime errors)
 * Builtins other than ``len``, ``text``, ``number``, ``round``, ``Ok``/``Err``
   (``sql``, ``ask``, ``upper``, result/text/collection helpers, ``mail``,
   ``remember``/``recall``, ``wait_user``, ...).
-* ``match`` is supported only for ``Ok``/``Err`` results and nullary enum
-  variants; there is no structural pattern matching beyond those arms (records
-  cannot be destructured).
+* ``match`` is supported for ``Ok``/``Err`` results and enum variants
+  (nullary, one-payload and multi-payload, bare or qualified).  There is no
+  structural pattern matching beyond those arms (records cannot be
+  destructured).
 * Map literals are JSON values: dotted field access (``m.k``) follows the
   reference fallback (it also works on maps), and ``m[0]`` uses the reference
   ``int`` coercion, so text-keyed maps are not indexable in either runtime.
@@ -192,7 +198,11 @@ class Program:
     # name to its ordered field names and an enum name to its variant set; the
     # VM seeds its registries from these before running ``main``.
     records: dict[str, tuple[str, ...]] = field(default_factory=dict)
-    enums: dict[str, frozenset[str]] = field(default_factory=dict)
+    # ``enum -> (frozenset of variant names | variant -> payload type tuple)``.
+    # A payload-free enum keeps the historical ``frozenset`` shape; an enum
+    # with at least one payload stores ``{variant: (type, ...)}`` (nullary
+    # variants map to ``()``).  Helpers below normalise both forms.
+    enums: dict[str, Any] = field(default_factory=dict)
 
     def disassemble(self) -> str:
         """Return a readable listing of the main instruction stream."""
@@ -325,19 +335,123 @@ def _result_matches(kind: str, value: Any) -> bool:
     return False
 
 
-def _match_kind(kind: str, value: Any) -> bool:
+_MISSING = object()
+
+
+class _AmbiguousVariant(Exception):
+    """A bare variant name is declared by more than one enum."""
+
+    def __init__(self, name: str):
+        super().__init__(name)
+        self.name = name
+
+
+def _payload_types(payload: Any) -> tuple[str, ...]:
+    """Normalise a declared payload spec to a tuple of type names.
+
+    ``None`` is a nullary variant, a plain string is one payload, and a tuple
+    is already the multi-payload form (mirrors ``gamal2._payload_type_list``).
+    """
+    if payload is None:
+        return ()
+    if isinstance(payload, tuple):
+        return payload
+    return (payload,)
+
+
+def _enum_spec(variants: list) -> Any:
+    """Build the ``Program.enums`` entry for one ``EnumDecl``.
+
+    Payload-free enums keep the historical ``frozenset`` so existing code and
+    tests that compare variants as a set keep working.  As soon as one variant
+    carries a payload, the entry becomes ``{variant: (type, ...)}`` so arity (and
+    the nullary/one/multi distinction) survives into the VM.
+    """
+    specs: dict[str, tuple[str, ...]] = {}
+    has_payload = False
+    for entry in variants:
+        name = entry[0]
+        payload = entry[1] if len(entry) > 1 else None
+        types = _payload_types(payload)
+        specs[name] = types
+        if types:
+            has_payload = True
+    return specs if has_payload else frozenset(specs)
+
+
+def _variant_payloads(spec: Any, variant: str) -> Any:
+    """Payload tuple for ``variant`` in one enum spec, or ``_MISSING``.
+
+    A nullary variant returns ``()`` (an empty tuple); an unknown variant
+    returns the sentinel so callers can tell "absent" from "no payload".
+    """
+    if isinstance(spec, dict):
+        return spec[variant] if variant in spec else _MISSING
+    return () if variant in spec else _MISSING
+
+
+def _resolve_enum_variant(enums: dict, name: str):
+    """Resolve ``Enum.Variant`` / a bare ``Variant`` against ``enums``.
+
+    Accepts qualified names with a namespaced enum (``geo.Color.Red``) and a
+    bare variant that must be unique across all enums.  Returns
+    ``(enum, variant, payload_types)`` or ``None``; raises
+    :class:`_AmbiguousVariant` when a bare name belongs to several enums.
+    """
+    if "." in name:
+        base, _, variant = name.rpartition(".")
+        spec = enums.get(base)
+        if spec is None:
+            return None
+        payloads = _variant_payloads(spec, variant)
+        if payloads is _MISSING:
+            return None
+        return base, variant, payloads
+    hits = []
+    for base, spec in enums.items():
+        payloads = _variant_payloads(spec, name)
+        if payloads is not _MISSING:
+            hits.append((base, name, payloads))
+    if not hits:
+        return None
+    if len(hits) > 1:
+        raise _AmbiguousVariant(name)
+    return hits[0]
+
+
+def _binding_names(bindings: Any) -> list[str]:
+    """Normalise a match arm binding spec to a list of names.
+
+    ``None`` means no binding, a string is one binding (the parser preserves
+    that form), and a list/tuple is already multi-binding.
+    """
+    if bindings is None:
+        return []
+    if isinstance(bindings, str):
+        return [bindings]
+    return list(bindings)
+
+
+def _match_kind(kind: str, value: Any, enums: dict) -> bool:
     """Whether ``value`` matches one ``match`` arm label.
 
     Mirrors ``gamal2.Interpreter.stmt``: ``Ok``/``Err`` match results and
-    ``Enum.Variant`` matches nullary enum values.  Anything else (including a
-    record) never matches an arm.
+    enum labels resolve through the same enum table as constructors, so bare
+    variants, qualified variants and namespaced enums all behave alike.  An
+    ambiguous bare variant simply does not match (the checker rejects it
+    first); anything else (including a record) never matches an arm.
     """
     if kind in ("Ok", "Err"):
         return _result_matches(kind, value)
     if isinstance(value, g2.EnumVal):
-        # Compare the full label so a namespaced enum (``geo.Color.Red``) also
-        # matches without assuming the enum name contains no dots.
-        return kind == f"{value.enum}.{value.variant}"
+        try:
+            resolved = _resolve_enum_variant(enums, kind)
+        except _AmbiguousVariant:
+            return False
+        if resolved is None:
+            return False
+        base, variant, _payloads = resolved
+        return value.enum == base and value.variant == variant
     return False
 
 
@@ -414,7 +528,7 @@ class _Compiler:
         # ``Call`` is a positional record constructor.  Dotted names and
         # ``RecordLit`` are resolved dynamically at run time.
         self.records: dict[str, tuple[str, ...]] = records if records is not None else {}
-        self.enums: dict[str, frozenset[str]] = enums if enums is not None else {}
+        self.enums: dict[str, Any] = enums if enums is not None else {}
 
     # -- emission helpers ------------------------------------------------
     def emit(self, op: str, arg: Any = None) -> int:
@@ -455,11 +569,9 @@ class _Compiler:
             self.emit("DEF_RECORD", (stmt.name, fields))
             return
         if isinstance(stmt, g2.EnumDecl):
-            if any(v[1] is not None for v in stmt.variants):
-                _unsupported(stmt, "enum payload variants")
-            variants = tuple(v[0] for v in stmt.variants)
-            self.enums[stmt.name] = frozenset(variants)
-            self.emit("DEF_ENUM", (stmt.name, variants))
+            spec = _enum_spec(stmt.variants)
+            self.enums[stmt.name] = spec
+            self.emit("DEF_ENUM", (stmt.name, spec))
             return
         if isinstance(stmt, g2.Print):
             self.compile_expr(stmt.expr)
@@ -596,7 +708,8 @@ class _Compiler:
         self.emit("LET", hidden)
 
         end_jumps: list[int] = []
-        for kind, var, body in stmt.arms:
+        for kind, bindings, body in stmt.arms:
+            names = _binding_names(bindings)
             next_arm = None
             if kind != "_":
                 self.emit("LOAD", hidden)
@@ -604,10 +717,14 @@ class _Compiler:
 
             self.emit("NEW_FRAME")
             self.frame_depth = match_base + 2
-            if var:
+            if names:
                 self.emit("LOAD", hidden)
-                self.emit("GET_RESULT_VALUE")
-                self.emit("LET", var)
+                if kind in ("Ok", "Err"):
+                    self.emit("MATCH_BIND_RESULT",
+                              (kind, names, stmt.line, stmt.col))
+                elif kind != "_":
+                    self.emit("MATCH_BIND_ENUM",
+                              (names, stmt.line, stmt.col))
             self.compile_statements(body)
 
             self.emit("POP_FRAME")  # arm frame
@@ -800,6 +917,16 @@ class _CallTarget:
         self.closure = closure
 
 
+class _EnumCtorTarget:
+    """A resolved enum constructor awaiting its already-evaluated arguments."""
+
+    __slots__ = ("enum", "variant")
+
+    def __init__(self, enum: str, variant: str):
+        self.enum = enum
+        self.variant = variant
+
+
 class _VM:
     def __init__(self, initial: Any = None, records=None, enums=None):
         if initial is None:
@@ -817,7 +944,7 @@ class _VM:
         # Nominal type registries.  Copies so a reused ``Program`` is unaffected
         # by declarations that activate only at run time.
         self.records: dict[str, tuple[str, ...]] = dict(records or {})
-        self.enums: dict[str, frozenset[str]] = dict(enums or {})
+        self.enums: dict[str, Any] = dict(enums or {})
 
     # -- call handling ---------------------------------------------------
     def _invoke(self, proto: FunctionProto, closure: Frame, args: list) -> Any:
@@ -853,7 +980,9 @@ class _VM:
 
         The longest dot-separated prefix that names a declared enum wins, so
         ``geo.Color.Red`` resolves when the enum table stores ``geo.Color``.
-        Returns ``None`` when no prefix names an enum (field access et al.).
+        A payload variant used as a bare value is rejected with the reference
+        runtime's message instead of producing a payload-less value.  Returns
+        ``None`` when no prefix names an enum (field access et al.).
         """
         parts = name.split(".")
         for i in range(len(parts) - 1, 0, -1):
@@ -861,8 +990,13 @@ class _VM:
             if enum_name not in self.enums:
                 continue
             variant = ".".join(parts[i:])
-            if variant not in self.enums[enum_name]:
+            payloads = _variant_payloads(self.enums[enum_name], variant)
+            if payloads is _MISSING:
                 raise IRRuntimeError(f"unknown enum variant {name}", line, col)
+            if payloads:
+                raise IRRuntimeError(
+                    f"enum variant {enum_name}.{variant} requires a payload "
+                    f"argument; write {enum_name}.{variant}(...)", line, col)
             return g2.EnumVal(enum_name, variant)
         return None
 
@@ -909,8 +1043,8 @@ class _VM:
     def _define_record(self, name: str, fields: tuple[str, ...]) -> None:
         self.records[name] = tuple(fields)
 
-    def _define_enum(self, name: str, variants) -> None:
-        self.enums[name] = frozenset(variants)
+    def _define_enum(self, name: str, spec) -> None:
+        self.enums[name] = spec
 
     def _check_record(self, arg) -> None:
         name, argc, line, col = arg
@@ -1060,10 +1194,33 @@ class _VM:
                     raise IRRuntimeError("match expects Result", line, col)
             elif op == "GET_RESULT_VALUE":
                 stack.append(stack.pop().value)
+            elif op == "MATCH_BIND_RESULT":
+                kind, names, line, col = arg
+                value = stack.pop()
+                if len(names) != 1:
+                    raise IRRuntimeError(
+                        f"match: {kind} pattern binds exactly one value",
+                        line, col)
+                frames[-1].define(names[0], value.value)
+            elif op == "MATCH_BIND_ENUM":
+                names, line, col = arg
+                value = stack.pop()
+                if value.payloads is None:
+                    raise IRRuntimeError(
+                        f"enum variant {value.enum}.{value.variant} is "
+                        f"nullary and cannot bind a payload", line, col)
+                if len(names) != len(value.payloads):
+                    raise IRRuntimeError(
+                        f"enum variant {value.enum}.{value.variant} expects "
+                        f"{len(value.payloads)} payload binding"
+                        f"{'s' if len(value.payloads) != 1 else ''}, "
+                        f"got {len(names)}", line, col)
+                for name, item in zip(names, value.payloads):
+                    frames[-1].define(name, item)
             elif op == "MATCH_JUMP_UNLESS":
                 kind, target = arg
                 value = stack.pop()
-                if not _match_kind(kind, value):
+                if not _match_kind(kind, value, self.enums):
                     ip = target
             elif op == "MATCH_FAIL":
                 line, col = arg
@@ -1090,22 +1247,54 @@ class _VM:
             elif op == "CHECK_CALL":
                 name, argc, line, col = arg
                 entry = self.functions.get(name)
-                if entry is None:
-                    raise IRRuntimeError(f"unknown function {name}", line, col)
-                proto, closure = entry
-                required = sum(1 for p in proto.params if p.default is None)
-                if not (required <= argc <= len(proto.params)):
-                    raise IRRuntimeError(
-                        f"{name} expects {required}..{len(proto.params)} args, got {argc}",
-                        line, col)
-                stack.append(_CallTarget(proto, closure))
+                if entry is not None:
+                    proto, closure = entry
+                    required = sum(1 for p in proto.params if p.default is None)
+                    if not (required <= argc <= len(proto.params)):
+                        raise IRRuntimeError(
+                            f"{name} expects {required}..{len(proto.params)} args, got {argc}",
+                            line, col)
+                    stack.append(_CallTarget(proto, closure))
+                else:
+                    # Functions first, then enum constructors: the reference
+                    # interpreter resolves ``Call`` through ``self.funcs`` before
+                    # ``find_enum_variant``, so a user function shadows a variant
+                    # with the same name.  Arity/kind failures happen here,
+                    # before arguments are evaluated, exactly like the
+                    # interpreter (which checks before ``self.expr``).
+                    try:
+                        ctor = _resolve_enum_variant(self.enums, name)
+                    except _AmbiguousVariant:
+                        raise IRRuntimeError(
+                            f"ambiguous enum constructor {name}; write "
+                            f"Enum.{name}", line, col) from None
+                    if ctor is None:
+                        raise IRRuntimeError(
+                            f"unknown function {name}", line, col)
+                    base, variant, payloads = ctor
+                    if not payloads:
+                        raise IRRuntimeError(
+                            f"enum variant {base}.{variant} is nullary; write "
+                            f"{base}.{variant} without parentheses", line, col)
+                    if argc != len(payloads):
+                        raise IRRuntimeError(
+                            f"enum variant {base}.{variant} expects "
+                            f"{len(payloads)} payload argument"
+                            f"{'s' if len(payloads) != 1 else ''}, "
+                            f"got {argc}", line, col)
+                    stack.append(_EnumCtorTarget(base, variant))
             elif op == "CALL":
                 argc = arg
                 args = stack[-argc:] if argc else []
                 if argc:
                     del stack[-argc:]
                 target = stack.pop()
-                stack.append(self._invoke(target.proto, target.closure, args))
+                if isinstance(target, _EnumCtorTarget):
+                    stack.append(g2.EnumVal(
+                        target.enum, target.variant, payloads=tuple(args)))
+                else:
+                    stack.append(self._invoke(
+                        target.proto, target.closure, args))
             elif op == "DEF":
                 self.functions[arg.name] = (arg, frames[-1])
             elif op == "DEF_RECORD":
@@ -1135,12 +1324,12 @@ def _top_level_decls(stmts: list) -> tuple[dict, dict]:
     ``DEF_ENUM`` when execution reaches them.
     """
     records: dict[str, tuple[str, ...]] = {}
-    enums: dict[str, frozenset[str]] = {}
+    enums: dict[str, Any] = {}
     for stmt in stmts:
         if isinstance(stmt, g2.RecordDecl):
             records[stmt.name] = tuple(fn for fn, _ft in stmt.fields)
         elif isinstance(stmt, g2.EnumDecl):
-            enums[stmt.name] = frozenset(v[0] for v in stmt.variants)
+            enums[stmt.name] = _enum_spec(stmt.variants)
     return records, enums
 
 
@@ -1179,11 +1368,11 @@ def compile_file(path: Any) -> Program:
     Plain ``import "lib.gm"`` therefore works in the IR backend.  Aliased
     imports (``import "lib.gm" as m``) also flatten: the loader exposes module
     functions, constants, records and enums as dotted names (``m.fn``,
-    ``m.pi``, ``geo.Point``, ``geo.Color``), and this backend resolves them
-    through the same tables it uses for local declarations.  Nullary aliased
-    enums compile; enum *payload* declarations are rejected explicitly by the
-    compiler instead of being silently miscompiled.
-    """
+  ``m.pi``, ``geo.Point``, ``geo.Color``, ``geo.Option.Some``), and this
+  backend resolves them through the same tables it uses for local
+  declarations.  Nullary and payload enum declarations (constructors and
+  match bindings) compile through the same path.
+  """
     return compile_program(g2.check_file(str(path)))
 
 
