@@ -21,8 +21,9 @@ Guarantees exercised here:
 The generator is deterministic: 140 valid programs, 45 structural deletions and
 45 duplicated closers (230 cases), plus targeted import/limit/proof matrices.
 
-Confirmed core leaks found by this round are pinned with ``expectedFailure``
-regression tests at the bottom of the file instead of being hidden.
+The core leaks found by this round were fixed and the former
+``expectedFailure`` pins are now plain regression tests at the bottom of the
+file, so they fail loudly if any leak returns.
 """
 import os
 import pathlib
@@ -672,20 +673,23 @@ def _has_int_str_limit():
 
 
 class KnownCoreLeakRegressionTests(unittest.TestCase):
-    """Confirmed round-2 leaks, pinned as expected failures.
+    """Regression tests for the round-2 core leaks.
 
     Each test asserts the contract: a bad value must surface as ``GamaError``.
-    While the core leaks a bare Python exception the test is an expected
-    failure.  When the core is fixed these become unexpected successes and must
-    be flipped into plain regression tests.
+    The leaks are fixed, so these run as plain regression tests; a regression
+    fails here instead of crashing with a bare Python exception.
     """
 
-    @unittest.expectedFailure
+    def test_number_non_finite_should_raise_gama_error(self):
+        for text in ("NaN", "Infinity", "-Infinity", "sNaN"):
+            with self.subTest(text=text):
+                with self.assertRaises(G.GamaError):
+                    G.run('print number("%s")\n' % text)
+
     def test_abs_nan_should_raise_gama_error(self):
         with self.assertRaises(G.GamaError):
             G.run('print abs(number("NaN"))\n')
 
-    @unittest.expectedFailure
     def test_floor_ceil_nan_should_raise_gama_error(self):
         for src in ('print floor(number("NaN"))\n',
                     'print ceil(number("NaN"))\n'):
@@ -693,7 +697,6 @@ class KnownCoreLeakRegressionTests(unittest.TestCase):
                 with self.assertRaises(G.GamaError):
                     G.run(src)
 
-    @unittest.expectedFailure
     def test_min_max_nan_should_raise_gama_error(self):
         for src in ('print min(number("NaN"), 1)\n',
                     'print max(number("NaN"), 1)\n'):
@@ -701,12 +704,10 @@ class KnownCoreLeakRegressionTests(unittest.TestCase):
                 with self.assertRaises(G.GamaError):
                     G.run(src)
 
-    @unittest.expectedFailure
     def test_sort_nan_list_should_raise_gama_error(self):
         with self.assertRaises(G.GamaError):
             G.run('print sort([number("NaN"), 1])\n')
 
-    @unittest.expectedFailure
     def test_malformed_loop_limit_should_raise_gama_error(self):
         for value in ("", "abc"):
             with self.subTest(value=value):
@@ -718,7 +719,6 @@ class KnownCoreLeakRegressionTests(unittest.TestCase):
 
     @unittest.skipUnless(_has_int_str_limit(),
                          "requires the Python 3.11+ int string digit limit")
-    @unittest.expectedFailure
     def test_to_int_oversized_digits_should_raise_gama_error(self):
         src = 'print to_int("%s")\n' % ("9" * 5000)
         with self.assertRaises(G.GamaError):
@@ -726,7 +726,6 @@ class KnownCoreLeakRegressionTests(unittest.TestCase):
 
     @unittest.skipUnless(_has_int_str_limit(),
                          "requires the Python 3.11+ int string digit limit")
-    @unittest.expectedFailure
     def test_big_integer_literal_parse_should_raise_gama_error(self):
         src = "print %s\n" % ("9" * 5000)
         with self.assertRaises(G.GamaError):
@@ -734,7 +733,6 @@ class KnownCoreLeakRegressionTests(unittest.TestCase):
 
     @unittest.skipUnless(_has_int_str_limit(),
                          "requires the Python 3.11+ int string digit limit")
-    @unittest.expectedFailure
     def test_big_integer_print_should_raise_gama_error(self):
         src = "print %s + 1\n" % ("9" * 4300)
         with self.assertRaises(G.GamaError):
@@ -742,10 +740,10 @@ class KnownCoreLeakRegressionTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.getrecursionlimit() <= 1000,
                          "default Python recursion budget is larger here")
-    @unittest.expectedFailure
     def test_default_call_depth_recursion_should_raise_gama_error(self):
-        # GAMA_L_MAX_CALL_DEPTH defaults to 1000, which is above the CPython
-        # stack budget, so the call-depth guard is never reached.
+        # An explicit high GAMA_L_MAX_CALL_DEPTH must still be clamped to the
+        # safe cap derived from the CPython recursion budget, so the guard
+        # fires instead of hitting RecursionError.
         src = ("fn down(n: Int) -> Int {\n"
                "  if (n <= 0) { return 0 }\n"
                "  return down(n - 1)\n}\n"

@@ -49,6 +49,22 @@ class GamaTypeError(GamaError): pass
 class GamaEffectError(GamaError): pass
 class GamaRuntimeError(GamaError): pass
 
+# ------------------------------------------------------------------ call depth
+# Each GAMA-L call consumes several CPython frames (invoke -> stmt -> expr ->
+# invoke ...), so a depth limit equal to the raw recursion limit is unsafe:
+# ``down(400)`` with the old default of 1000 hit RecursionError before the
+# guard. The default below is intentionally conservative and the effective cap
+# is additionally clamped against the live interpreter budget.
+DEFAULT_CALL_DEPTH = 200
+_CALL_DEPTH_SAFETY_MARGIN = 100
+_CALL_FRAMES_PER_CALL = 4
+
+
+def _call_depth_cap() -> int:
+    """Largest GAMA-L call depth that fits the current Python stack budget."""
+    return max(1, (sys.getrecursionlimit() - _CALL_DEPTH_SAFETY_MARGIN)
+               // _CALL_FRAMES_PER_CALL)
+
 class Denied:
     """Explicit HITL refusal value; falsy, renders as Denied."""
     def __bool__(self): return False
@@ -120,7 +136,12 @@ def lex(src: str) -> list[Tok]:
             start = line, col; j = i
             while i < n and (src[i].isdigit() or src[i] == "."): i += 1
             txt = src[j:i]
-            val = Decimal(txt) if "." in txt else int(txt)
+            try:
+                val = Decimal(txt) if "." in txt else int(txt)
+            except (ValueError, OverflowError, InvalidOperation):
+                raise GamaError(
+                    "number literal is too large or malformed",
+                    start[0], start[1]) from None
             out.append(Tok("NUMBER", val, start[0], start[1])); col += len(txt); continue
         if c.isalpha() or c == "_":
             start = line, col; j = i
@@ -648,10 +669,17 @@ def _as_text(v, name: str, line: int = 0, col: int = 0) -> str:
     raise GamaRuntimeError(f"{name} expects Text, got {tname(v)}", line, col)
 
 def _as_number(v, name: str, line: int = 0, col: int = 0):
-    """Return a GAMA numeric value (Int or Decimal), rejecting Bool."""
+    """Return a GAMA numeric value (Int or Decimal), rejecting Bool.
+
+    Non-finite decimals (NaN/Infinity) are rejected here as a defensive
+    backstop so numeric builtins can never leak ``decimal.InvalidOperation``.
+    """
     if isinstance(v, bool) or not isinstance(v, (int, Decimal)):
         raise GamaRuntimeError(
             f"{name} expects a number, got {tname(v)}", line, col)
+    if isinstance(v, Decimal) and not v.is_finite():
+        raise GamaRuntimeError(
+            f"{name}: non-finite number {v} is not supported", line, col)
     return v
 
 def _join_item(v) -> str:
@@ -822,7 +850,11 @@ def eval_core_builtin(name: str, args: list, line: int = 0, col: int = 0):
             return []
         kinds = {tname(x) for x in seq}
         if kinds <= {"Int", "Decimal"} or kinds == {"Text"}:
-            return sorted(seq)
+            try:
+                return sorted(seq)
+            except (InvalidOperation, TypeError, ValueError) as ex:
+                raise GamaRuntimeError(
+                    f"sort: cannot order values ({ex})", line, col) from None
         raise GamaRuntimeError(
             "sort expects a list of all numbers or all Text", line, col)
     if name == "to_int":
@@ -833,16 +865,25 @@ def eval_core_builtin(name: str, args: list, line: int = 0, col: int = 0):
         if isinstance(v, int):
             return v
         if isinstance(v, Decimal):
-            if v != v.to_integral_value():
+            if not v.is_finite() or v != v.to_integral_value():
                 raise GamaRuntimeError(
-                    f"to_int: {v} is not an integral Decimal", line, col)
-            return int(v)
+                    f"to_int: {v} is not an integral finite Decimal", line, col)
+            try:
+                return int(v)
+            except (ValueError, OverflowError):
+                raise GamaRuntimeError(
+                    "to_int: integer value is too large", line, col) from None
         if isinstance(v, str):
             s = v.strip()
             if not re.fullmatch(r"[+-]?\d+", s):
                 raise GamaRuntimeError(
                     f"to_int: cannot parse {v!r} as an integer", line, col)
-            return int(s)
+            try:
+                return int(s)
+            except (ValueError, OverflowError):
+                raise GamaRuntimeError(
+                    "to_int: integer text is too large (Python digit limit)",
+                    line, col) from None
         raise GamaRuntimeError(
             f"to_int expects Int, integral Decimal, or Text, got {tname(v)}",
             line, col)
@@ -1676,13 +1717,31 @@ class Interpreter:
                     except OSError:
                         pass
     @staticmethod
-    def _env_int(name, default):
+    def _env_int(name, default, strict=False, line=0, col=0):
+        """Parse an integer env limit.
+
+        Blank or malformed values fall back to ``default`` by default.  With
+        ``strict=True`` they raise a clear ``GamaRuntimeError`` instead, which
+        callers such as the while-loop limit use so a typo cannot silently
+        disable (or crash) a guard.
+        """
         raw = os.environ.get(name)
-        if raw is None or not raw.strip():
+        if raw is None:
+            # Unset always means "use the default"; strict only governs values
+            # that are present but not a valid integer.
+            return default
+        if not raw.strip():
+            if strict:
+                raise GamaRuntimeError(
+                    f"{name} must be an integer, got {raw!r}", line, col)
             return default
         try:
             return int(raw)
         except ValueError:
+            if strict:
+                raise GamaRuntimeError(
+                    f"{name} must be an integer, got {raw!r}",
+                    line, col) from None
             return default
     @staticmethod
     def _env_optional_int(name):
@@ -1752,8 +1811,13 @@ class Interpreter:
             while self.truth(self.expr(s.cond, env)):
                 n += 1
                 self._tick(s.line, s.col)
-                if n > int(os.environ.get("GAMA_L_LOOP_LIMIT", "1000000")):
-                    raise GamaRuntimeError("loop limit exceeded", s.line, s.col)
+                loop_limit = self._env_int(
+                    "GAMA_L_LOOP_LIMIT", 1000000, strict=True,
+                    line=s.line, col=s.col)
+                if n > loop_limit:
+                    raise GamaRuntimeError(
+                        f"loop limit exceeded: {n} > GAMA_L_LOOP_LIMIT={loop_limit}",
+                        s.line, s.col)
                 try:
                     for x in s.body: self.stmt(x, env)
                 except ContinueSignal: continue
@@ -1794,10 +1858,16 @@ class Interpreter:
         elif isinstance(s, ExprStmt): self.expr(s.expr, env)
     def truth(self, v): return bool(v)
     def render(self, v):
-        if isinstance(v, Decimal): return format(v, "f")
-        if isinstance(v, (dict, list)): return json.dumps(v, ensure_ascii=False, default=str)
-        if isinstance(v, ResultVal): return str(v)
-        return str(v)
+        try:
+            if isinstance(v, Decimal): return format(v, "f")
+            if isinstance(v, (dict, list)):
+                return json.dumps(v, ensure_ascii=False, default=str)
+            if isinstance(v, ResultVal): return str(v)
+            return str(v)
+        except (ValueError, OverflowError) as ex:
+            # CPython's int->str digit limit raises ValueError; never leak it.
+            raise GamaRuntimeError(
+                f"cannot render value to text: {ex}") from None
     @staticmethod
     def _check_proof_binding(name, rec, intent, lease):
         """Enforce ``(intent, lease, key)`` uniqueness for one proof key.
@@ -1895,12 +1965,16 @@ class Interpreter:
                 errs.append("lease_not_configured")
         return {"ok": not errs, "expected": exp, "errors": errs}
     def invoke(self, fv, args, env, row, line, col):
-        depth_limit = self._env_int("GAMA_L_MAX_CALL_DEPTH", 1000)
+        configured = self._env_int("GAMA_L_MAX_CALL_DEPTH", DEFAULT_CALL_DEPTH)
+        # Even an explicit high value must not exceed what CPython can hold.
+        depth_limit = min(configured, _call_depth_cap())
         self.call_depth += 1
         try:
             if self.call_depth > depth_limit:
                 raise GamaRuntimeError(
-                    f"call depth limit exceeded: {self.call_depth} > GAMA_L_MAX_CALL_DEPTH={depth_limit}",
+                    f"call depth limit exceeded: {self.call_depth} > "
+                    f"GAMA_L_MAX_CALL_DEPTH={configured} "
+                    f"(effective cap {depth_limit})",
                     line, col)
             required = sum(1 for p in fv.params if p.default is None)
             if not (required <= len(args) <= len(fv.params)):
@@ -1919,6 +1993,12 @@ class Interpreter:
             except ReturnSignal as r: return r.value
             except PropagateSignal as p: return ResultVal(False, p.value)
             return None
+        except RecursionError:
+            # Backstop: if the CPython stack is exhausted before the depth
+            # guard (e.g. a raised recursionlimit with very frame-heavy
+            # expressions), surface a GAMA error, never RecursionError.
+            raise GamaRuntimeError(
+                "call depth exceeded the Python recursion limit", line, col) from None
         finally:
             self.call_depth -= 1
     def expr(self, e, env, row=None):
@@ -2082,11 +2162,16 @@ class Interpreter:
                 _need_args("number", e.args, 1, e.line, e.col)
                 raw = self.expr(e.args[0], env, row)
                 try:
-                    return Decimal(str(raw))
+                    value = Decimal(str(raw))
                 except (InvalidOperation, ValueError, TypeError):
                     raise GamaRuntimeError(
                         f"number: cannot convert {raw!r} to Decimal",
                         e.line, e.col) from None
+                if not value.is_finite():
+                    raise GamaRuntimeError(
+                        f"number: non-finite value {raw!r} is not supported",
+                        e.line, e.col)
+                return value
             if e.name == "round":
                 if not (1 <= len(e.args) <= 2):
                     raise GamaRuntimeError(

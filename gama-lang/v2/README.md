@@ -138,8 +138,8 @@ python3 gamal2.py fmt --write file.gm  # write in place
   `GAMA_L_AI_MODEL`, `GAMA_L_AI_ALLOW_HTTP=1` for local HTTP; HTTPS by default,
   retries 429/5xx, 1 MiB response cap; redirects are refused
 - `prove` (hash-chained receipt, optional HMAC via `GAMA_L_PROOF_KEY`, optional persistent JSONL ledger via `GAMA_L_PROOF_LEDGER`, optional intent/lease binding via `GAMA_L_PROOF_INTENT`/`GAMA_L_PROOF_LEASE`) and `verify` (tamper detection, intent/lease mismatch rejection; `GAMA_L_REQUIRE_INTENT_LEASE=1` requires both env values and a match). Concurrent appends to one ledger are serialized (POSIX `flock`) across tail-read, hash and append, so parallel runs extend a single chain; a forked or malformed ledger is refused by `prove` and reported by `verify`
-- runtime limits via `GAMA_L_MAX_CALL_DEPTH` (default 1000; CPython frames may trigger first, lower it for predictable caps) and `GAMA_L_MAX_OUTPUT_CHARS` (default 1000000)
-- optional global step limit via `GAMA_L_MAX_STEPS` (unset, blank, malformed, or negative = disabled): counts every executed statement dispatch (including nested block and function-body statements) plus one tick per `for`/`while` body iteration; expression evaluation and the function call itself are not counted separately. On exceed raises `GamaRuntimeError` with the count, the limit, and the source line/col. `GAMA_L_LOOP_LIMIT` (default 1000000) still bounds `while` iterations independently
+- runtime limits via `GAMA_L_MAX_CALL_DEPTH` (default 200; the effective cap is additionally clamped to `(sys.getrecursionlimit() - 100) // 4`, so an explicit higher value cannot exhaust the CPython stack — deep recursion raises `GamaError`, never `RecursionError`) and `GAMA_L_MAX_OUTPUT_CHARS` (default 1000000)
+- optional global step limit via `GAMA_L_MAX_STEPS` (unset, blank, malformed, or negative = disabled): counts every executed statement dispatch (including nested block and function-body statements) plus one tick per `for`/`while` body iteration; expression evaluation and the function call itself are not counted separately. On exceed raises `GamaRuntimeError` with the count, the limit, and the source line/col. `GAMA_L_LOOP_LIMIT` (default 1000000) still bounds `while` iterations independently; a present but blank or non-integer value raises `GamaRuntimeError` instead of leaking `ValueError`
 - optional expression step limit via `GAMA_L_MAX_EXPR_STEPS` (unset, blank, malformed, or negative = disabled): counts every `Interpreter.expr` evaluation; nested calls count individually (e.g. `1 + 2` is three steps: the `Binary` plus both `Literal`s). On exceed raises `GamaRuntimeError` with the count, the limit, and the source line/col. It is independent of `GAMA_L_MAX_STEPS`, call depth, output, and loop limits, and remains counted when the cap is disabled
 - standalone bytecode IR prototype (`gama_ir.py`) for a documented subset: statements/expressions, `if`/`else if`, `while`, `for`, list/map literals and indexing, `break`/`continue`, `fn`, `Ok`/`Err` + `match`, and the core builtins `len`/`text`/`number`/`round`; not integrated into the interpreter/CLI
 - static type errors and static effect violations
@@ -148,7 +148,7 @@ python3 gamal2.py fmt --write file.gm  # write in place
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 761/761
+python3 -m unittest discover -s tests -v   # 1027/1027
 python3 gamal2.py doctor --json                # 8/8 checks
 ```
 
