@@ -278,7 +278,7 @@ samples.
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 1594/1594
+python3 -m unittest discover -s tests -v   # 1647/1647
 python3 gamal2.py doctor --json                # 8/8 checks
 ../../scripts/ci_local.sh                      # py_compile + tests + doctor + VS Code JSON/smoke
 ```
@@ -300,7 +300,6 @@ Conformance: see `CONFORMANCE.md` (SPEC 2.0 T1–T10: **PASS 10/10**, including 
 
 - deployed/public package registry (the HTTP server is implemented and testable)
 - renamed exports (`export fn a as b`), `export enum`, and selective re-exports; explicit export lists mark the alias surface, but modules without any `export` keep the legacy all-visible alias behaviour
-- LSP navigation/rename for an aliased enum variant (`alias.Enum.Variant`): definition/hover resolves `alias.Enum` and direct `Enum.Variant`, but the variant segment under an aliased enum is not resolved (the compiler and IR still type-check and run it)
 - external intent/lease registry with expiry/revocation (env-bound intent/lease receipts are implemented; there is no external registry)
 - full type inference and generics; generic enum variants; record methods/structural subtyping
 - formatter remaining edges: comments that have no legal line-break position (after `|` before a stage keyword, before a binary operator, between `let x =` and its expression), inside a `fn` effects set, or inside an inline lambda may move to a safe position; indivisible tokens longer than the width still overflow
