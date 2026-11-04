@@ -134,15 +134,13 @@ the v2 core (`gamal2.py`). Result helpers (`unwrap`, `unwrap_or`, `is_ok`,
 
 ## Language-core limitations (kept truthful in the grammar)
 
-- **IIFE is not supported.** `(fn(x: Int) -> Int { ... })(41)` fails in
-  `gamal2.py` with `GamaError: expected end of statement`, because a call is
-  only parsed for a plain identifier followed by `(`. The grammar therefore
-  does not claim IIFE support. Pass the lambda as an argument to a `Function`
-  parameter, or bind it with `let` and call the binding.
-- **Named `fn` declarations are not first-class values.** After
-  `fn add(a: Int, b: Int) -> Int { ... }`, `let f = add` fails with
-  `GamaTypeError: unknown variable add`. Only a lambda is a function value:
-  `let add = fn(a: Int, b: Int) -> Int { ... }`, `let f = add`, `f(2, 3)`
+- **IIFE is supported:** `(fn(x: Int) -> Int { ... })(41)` parses and runs;
+  the grammar highlights the lambda head and the call is ordinary syntax.
+- **Named `fn` declarations are first-class values after definition:**
+  `fn add(a: Int, b: Int) -> Int { ... }` then `let f = add` works. The
+  checker knows top-level function names up front; the runtime resolves the
+  value when the `fn` declaration has executed, so bind after the declaration.
+  `let add = fn(a: Int, b: Int) -> Int { ... }`, `let f = add`, `f(2, 3)` also
   works.
 - **`Function` is a valid parameter/annotation type.** Higher-order calls and
   passing a lambda directly both work:

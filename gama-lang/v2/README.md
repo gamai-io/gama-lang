@@ -92,7 +92,7 @@ python3 gamal2.py fmt --write file.gm  # write in place
 - `import "file.gm"` with cycle detection (relative to the importing file)
 - `let` with optional type annotation, `:=` assignment
 - `fn` and SPEC `make` with typed parameters, defaults, return type, `effects { ... }`
-- first-class functions and lambdas: `fn(x: Int) -> Int { ... }`, `let f = ...`, `f(41)`, passing functions as values
+- first-class functions and lambdas: `fn(x: Int) -> Int { ... }`, `let f = ...`, `f(41)`, passing functions as values, named functions as values after definition, IIFE `(fn...)(41)`, and recursive lambdas
 - `if` / `else` blocks, `return`
 - `for x in list/text`, `while cond`, `break`/`continue`, list/text indexing
 - `Ok`/`Err` Result values and `match` arms (`Ok(v)`, `Err(e)`, `_`)
@@ -117,7 +117,7 @@ python3 gamal2.py fmt --write file.gm  # write in place
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 290/290
+python3 -m unittest discover -s tests -v   # 302/302
 python3 gamal2.py doctor --json                # 8/8 checks
 ```
 
