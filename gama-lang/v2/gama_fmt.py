@@ -675,10 +675,17 @@ class _AstFormatter:
 
     @staticmethod
     def _enum_text(s) -> str:
-        names = [v[0] if isinstance(v, tuple) else v for v in s.variants]
-        if not names:
+        parts = []
+        for v in s.variants:
+            if isinstance(v, tuple):
+                name = v[0]
+                payload = v[1] if len(v) > 1 else None
+            else:
+                name, payload = v, None
+            parts.append(name + ("(" + payload + ")" if payload else ""))
+        if not parts:
             return "enum " + s.name + " { }"
-        return "enum " + s.name + " { " + ", ".join(names) + " }"
+        return "enum " + s.name + " { " + ", ".join(parts) + " }"
 
     def _multiline_lead(self, stmts, brace_line: int):
         """Inline text for a first statement that shares the opener line.
@@ -839,7 +846,7 @@ class _AstFormatter:
                 limit = pair[0].line if pair else outer[1].line
                 prev_end = self._flush_before(prev_end, limit, indent + 1,
                                               outer[0].line)
-                label = name if name == "_" else name + "(" + (var or "") + ")"
+                label = name if name == "_" or var is None else name + "(" + var + ")"
                 label += " {"
                 self._emit(_UNIT * (indent + 1) + label,
                            [pair[0].line] if pair else [s.line])
@@ -1030,7 +1037,7 @@ class _AstFormatter:
         if isinstance(s, G.Match):
             arms = []
             for name, var, body in s.arms:
-                label = name if name == "_" else name + "(" + (var or "") + ")"
+                label = name if name == "_" or var is None else name + "(" + var + ")"
                 inner = self._inline_block(body)
                 arms.append(label + " { " + inner + " }")
             return "match " + self._expr(s.expr) + " { " + " ".join(arms) + " }"

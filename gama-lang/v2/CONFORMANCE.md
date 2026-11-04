@@ -63,8 +63,9 @@ These are outside the T1–T10 checks or only partially covered; see
    budget or cost model.
 4. **Full type system.** No full inference. Nominal records with typed fields,
    positional/named construction and dotted field access are implemented
-   (`tests/test_records.py`); simple nullary enums are implemented
-   (`tests/test_enums.py`). Generics, payload enum variants, record methods,
+   (`tests/test_records.py`); nullary and single-payload enums are implemented
+   (`tests/test_enums.py`, `tests/test_payload_enums.py`). Generics,
+   multi-payload/generic enum variants, record methods,
    field update/copy syntax, and structural subtyping are missing; the IR
    prototype does not compile record/enum declarations or literals.
 5. **Formatter edges.** `fmt` is AST-based; it preserves comments and strings

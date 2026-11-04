@@ -112,17 +112,31 @@ def _record_value_str(v) -> str:
         return json.dumps(v, ensure_ascii=False, default=str)
     return str(v)
 
+_NO_PAYLOAD = object()
+
 class EnumVal:
-    """Runtime nullary enum value: Enum.Variant (no payload)."""
-    __slots__ = ("enum", "variant")
-    def __init__(self, enum: str, variant: str):
-        self.enum, self.variant = enum, variant
+    """Runtime enum value: Enum.Variant or Enum.Variant(payload).
+
+    ``payload is _NO_PAYLOAD`` marks a nullary variant, so ``None`` remains a
+    legitimate payload value. Equality compares enum, variant and payload;
+    printing is deterministic (payload rendered like a record field value).
+    """
+    __slots__ = ("enum", "variant", "payload")
+    def __init__(self, enum: str, variant: str, payload=_NO_PAYLOAD):
+        self.enum, self.variant, self.payload = enum, variant, payload
     def __eq__(self, other):
         if isinstance(other, EnumVal):
-            return self.enum == other.enum and self.variant == other.variant
+            if self.enum != other.enum or self.variant != other.variant:
+                return False
+            if self.payload is _NO_PAYLOAD or other.payload is _NO_PAYLOAD:
+                return self.payload is other.payload
+            return self.payload == other.payload
         return NotImplemented
     def __hash__(self): return hash((self.enum, self.variant))
-    def __str__(self): return f"{self.enum}.{self.variant}"
+    def __str__(self):
+        if self.payload is _NO_PAYLOAD:
+            return f"{self.enum}.{self.variant}"
+        return f"{self.enum}.{self.variant}({_record_value_str(self.payload)})"
     __repr__ = __str__
 class FunctionVal:
     """Runtime callable value: a lambda bound to its defining environment."""
@@ -463,7 +477,16 @@ class Parser:
             v = self.expect("IDENT")
             if "." in v.val:
                 raise GamaError("enum variant must be a simple identifier", v.line, v.col)
-            variants.append((v.val, v.line, v.col))
+            payload = None
+            if self.at("OP", "("):
+                self.take(); self.skip_nl()
+                pt = self.expect("IDENT")
+                if "." in pt.val:
+                    raise GamaError(
+                        "enum payload type must be a simple identifier", pt.line, pt.col)
+                payload = pt.val
+                self.skip_nl(); self.expect("OP", ")")
+            variants.append((v.val, payload, v.line, v.col))
             if self.at("OP", ","):
                 self.take(); self.skip_seps()
             elif self.at("NL"):
@@ -481,20 +504,24 @@ class Parser:
             if self.at("OP", "}"): break
             arm = self.take()
             if arm.kind != "IDENT":
-                raise GamaError("match arm must be Ok(x), Err(e), Enum.Variant or _", arm.line, arm.col)
+                raise GamaError("match arm must be Ok(x), Err(e), Variant(x), Variant, Enum.Variant or _", arm.line, arm.col)
+            kind = arm.val
             var = None
-            if arm.val in ("Ok", "Err"):
-                self.expect("OP", "("); var = self.expect("IDENT").val; self.expect("OP", ")")
-            elif arm.val == "_":
+            if kind == "_":
                 pass
-            elif "." in arm.val:
-                if arm.val.count(".") != 1:
-                    raise GamaError("enum match pattern must be Enum.Variant", arm.line, arm.col)
             else:
-                raise GamaError("match arm must be Ok(x), Err(e), Enum.Variant or _", arm.line, arm.col)
+                if self.at("OP", "("):
+                    self.take(); var = self.expect("IDENT").val
+                    self.expect("OP", ")")
+                elif kind in ("Ok", "Err"):
+                    raise GamaError(
+                        f"{kind} match patterns require a binding: {kind}(x)",
+                        arm.line, arm.col)
+                elif "." in kind and kind.count(".") != 1:
+                    raise GamaError("enum match pattern must be Enum.Variant", arm.line, arm.col)
             if self.at("OP", "=>"):
                 self.take(); self.skip_nl()
-            self.skip_nl(); body = self.block(); arms.append((arm.val, var, body))
+            self.skip_nl(); body = self.block(); arms.append((kind, var, body))
             if self.at("OP", ","): self.take()
             self.skip_seps()
         self.expect("OP", "}")
@@ -646,6 +673,33 @@ def tname(v) -> str:
         return "List"
     if isinstance(v, dict): return "Json"
     return "Any"
+
+class _AmbiguousVariantError(Exception):
+    """A bare variant name matches variants of more than one enum."""
+    def __init__(self, name: str):
+        super().__init__(name); self.name = name
+
+def find_enum_variant(enums, name):
+    """Resolve an enum variant reference against ``enums``.
+
+    ``enums`` maps ``Enum -> {Variant: payload_type_or_None}``. Accepts
+    ``Enum.Variant`` and a bare ``Variant`` that must be unique across all
+    declared enums. Returns ``(enum, variant, payload_type)`` or ``None`` when
+    the reference is not a declared variant. Raises ``_AmbiguousVariantError``
+    for a bare name defined by several enums.
+    """
+    if "." in name:
+        base, _, variant = name.partition(".")
+        pm = enums.get(base)
+        if pm is not None and variant in pm:
+            return base, variant, pm[variant]
+        return None
+    hits = [(base, name, pm[name]) for base, pm in enums.items() if name in pm]
+    if not hits:
+        return None
+    if len(hits) > 1:
+        raise _AmbiguousVariantError(name)
+    return hits[0]
 
 BUILTINS = {
     "sql": ({"sql.read"}, "Table"),
@@ -1140,14 +1194,14 @@ class Checker:
                     e.src = getattr(s, "_src", None)
                     raise e
                 seen = set()
-                for vn, vl, vc in s.variants:
+                for vn, _vp, vl, vc in s.variants:
                     if vn in seen:
                         e = GamaTypeError(
                             f"duplicate enum variant {s.name}.{vn}", vl, vc)
                         e.src = getattr(s, "_src", None)
                         raise e
                     seen.add(vn)
-                self.enums[s.name] = seen
+                self.enums[s.name] = {vn: vp for vn, vp, _vl, _vc in s.variants}
         for s in stmts:
             if isinstance(s, EnumDecl):
                 continue
@@ -1184,6 +1238,7 @@ class Checker:
             if t not in ("Result", "Any") and t not in self.enums:
                 raise GamaTypeError("match expects Result or enum", s.line, s.col)
             for kind, var, body in s.arms:
+                payload_type = None
                 if kind == "_":
                     pass
                 elif kind in ("Ok", "Err"):
@@ -1192,19 +1247,30 @@ class Checker:
                             f"match: {kind} pattern does not match subject type {t}",
                             s.line, s.col)
                 else:
-                    base, _, variant = kind.partition(".")
-                    if base not in self.enums:
+                    try:
+                        resolved = find_enum_variant(self.enums, kind)
+                    except _AmbiguousVariantError:
                         raise GamaTypeError(
-                            f"unknown enum type {base}", s.line, s.col)
-                    if variant not in self.enums[base]:
+                            f"ambiguous enum variant {kind}; write Enum.{kind}",
+                            s.line, s.col) from None
+                    if resolved is None:
                         raise GamaTypeError(
                             f"unknown enum variant {kind}", s.line, s.col)
+                    base, variant, payload_type = resolved
                     if t not in ("Any", base):
                         raise GamaTypeError(
                             f"match: {kind} pattern does not match subject type {t}",
                             s.line, s.col)
+                    if payload_type is None and var is not None:
+                        raise GamaTypeError(
+                            f"enum variant {base}.{variant} is nullary and cannot bind a payload",
+                            s.line, s.col)
+                    if payload_type is not None and var is None:
+                        raise GamaTypeError(
+                            f"enum variant {base}.{variant} requires a payload pattern "
+                            f"{variant}(x)", s.line, s.col)
                 self.push()
-                if var: self.set(var, "Any")
+                if var: self.set(var, payload_type or "Any")
                 [self.stmt(x, allowed) for x in body]
                 self.pop()
             return
@@ -1341,6 +1407,10 @@ class Checker:
                     if variant not in self.enums[base]:
                         raise GamaTypeError(
                             f"unknown enum variant {e.name}", e.line, e.col)
+                    if self.enums[base][variant] is not None:
+                        raise GamaTypeError(
+                            f"enum variant {e.name} requires a payload argument; "
+                            f"write {variant}(...)", e.line, e.col)
                     return base
             if "." in e.name:
                 parts = e.name.split(".")
@@ -1426,6 +1496,28 @@ class Checker:
                     return "Any"
                 if vt is not None:
                     raise GamaTypeError(f"{e.name} is not callable ({vt})", e.line, e.col)
+                try:
+                    ctor = find_enum_variant(self.enums, e.name)
+                except _AmbiguousVariantError:
+                    raise GamaTypeError(
+                        f"ambiguous enum constructor {e.name}; write Enum.{e.name}",
+                        e.line, e.col) from None
+                if ctor is not None:
+                    base, variant, payload_t = ctor
+                    if payload_t is None:
+                        raise GamaTypeError(
+                            f"enum variant {base}.{variant} is nullary; write "
+                            f"{base}.{variant} without parentheses", e.line, e.col)
+                    if len(e.args) != 1:
+                        raise GamaTypeError(
+                            f"enum variant {base}.{variant} expects 1 payload "
+                            f"argument, got {len(e.args)}", e.line, e.col)
+                    at = self.expr(e.args[0])
+                    if not self.compat(at, payload_t):
+                        raise GamaTypeError(
+                            f"{base}.{variant}: payload {at} != {payload_t}",
+                            e.line, e.col)
+                    return base
                 raise GamaTypeError(f"unknown function {e.name}", e.line, e.col)
             required = sum(1 for p in f.params if p.default is None)
             if not (required <= len(e.args) <= len(f.params)):
@@ -2078,7 +2170,7 @@ class Interpreter:
         # enum can still reference its variants when they are invoked.
         for s in stmts:
             if isinstance(s, EnumDecl) and s.name not in self.enums:
-                self.enums[s.name] = {v[0] for v in s.variants}
+                self.enums[s.name] = {v[0]: v[1] for v in s.variants}
         try:
             # Record declarations are nominal and may be referenced before the
             # declaration line; register them up front like the checker does.
@@ -2096,7 +2188,7 @@ class Interpreter:
         elif isinstance(s, Use): pass
         elif isinstance(s, RecordDecl): self.records[s.name] = s
         elif isinstance(s, EnumDecl):
-            self.enums.setdefault(s.name, {v[0] for v in s.variants})
+            self.enums.setdefault(s.name, {v[0]: v[1] for v in s.variants})
         elif isinstance(s, For):
             seq = self.expr(s.iterable, env)
             if isinstance(seq, str): seq = list(seq)
@@ -2138,14 +2230,24 @@ class Interpreter:
                     hit = (isinstance(rv, ResultVal)
                            and (kind == "Ok") == rv.ok)
                 elif isinstance(rv, EnumVal):
-                    base, _, variant = kind.partition(".")
-                    hit = rv.enum == base and rv.variant == variant
+                    try:
+                        resolved = find_enum_variant(self.enums, kind)
+                    except _AmbiguousVariantError:
+                        resolved = None
+                    if resolved is None:
+                        hit = False
+                    else:
+                        base, variant, _payload_t = resolved
+                        hit = rv.enum == base and rv.variant == variant
                 else:
                     hit = False
                 if hit:
                     local = Env(env)
                     if var and isinstance(rv, ResultVal):
                         local.set(var, rv.value)
+                    elif (var and isinstance(rv, EnumVal)
+                          and rv.payload is not _NO_PAYLOAD):
+                        local.set(var, rv.payload)
                     for x in body: self.stmt(x, local)
                     return
             raise GamaRuntimeError("match: no arm matched", s.line, s.col)
@@ -2384,6 +2486,10 @@ class Interpreter:
                         if variant not in self.enums[base]:
                             raise GamaRuntimeError(
                                 f"unknown enum variant {e.name}", e.line, e.col)
+                        if self.enums[base][variant] is not None:
+                            raise GamaRuntimeError(
+                                f"enum variant {e.name} requires a payload "
+                                f"argument; write {variant}(...)", e.line, e.col)
                         return EnumVal(base, variant)
                 if "." not in e.name: raise
                 parts = e.name.split(".")
@@ -2559,6 +2665,24 @@ class Interpreter:
                 fnval = env.get(e.name)
             except GamaRuntimeError:
                 fnval = None
+            if fnval is None:
+                try:
+                    ctor = find_enum_variant(self.enums, e.name)
+                except _AmbiguousVariantError:
+                    raise GamaRuntimeError(
+                        f"ambiguous enum constructor {e.name}; write Enum.{e.name}",
+                        e.line, e.col) from None
+                if ctor is not None:
+                    base, variant, payload_t = ctor
+                    if payload_t is None:
+                        raise GamaRuntimeError(
+                            f"enum variant {base}.{variant} is nullary; write "
+                            f"{base}.{variant} without parentheses", e.line, e.col)
+                    if len(e.args) != 1:
+                        raise GamaRuntimeError(
+                            f"enum variant {base}.{variant} expects 1 payload "
+                            f"argument, got {len(e.args)}", e.line, e.col)
+                    return EnumVal(base, variant, self.expr(e.args[0], env, row))
             if isinstance(fnval, FunctionVal):
                 return self.invoke(fnval, e.args, env, row, e.line, e.col)
             if fnval is not None:
