@@ -12,19 +12,30 @@ Supported statements
 --------------------
 ``let`` / ``:=`` (assign), ``print``, ``if``/``else`` (including ``else if``
 chains), ``while``, ``for`` (list/text iteration), ``break``, ``continue``,
-``match`` on ``Ok``/``Err``, ``fn`` (named function definitions), ``return``
-(inside functions only), and expression statements.
+``match`` on ``Ok``/``Err`` results and nullary enum variants, ``record`` and
+``enum`` declarations, ``fn`` (named function definitions), ``return`` (inside
+functions only), and expression statements.
 
 Supported expressions
 ---------------------
 Literals: ``Int``, ``Decimal``, ``Text``, ``Bool``, ``null``, list literals
 ``[a, b]`` and map literals ``{k: v}``.
-Variables, unary ``!``/``-``; binary ``+ - * / %``, comparisons
-``== != < <= > >=`` and short-circuit ``&&``/``||``; indexing ``base[i]``
-(list/text, with the reference interpreter's ``int`` coercion and Python-style
-negative indices); calls to *named, user-defined* functions (including
-recursion and default parameters); and the core builtins ``len``, ``text``,
-``number``, ``round`` and ``Ok``/``Err``.
+Record construction (positional ``Point(1, 2)`` and named
+``Point { x: 1, y: 2 }``), field access ``p.x`` (walking record fields and map
+keys), enum variants ``Color.Red``, unary ``!``/``-``; binary ``+ - * / %``,
+comparisons ``== != < <= > >=`` and short-circuit ``&&``/``||``; indexing
+``base[i]`` (list/text, with the reference interpreter's ``int`` coercion and
+Python-style negative indices); calls to *named, user-defined* functions
+(including recursion and default parameters); and the core builtins ``len``,
+``text``, ``number``, ``round`` and ``Ok``/``Err``.
+
+Records and enums follow the reference runtime exactly: record values are
+nominal (type name plus declaration-ordered fields, value-based equality),
+enums are nullary ``Enum.Variant`` values, and both reuse the reference value
+classes for rendering.  Declarations are registered before the program runs
+(so functions may refer to records/enums declared later) and nested record
+declarations take effect when execution reaches them, mirroring
+``gamal2.Interpreter``.
 
 Runtime model
 -------------
@@ -42,16 +53,17 @@ implementation byte-for-byte.
 Limitations (raise ``IRUnsupported`` / documented runtime errors)
 ------------------------------------------------------------------
 * ``prove``/``verify`` (and dotted proof names) and ``import``.
-* Dotted names / field access (``a.b``), dotted calls / namespaces
-  (``mod.fn``), pipes and ``try``.
+* Dotted *calls* / namespaces (``mod.fn``), pipes and ``try``.  (Dotted *names*
+  are supported: ``p.x`` field access and ``Color.Red`` enum variants.)
 * Builtins other than ``len``, ``text``, ``number``, ``round``, ``Ok``/``Err``
   (``sql``, ``ask``, ``upper``, result/text/collection helpers, ``mail``,
   ``remember``/``recall``, ``wait_user``, ...).
-* ``match`` is supported only for ``Ok``/``Err`` results; there is no
-  structural pattern matching beyond those arms.
-* Map literals are JSON values: field access (``m.k``) stays unsupported in the
-  IR, and ``m[0]`` uses the reference ``int`` coercion, so text-keyed maps are
-  not indexable in either runtime.
+* ``match`` is supported only for ``Ok``/``Err`` results and nullary enum
+  variants; there is no structural pattern matching beyond those arms (records
+  cannot be destructured).
+* Map literals are JSON values: dotted field access (``m.k``) follows the
+  reference fallback (it also works on maps), and ``m[0]`` uses the reference
+  ``int`` coercion, so text-keyed maps are not indexable in either runtime.
 * Lambdas, first-class function values and expression callees (``f()`` where
   ``f`` is a variable).  Calling such a value fails with a clear runtime error.
 * ``break``/``continue`` outside a loop and ``return`` outside a function are
@@ -148,6 +160,11 @@ class FunctionProto:
 @dataclass
 class Program:
     main: Code
+    # Nominal type tables captured from top-level declarations.  Maps a record
+    # name to its ordered field names and an enum name to its variant set; the
+    # VM seeds its registries from these before running ``main``.
+    records: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    enums: dict[str, frozenset[str]] = field(default_factory=dict)
 
     def disassemble(self) -> str:
         """Return a readable listing of the main instruction stream."""
@@ -280,6 +297,21 @@ def _result_matches(kind: str, value: Any) -> bool:
     return False
 
 
+def _match_kind(kind: str, value: Any) -> bool:
+    """Whether ``value`` matches one ``match`` arm label.
+
+    Mirrors ``gamal2.Interpreter.stmt``: ``Ok``/``Err`` match results and
+    ``Enum.Variant`` matches nullary enum values.  Anything else (including a
+    record) never matches an arm.
+    """
+    if kind in ("Ok", "Err"):
+        return _result_matches(kind, value)
+    if isinstance(value, g2.EnumVal):
+        base, _, variant = kind.partition(".")
+        return value.enum == base and value.variant == variant
+    return False
+
+
 def _builtin(name: str, args: list, line: int, col: int) -> Any:
     """Evaluate a supported builtin on already-evaluated arguments.
 
@@ -339,12 +371,17 @@ class _Compiler:
     default-argument expression).  Frames created by ``if`` branches are
     tracked so ``break``/``continue`` can unwind them precisely."""
 
-    def __init__(self, in_function: bool = False):
+    def __init__(self, in_function: bool = False, records=None, enums=None):
         self.code = Code()
         self.frame_depth = 0
         self.loops: list[dict] = []
         self.in_function = in_function
         self.match_seq = 0
+        # Nominal type tables used only to decide, at compile time, whether a
+        # ``Call`` is a positional record constructor.  Dotted names and
+        # ``RecordLit`` are resolved dynamically at run time.
+        self.records: dict[str, tuple[str, ...]] = records if records is not None else {}
+        self.enums: dict[str, frozenset[str]] = enums if enums is not None else {}
 
     # -- emission helpers ------------------------------------------------
     def emit(self, op: str, arg: Any = None) -> int:
@@ -373,6 +410,16 @@ class _Compiler:
             return
         if isinstance(stmt, g2.Use):
             self.emit("NOP")
+            return
+        if isinstance(stmt, g2.RecordDecl):
+            fields = tuple(fn for fn, _ft in stmt.fields)
+            self.records[stmt.name] = fields
+            self.emit("DEF_RECORD", (stmt.name, fields))
+            return
+        if isinstance(stmt, g2.EnumDecl):
+            variants = tuple(v[0] for v in stmt.variants)
+            self.enums[stmt.name] = frozenset(variants)
+            self.emit("DEF_ENUM", (stmt.name, variants))
             return
         if isinstance(stmt, g2.Print):
             self.compile_expr(stmt.expr)
@@ -553,7 +600,13 @@ class _Compiler:
         self.emit("JUMP", ctx["continue"])
 
     def compile_function(self, stmt: g2.Fn) -> FunctionProto:
-        body = _Compiler(in_function=True)
+        # Function bodies get their own nominal tables (copied) so a record
+        # declared inside one body does not leak into later top-level code.
+        body = _Compiler(
+            in_function=True,
+            records=dict(self.records),
+            enums=dict(self.enums),
+        )
         body.compile_statements(stmt.body)
         body.emit("CONST", None)
         body.emit("RETURN")
@@ -562,7 +615,8 @@ class _Compiler:
         for param in stmt.params:
             default: Code | None = None
             if param.default is not None:
-                default_compiler = _Compiler()
+                default_compiler = _Compiler(
+                    records=dict(self.records), enums=dict(self.enums))
                 default_compiler.compile_expr(param.default)
                 default_compiler.emit("RETURN")
                 default = default_compiler.code
@@ -576,8 +630,19 @@ class _Compiler:
             return
         if isinstance(expr, g2.Var):
             if "." in expr.name:
-                _unsupported(expr, "dotted names / field access")
-            self.emit("LOAD", expr.name)
+                # Resolved dynamically like the reference runtime: exact name,
+                # then enum variant, then longest-bound-prefix field walk.
+                self.emit("LOAD_NAME", (expr.name, expr.line, expr.col))
+            else:
+                self.emit("LOAD", expr.name)
+            return
+        if isinstance(expr, g2.RecordLit):
+            # Evaluate field expressions in source order, then validate/order
+            # them against the declaration at run time.
+            names = tuple(str(k) for k, _v in expr.fields)
+            for _k, value in expr.fields:
+                self.compile_expr(value)
+            self.emit("BUILD_RECORD", (expr.name, names, expr.line, expr.col))
             return
         if isinstance(expr, g2.ListExpr):
             for item in expr.items:
@@ -611,6 +676,14 @@ class _Compiler:
                 self.emit("BINOP", expr.op)
             return
         if isinstance(expr, g2.Call):
+            if expr.name in self.records:
+                # Positional record constructor.  The reference runtime checks
+                # arity *before* evaluating arguments, so emit the guard first.
+                self.emit("CHECK_RECORD", (expr.name, len(expr.args), expr.line, expr.col))
+                for arg in expr.args:
+                    self.compile_expr(arg)
+                self.emit("BUILD_RECORD_POS", (expr.name, len(expr.args), expr.line, expr.col))
+                return
             if expr.name in _UNSUPPORTED_BUILTINS:
                 _unsupported(expr, f"builtin {expr.name!r} is not supported")
             if expr.name in _SUPPORTED_BUILTINS:
@@ -654,7 +727,7 @@ class _CallTarget:
 
 
 class _VM:
-    def __init__(self, initial: Any = None):
+    def __init__(self, initial: Any = None, records=None, enums=None):
         if initial is None:
             self.root = Frame()
         elif isinstance(initial, Frame):
@@ -667,6 +740,10 @@ class _VM:
         self.functions: dict[str, tuple[FunctionProto, Frame]] = {}
         self.out: list[str] = []
         self.call_depth = 0
+        # Nominal type registries.  Copies so a reused ``Program`` is unaffected
+        # by declarations that activate only at run time.
+        self.records: dict[str, tuple[str, ...]] = dict(records or {})
+        self.enums: dict[str, frozenset[str]] = dict(enums or {})
 
     # -- call handling ---------------------------------------------------
     def _invoke(self, proto: FunctionProto, closure: Frame, args: list) -> Any:
@@ -696,6 +773,81 @@ class _VM:
         except ValueError:
             return 1000
 
+    # -- dotted names / records / enums ----------------------------------
+    def _load_name(self, frame: Frame, arg) -> Any:
+        """Resolve a dotted name exactly like ``gamal2.Interpreter.expr``.
+
+        Order: an exact binding, then an enum variant (``Enum.Variant``), then
+        the longest bound prefix walked through record fields / map keys.
+        """
+        name, line, col = arg
+        try:
+            return frame.get(name)
+        except IRRuntimeError:
+            pass
+        base, _, variant = name.partition(".")
+        if base in self.enums:
+            if variant not in self.enums[base]:
+                raise IRRuntimeError(f"unknown enum variant {name}", line, col)
+            return g2.EnumVal(base, variant)
+        parts = name.split(".")
+        base_n = None
+        for i in range(len(parts) - 1, 0, -1):
+            try:
+                frame.get(".".join(parts[:i]))
+                base_n = i
+                break
+            except IRRuntimeError:
+                pass
+        if base_n is None:
+            raise IRRuntimeError(f"unknown variable {name}")
+        obj = frame.get(".".join(parts[:base_n]))
+        for part in parts[base_n:]:
+            if isinstance(obj, g2.RecordVal):
+                if part not in obj.fields:
+                    raise IRRuntimeError(f"unknown field {name}", line, col)
+                obj = obj.fields[part]
+                continue
+            if (isinstance(obj, dict) and part not in obj
+                    and isinstance(obj.get("value"), dict)):
+                obj = obj["value"]
+            if not isinstance(obj, dict) or part not in obj:
+                raise IRRuntimeError(f"unknown field {name}", line, col)
+            obj = obj[part]
+        return obj
+
+    def _define_record(self, name: str, fields: tuple[str, ...]) -> None:
+        self.records[name] = tuple(fields)
+
+    def _define_enum(self, name: str, variants) -> None:
+        self.enums[name] = frozenset(variants)
+
+    def _check_record(self, arg) -> None:
+        name, argc, line, col = arg
+        decl = self.records.get(name)
+        if decl is None:
+            raise IRRuntimeError(f"unknown function {name}", line, col)
+        if argc != len(decl):
+            raise IRRuntimeError(
+                f"{name} expects {len(decl)} fields, got {argc}", line, col)
+
+    def _make_record(self, name: str, decl: tuple[str, ...],
+                     pairs, line: int, col: int) -> Any:
+        """Validate named fields and reorder them to declaration order."""
+        values: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in values:
+                raise IRRuntimeError(f"{name}: duplicate field {key}", line, col)
+            if key not in decl:
+                raise IRRuntimeError(f"{name}: unknown field {key}", line, col)
+            values[key] = value
+        missing = [fn for fn in decl if fn not in values]
+        if missing:
+            raise IRRuntimeError(
+                f"{name}: missing field{'s' if len(missing) > 1 else ''} "
+                + ", ".join(missing), line, col)
+        return g2.RecordVal(name, {fn: values[fn] for fn in decl})
+
     # -- interpreter loop ------------------------------------------------
     def _exec(self, code: Code, frame: Frame) -> Any:
         instrs = code.instrs
@@ -712,6 +864,8 @@ class _VM:
                 stack.append(arg)
             elif op == "LOAD":
                 stack.append(frames[-1].get(arg))
+            elif op == "LOAD_NAME":
+                stack.append(self._load_name(frames[-1], arg))
             elif op == "LET":
                 frames[-1].define(arg, stack.pop())
             elif op == "ASSIGN":
@@ -742,6 +896,29 @@ class _VM:
                 if count:
                     del stack[-count:]
                 stack.append(dict(zip(keys, values)))
+            elif op == "BUILD_RECORD":
+                name, field_names, line, col = arg
+                count = len(field_names)
+                values = stack[-count:] if count else []
+                if count:
+                    del stack[-count:]
+                decl = self.records.get(name)
+                if decl is None:
+                    raise IRRuntimeError(f"unknown record {name}", line, col)
+                stack.append(self._make_record(
+                    name, decl, zip(field_names, values), line, col))
+            elif op == "BUILD_RECORD_POS":
+                name, argc, line, col = arg
+                values = stack[-argc:] if argc else []
+                if argc:
+                    del stack[-argc:]
+                decl = self.records.get(name)
+                if decl is None:
+                    raise IRRuntimeError(f"unknown function {name}", line, col)
+                if argc != len(decl):
+                    raise IRRuntimeError(
+                        f"{name} expects {len(decl)} fields, got {argc}", line, col)
+                stack.append(g2.RecordVal(name, dict(zip(decl, values))))
             elif op == "INDEX":
                 line, col = arg
                 index = stack.pop()
@@ -775,14 +952,14 @@ class _VM:
                 stack.append(_builtin(name, args, line, col))
             elif op == "MATCH_PREP":
                 line, col = arg
-                if not isinstance(stack[-1], g2.ResultVal):
+                if not isinstance(stack[-1], (g2.ResultVal, g2.EnumVal)):
                     raise IRRuntimeError("match expects Result", line, col)
             elif op == "GET_RESULT_VALUE":
                 stack.append(stack.pop().value)
             elif op == "MATCH_JUMP_UNLESS":
                 kind, target = arg
                 value = stack.pop()
-                if not _result_matches(kind, value):
+                if not _match_kind(kind, value):
                     ip = target
             elif op == "MATCH_FAIL":
                 line, col = arg
@@ -826,6 +1003,14 @@ class _VM:
                 stack.append(self._invoke(target.proto, target.closure, args))
             elif op == "DEF":
                 self.functions[arg.name] = (arg, frames[-1])
+            elif op == "DEF_RECORD":
+                name, fields = arg
+                self._define_record(name, fields)
+            elif op == "DEF_ENUM":
+                name, variants = arg
+                self._define_enum(name, variants)
+            elif op == "CHECK_RECORD":
+                self._check_record(arg)
             elif op == "RETURN":
                 return stack.pop() if stack else None
             elif op == "NOP":
@@ -836,6 +1021,24 @@ class _VM:
 
 
 # ------------------------------------------------------------------ public API
+def _top_level_decls(stmts: list) -> tuple[dict, dict]:
+    """Collect top-level record/enum declarations before compiling.
+
+    Mirrors ``gamal2.Interpreter.run``: these are registered up front, so a
+    function declared before a ``record``/``enum`` can still refer to it.
+    Nested declarations are *not* included; they activate via ``DEF_RECORD`` /
+    ``DEF_ENUM`` when execution reaches them.
+    """
+    records: dict[str, tuple[str, ...]] = {}
+    enums: dict[str, frozenset[str]] = {}
+    for stmt in stmts:
+        if isinstance(stmt, g2.RecordDecl):
+            records[stmt.name] = tuple(fn for fn, _ft in stmt.fields)
+        elif isinstance(stmt, g2.EnumDecl):
+            enums[stmt.name] = frozenset(v[0] for v in stmt.variants)
+    return records, enums
+
+
 def compile_program(ast: Any) -> Program:
     """Compile a parsed (optionally checked) ``gamal2`` AST into a :class:`Program`.
 
@@ -849,9 +1052,11 @@ def compile_program(ast: Any) -> Program:
         ast = g2.check(ast)
     if not isinstance(ast, (list, tuple)):
         raise TypeError("compile_program expects a statement list, Program or source string")
-    compiler = _Compiler()
-    compiler.compile_statements(list(ast))
-    return Program(compiler.code)
+    stmts = list(ast)
+    top_records, top_enums = _top_level_decls(stmts)
+    compiler = _Compiler(records=dict(top_records), enums=dict(top_enums))
+    compiler.compile_statements(stmts)
+    return Program(compiler.code, top_records, top_enums)
 
 
 def run_program(ast: Any, env: Any = None) -> RunResult:
@@ -861,6 +1066,6 @@ def run_program(ast: Any, env: Any = None) -> RunResult:
     :class:`Frame`, or ``None``.
     """
     program = ast if isinstance(ast, Program) else compile_program(ast)
-    vm = _VM(env)
+    vm = _VM(env, program.records, program.enums)
     vm._exec(program.main, vm.root)
     return RunResult(list(vm.out), dict(vm.root.outermost().vars))

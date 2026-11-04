@@ -593,7 +593,9 @@ class IRUnsupportedTests(unittest.TestCase):
         ("prove", "prove p = 1\n"),
         ("verify", "verify true\n"),
         ("import", 'import "lib.gm" as m\nprint 1\n'),
-        ("field access", "let m = {a: 1}\nprint m.a\n"),
+        # Dotted names (field access / enum variants) are supported now; this
+        # slot keeps a construct that is still outside the IR subset.
+        ("wait_user", 'wait user "ok?"\n'),
         ("pipe", "print [1, 2] | count\n"),
         ("try", "print Ok(1)?\n"),
         ("lambda", "let f = fn(x: Int) -> Int { return x }\nprint f(1)\n"),

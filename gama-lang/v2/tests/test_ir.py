@@ -179,8 +179,10 @@ class IRRejectsUnsupported(unittest.TestCase):
             IR.compile_program(G.parse(src))
         self.assertIn("IR does not support", str(ctx.exception))
 
-    def test_dotted_name_and_field_access(self):
-        self.assert_unsupported('print m.a\n')
+    def test_dotted_call_and_namespace(self):
+        # Dotted *names* (field access / enum variants) are supported now;
+        # dotted *calls* through namespaces still are not.
+        self.assert_unsupported('print mod.fn()\n')
 
     def test_pipe(self):
         self.assert_unsupported('print xs | count\n')
