@@ -61,7 +61,11 @@ These are outside the T1–T10 checks or only partially covered; see
    production run path. Runtime limits are enforced (call depth, output,
    statement/expression steps, loop limit); there is no production resource
    budget or cost model.
-4. **Full type system.** No full inference; records/enums/generics are missing.
+4. **Full type system.** No full inference. Nominal records with typed fields,
+   positional/named construction and dotted field access are implemented
+   (`tests/test_records.py`), but enums, generics, record methods, field
+   update/copy syntax, and structural subtyping are missing; the IR prototype
+   does not compile record declarations or literals.
 5. **Full AST formatter.** `fmt` is token-based; it preserves comments and
    strings but does not reflow multi-line strings (T10 still passes on
    determinism).

@@ -78,6 +78,40 @@ class ResultVal:
     def __str__(self): return ("Ok(" if self.ok else "Err(") + str(self.value) + ")"
     __repr__ = __str__
 
+class RecordVal:
+    """Runtime record (struct) value: a nominal type name plus ordered fields.
+
+    Field order follows the declaration order, which makes printing
+    deterministic. Equality is nominal: type name and fields must match.
+    """
+    def __init__(self, type_name: str, fields: dict):
+        self.type_name, self.fields = type_name, dict(fields)
+    def __eq__(self, other):
+        return (isinstance(other, RecordVal)
+                and self.type_name == other.type_name
+                and self.fields == other.fields)
+    def __ne__(self, other):
+        return not self.__eq__(other)
+    def __str__(self):
+        body = ", ".join(f"{k}: {_record_value_str(v)}"
+                         for k, v in self.fields.items())
+        return f"{self.type_name} {{ {body} }}"
+    __repr__ = __str__
+
+def _record_value_str(v) -> str:
+    """Deterministic rendering of one record field value."""
+    if isinstance(v, Decimal):
+        return format(v, "f")
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if v is None:
+        return "null"
+    if isinstance(v, str):
+        return json.dumps(v, ensure_ascii=False)
+    if isinstance(v, (list, dict)):
+        return json.dumps(v, ensure_ascii=False, default=str)
+    return str(v)
+
 class FunctionVal:
     """Runtime callable value: a lambda bound to its defining environment."""
     def __init__(self, params, ret, effects, body, closure, name="<lambda>"):
@@ -215,6 +249,10 @@ class Prove: name: str; expr: Any; line: int; col: int
 class Verify: expr: Any; line: int; col: int
 @dataclass
 class Try: expr: Any; line: int; col: int
+@dataclass
+class RecordDecl: name: str; fields: list; line: int; col: int
+@dataclass
+class RecordLit: name: str; fields: list; line: int; col: int
 
 @dataclass
 class Print: expr: Any; line: int; col: int
@@ -223,12 +261,21 @@ class ExprStmt: expr: Any; line: int; col: int
 
 # Statements that end with a closing brace; a following statement may start
 # on the same line without an explicit separator.
-_BLOCK_STMT = (If, While, For, Match, Fn)
+_BLOCK_STMT = (If, While, For, Match, Fn, RecordDecl)
 
 # ------------------------------------------------------------------ parser
 class Parser:
     def __init__(self, toks: list[Tok]):
         self.t = toks; self.i = 0
+        # Pre-scan record type names so `Point { x: 1 }` can be parsed as a
+        # named record literal without making a bare `name {` ambiguous with
+        # an if/while/for block header. Only locally declared records qualify.
+        self.record_names: set[str] = set()
+        for j in range(len(toks) - 2):
+            if (toks[j].kind == "IDENT" and toks[j].val == "record"
+                    and toks[j + 1].kind == "IDENT"
+                    and toks[j + 2].kind == "OP" and toks[j + 2].val == "{"):
+                self.record_names.add(toks[j + 1].val)
     def peek(self, k=0): return self.t[min(self.i+k, len(self.t)-1)]
     def at(self, kind, val=None):
         x = self.peek()
@@ -265,6 +312,10 @@ class Parser:
         self.expect("OP", "}"); return out
     def statement(self):
         x = self.peek()
+        if (x.kind == "IDENT" and x.val == "record"
+                and self.peek(1).kind == "IDENT"
+                and self.peek(2).kind == "OP" and self.peek(2).val == "{"):
+            return self.record_decl()
         if x.kind == "KW" and x.val == "import":
             self.take(); path = self.expect("STRING").val
             alias = None
@@ -313,6 +364,25 @@ class Parser:
         if x.kind == "IDENT" and self.peek(1).kind == "OP" and self.peek(1).val == ":=":
             name = self.take().val; self.take(); return Assign(name, self.expr(), x.line, x.col)
         return ExprStmt(self.expr(), x.line, x.col)
+    def record_decl(self):
+        x = self.take()  # `record`
+        name = self.expect("IDENT").val
+        self.skip_nl()
+        self.expect("OP", "{")
+        self.skip_seps()
+        fields = []
+        while not self.at("OP", "}"):
+            if self.at("EOF"):
+                e = self.peek(); raise GamaError("unterminated record declaration", e.line, e.col)
+            fn = self.expect("IDENT").val
+            self.expect("OP", ":")
+            ft = self.expect("IDENT").val
+            fields.append((fn, ft))
+            self.skip_seps()
+            if self.at("OP", ","):
+                self.take(); self.skip_seps()
+        self.expect("OP", "}")
+        return RecordDecl(name, fields, x.line, x.col)
     def fn(self):
         x = self.take(); name = self.expect("IDENT").val; self.expect("OP", "("); self.skip_nl()
         params = []
@@ -469,6 +539,20 @@ class Parser:
                         if not self.at("OP", ","): break
                         self.take(); self.skip_nl()
                 self.expect("OP", ")"); return Call(name, args, x.line, x.col)
+            if name in self.record_names and self.at("OP", "{"):
+                # Named record literal: Point { x: 3, y: 4 }
+                self.take(); self.skip_nl(); pairs = []
+                if not self.at("OP", "}"):
+                    while True:
+                        k = self.take()
+                        if k.kind not in ("IDENT", "STRING", "KW"):
+                            raise GamaError("record field name expected", k.line, k.col)
+                        self.expect("OP", ":"); self.skip_nl()
+                        pairs.append((str(k.val), self.expr())); self.skip_nl()
+                        if not self.at("OP", ","): break
+                        self.take(); self.skip_nl()
+                self.expect("OP", "}")
+                return RecordLit(name, pairs, x.line, x.col)
             return Var(name, x.line, x.col)
         if x.kind == "OP" and x.val == "(":
             self.take(); self.skip_nl(); e = self.expr(); self.skip_nl(); self.expect("OP", ")"); return e
@@ -498,6 +582,7 @@ def parse(src: str):
 # ------------------------------------------------------------------ types / checker
 NUM = {"Int", "Decimal"}
 def tname(v) -> str:
+    if isinstance(v, RecordVal): return v.type_name
     if isinstance(v, ResultVal): return "Result"
     if isinstance(v, FunctionVal): return "Function"
     if v is None: return "Null"
@@ -953,6 +1038,7 @@ class Checker:
     def __init__(self):
         self.scope: list[dict[str, str]] = [{}]
         self.funcs: dict[str, Fn] = {}
+        self.records: dict[str, RecordDecl] = {}
         self.effects: set[str] = set()
         self.ret_type: str | None = None
         self.loop_depth = 0
@@ -965,9 +1051,36 @@ class Checker:
     def set(self, n, t): self.scope[-1][n] = t
     def program(self, stmts):
         for s in stmts:
+            if isinstance(s, RecordDecl):
+                if s.name in self.records:
+                    e = GamaTypeError(f"duplicate record {s.name}", s.line, s.col)
+                    e.src = getattr(s, "_src", None)
+                    raise e
+                if s.name in BUILTINS:
+                    e = GamaTypeError(
+                        f"record {s.name} collides with an existing name",
+                        s.line, s.col)
+                    e.src = getattr(s, "_src", None)
+                    raise e
+                seen = set()
+                for fn, _ft in s.fields:
+                    if fn in seen:
+                        e = GamaTypeError(
+                            f"record {s.name}: duplicate field {fn}", s.line, s.col)
+                        e.src = getattr(s, "_src", None)
+                        raise e
+                    seen.add(fn)
+                self.records[s.name] = s
+        for s in stmts:
             if isinstance(s, Fn):
                 if s.name in self.funcs:
                     e = GamaTypeError("duplicate function", s.line, s.col)
+                    e.src = getattr(s, "_src", None)
+                    raise e
+                if s.name in self.records:
+                    e = GamaTypeError(
+                        f"function {s.name} collides with record {s.name}",
+                        s.line, s.col)
                     e.src = getattr(s, "_src", None)
                     raise e
                 self.funcs[s.name] = s
@@ -982,6 +1095,8 @@ class Checker:
         if isinstance(s, Import):
             raise GamaError("import requires check_file/run_file", s.line, s.col)
         if isinstance(s, Use):
+            return
+        if isinstance(s, RecordDecl):
             return
         if isinstance(s, For):
             t = self.expr(s.iterable)
@@ -1100,6 +1215,30 @@ class Checker:
             if self.ret_type not in ("Result", "Any"):
                 raise GamaTypeError("? requires function returning Result", e.line, e.col)
             return "Any"
+        if isinstance(e, RecordLit):
+            rec = self.records.get(e.name)
+            if rec is None:
+                raise GamaTypeError(f"unknown record {e.name}", e.line, e.col)
+            decl = dict(rec.fields)
+            seen = set()
+            for k, val in e.fields:
+                if k in seen:
+                    raise GamaTypeError(
+                        f"{e.name}: duplicate field {k}", e.line, e.col)
+                seen.add(k)
+                if k not in decl:
+                    raise GamaTypeError(
+                        f"{e.name}: unknown field {k}", e.line, e.col)
+                at = self.expr(val, row)
+                if not self.compat(at, decl[k]):
+                    raise GamaTypeError(
+                        f"{e.name}.{k}: {at} != {decl[k]}", e.line, e.col)
+            missing = [fn for fn, _ft in rec.fields if fn not in seen]
+            if missing:
+                raise GamaTypeError(
+                    f"{e.name}: missing field{'s' if len(missing) > 1 else ''} "
+                    + ", ".join(missing), e.line, e.col)
+            return e.name
         if isinstance(e, Attr):
             t = self.expr(e.base)
             if t not in ("Json", "Any", "Table"): raise GamaTypeError("field access needs Json/Table", e.line, e.col)
@@ -1112,8 +1251,21 @@ class Checker:
             if "." in e.name:
                 parts = e.name.split(".")
                 for i in range(len(parts) - 1, 0, -1):
-                    if self.get(".".join(parts[:i])) is not None:
-                        return "Any"
+                    base = self.get(".".join(parts[:i]))
+                    if base is None:
+                        continue
+                    t = base
+                    for part in parts[i:]:
+                        if t in self.records:
+                            fmap = dict(self.records[t].fields)
+                            if part not in fmap:
+                                raise GamaTypeError(
+                                    f"unknown field {part!r} on {t}",
+                                    e.line, e.col)
+                            t = fmap[part]
+                        else:
+                            t = "Any"
+                    return t
             if row is not None:
                 if e.name in row: return "Any"
                 raise GamaTypeError(f"unknown column {e.name!r}", e.line, e.col)
@@ -1142,6 +1294,18 @@ class Checker:
             if a != b and not (a in NUM and b in NUM): raise GamaTypeError("== expects matching types", e.line, e.col)
             return "Bool"
         if isinstance(e, Call):
+            if e.name in self.records:
+                rec = self.records[e.name]
+                if len(e.args) != len(rec.fields):
+                    raise GamaTypeError(
+                        f"{e.name} expects {len(rec.fields)} fields, got "
+                        f"{len(e.args)}", e.line, e.col)
+                for (fn, ft), a in zip(rec.fields, e.args):
+                    at = self.expr(a, row)
+                    if not self.compat(at, ft):
+                        raise GamaTypeError(
+                            f"{e.name}.{fn}: {at} != {ft}", e.line, e.col)
+                return e.name
             if e.name in BUILTINS:
                 eff, rt = BUILTINS[e.name]
                 self.effects |= eff
@@ -1255,7 +1419,7 @@ _ALIAS_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # namespace MVP. Top-level `let` values are evaluated at import time and
 # exposed as `alias.name`; module functions keep seeing them through the same
 # renamed binding.
-_ALIAS_ALLOWED_TOPLEVEL = (Fn, Let, Import, Use)
+_ALIAS_ALLOWED_TOPLEVEL = (Fn, Let, Import, Use, RecordDecl)
 _STMT_KIND = {Let: "let", Assign: "assignment", Print: "print",
               Prove: "prove", Verify: "verify",
               ExprStmt: "expression statement"}
@@ -1293,6 +1457,37 @@ def _rename_refs(node, mapping):
                        args=[_rename_refs(a, mapping) for a in node.args])
     if isinstance(node, Var):
         return replace(node, name=mapping.get(node.name, node.name))
+    if isinstance(node, RecordDecl):
+        return replace(
+            node, name=mapping.get(node.name, node.name),
+            fields=[(fn, mapping.get(ft, ft)) for fn, ft in node.fields])
+    if isinstance(node, RecordLit):
+        return replace(
+            node, name=mapping.get(node.name, node.name),
+            fields=[(k, _rename_refs(v, mapping)) for k, v in node.fields])
+    if isinstance(node, Let):
+        return replace(
+            node, name=mapping.get(node.name, node.name),
+            type_name=(mapping.get(node.type_name, node.type_name)
+                       if node.type_name else node.type_name),
+            expr=_rename_refs(node.expr, mapping))
+    if isinstance(node, Param):
+        return replace(
+            node, type_name=mapping.get(node.type_name, node.type_name),
+            default=(_rename_refs(node.default, mapping)
+                     if node.default is not None else None))
+    if isinstance(node, Fn):
+        return replace(
+            node, name=mapping.get(node.name, node.name),
+            ret=(mapping.get(node.ret, node.ret) if node.ret else node.ret),
+            params=[_rename_refs(p, mapping) for p in node.params],
+            body=_rename_refs(node.body, mapping))
+    if isinstance(node, Lambda):
+        return replace(
+            node,
+            ret=(mapping.get(node.ret, node.ret) if node.ret else node.ret),
+            params=[_rename_refs(p, mapping) for p in node.params],
+            body=_rename_refs(node.body, mapping))
     if is_dataclass(node):
         changes = {}
         for f in fields(node):
@@ -1346,7 +1541,7 @@ def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
     # generated `alias.fn` names must not clash with them.
     declared = set()
     for s in ast:
-        if isinstance(s, (Fn, Let, Assign, Use)):
+        if isinstance(s, (Fn, Let, Assign, Use, RecordDecl)):
             declared.add(s.name)
     out = []
     aliases = set()
@@ -1388,7 +1583,7 @@ def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
             # Every exported declaration is renamed to `alias.name`; the
             # mapping is also applied inside each node so module functions and
             # constants keep referring to their siblings through the namespace.
-            sub_decls = [st for st in sub if isinstance(st, (Fn, Let))]
+            sub_decls = [st for st in sub if isinstance(st, (Fn, Let, RecordDecl))]
             mapping = {st.name: s.alias + "." + st.name for st in sub_decls}
             for st in sub_decls:
                 new_name = mapping[st.name]
@@ -1579,7 +1774,7 @@ def _ledger_scan(data):
 
 class Interpreter:
     def __init__(self, interactive=False):
-        self.env = Env(); self.funcs = {}; self.out = []; self.memory = {}
+        self.env = Env(); self.funcs = {}; self.records = {}; self.out = []; self.memory = {}
         self.proofs = {}; self.proof_chain = []; self.prev_proof = "GENESIS"; self.interactive = interactive
         self._ledger_records = []; self._ledger_problems = []
         self.last_ask = None
@@ -1786,6 +1981,11 @@ class Interpreter:
         self.out_chars = total
     def run(self, stmts):
         try:
+            # Record declarations are nominal and may be referenced before the
+            # declaration line; register them up front like the checker does.
+            for s in stmts:
+                if isinstance(s, RecordDecl):
+                    self.records[s.name] = s
             for s in stmts: self.stmt(s, self.env)
         except PropagateSignal:
             raise GamaRuntimeError("? outside function") from None
@@ -1795,6 +1995,7 @@ class Interpreter:
         if isinstance(s, Let): env.set(s.name, self.expr(s.expr, env))
         elif isinstance(s, Assign): env.assign(s.name, self.expr(s.expr, env))
         elif isinstance(s, Use): pass
+        elif isinstance(s, RecordDecl): self.records[s.name] = s
         elif isinstance(s, For):
             seq = self.expr(s.iterable, env)
             if isinstance(seq, str): seq = list(seq)
@@ -1862,6 +2063,7 @@ class Interpreter:
             if isinstance(v, Decimal): return format(v, "f")
             if isinstance(v, (dict, list)):
                 return json.dumps(v, ensure_ascii=False, default=str)
+            if isinstance(v, RecordVal): return str(v)
             if isinstance(v, ResultVal): return str(v)
             return str(v)
         except (ValueError, OverflowError) as ex:
@@ -2011,6 +2213,26 @@ class Interpreter:
         """
         self._expr_tick(getattr(e, "line", 0), getattr(e, "col", 0))
         if isinstance(e, Literal): return e.value
+        if isinstance(e, RecordLit):
+            rec = self.records.get(e.name)
+            if rec is None:
+                raise GamaRuntimeError(f"unknown record {e.name}", e.line, e.col)
+            decl = dict(rec.fields)
+            values = {}
+            for k, val in e.fields:
+                if k in values:
+                    raise GamaRuntimeError(
+                        f"{e.name}: duplicate field {k}", e.line, e.col)
+                if k not in decl:
+                    raise GamaRuntimeError(
+                        f"{e.name}: unknown field {k}", e.line, e.col)
+                values[k] = self.expr(val, env, row)
+            missing = [fn for fn, _ft in rec.fields if fn not in values]
+            if missing:
+                raise GamaRuntimeError(
+                    f"{e.name}: missing field{'s' if len(missing) > 1 else ''} "
+                    + ", ".join(missing), e.line, e.col)
+            return RecordVal(e.name, {fn: values[fn] for fn, _ft in rec.fields})
         if isinstance(e, Lambda):
             return FunctionVal(e.params, e.ret, e.effects, e.body, env)
         if isinstance(e, ListExpr): return [self.expr(x, env, row) for x in e.items]
@@ -2051,6 +2273,12 @@ class Interpreter:
                 if base_n is None: raise
                 obj = env.get(".".join(parts[:base_n]))
                 for part in parts[base_n:]:
+                    if isinstance(obj, RecordVal):
+                        if part not in obj.fields:
+                            raise GamaRuntimeError(
+                                f"unknown field {e.name}", e.line, e.col)
+                        obj = obj.fields[part]
+                        continue
                     if isinstance(obj, dict) and part not in obj and isinstance(obj.get("value"), dict):
                         obj = obj["value"]
                     if not isinstance(obj, dict) or part not in obj:
@@ -2075,6 +2303,15 @@ class Interpreter:
             except (ZeroDivisionError, ArithmeticError, TypeError, ValueError) as ex:
                 raise GamaRuntimeError(f"{e.op}: {ex}", e.line, e.col) from None
         if isinstance(e, Call):
+            if e.name in self.records:
+                rec = self.records[e.name]
+                if len(e.args) != len(rec.fields):
+                    raise GamaRuntimeError(
+                        f"{e.name} expects {len(rec.fields)} fields, got "
+                        f"{len(e.args)}", e.line, e.col)
+                vals = [self.expr(a, env, row) for a in e.args]
+                return RecordVal(e.name, {fn: v for (fn, _ft), v in
+                                          zip(rec.fields, vals)})
             if e.name in ("Ok", "Err"):
                 if len(e.args) != 1: raise GamaRuntimeError(f"{e.name} expects 1 arg", e.line, e.col)
                 return ResultVal(e.name == "Ok", self.expr(e.args[0], env, row))
