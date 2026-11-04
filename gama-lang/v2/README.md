@@ -112,7 +112,7 @@ python3 gamal2.py fmt --write file.gm  # write in place
   `GAMA_L_AI_MODEL`, `GAMA_L_AI_ALLOW_HTTP=1` for local HTTP; HTTPS by default,
   retries 429/5xx, 1 MiB response cap; redirects are refused
 - `prove` (hash-chained receipt, optional HMAC via `GAMA_L_PROOF_KEY`, optional persistent JSONL ledger via `GAMA_L_PROOF_LEDGER`) and `verify` (tamper detection)
-- runtime limits via `GAMA_L_MAX_CALL_DEPTH` (default 1000) and `GAMA_L_MAX_OUTPUT_CHARS` (default 1000000)
+- runtime limits via `GAMA_L_MAX_CALL_DEPTH` (default 1000; CPython frames may trigger first, lower it for predictable caps) and `GAMA_L_MAX_OUTPUT_CHARS` (default 1000000)
 - static type errors and static effect violations
 - CLI `run`, `check`, `fmt`, `test`, `pkg`, `lsp`
 
