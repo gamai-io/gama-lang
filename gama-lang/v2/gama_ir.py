@@ -410,6 +410,11 @@ class _Compiler:
             self.emit("LET", stmt.name)
             return
         if isinstance(stmt, g2.Assign):
+            if "." in stmt.name:
+                # Field assignment mutates a record in place; the IR value
+                # model has no record mutation, so reject it instead of
+                # silently creating a shadow variable.
+                _unsupported(stmt, "record field assignment")
             self.compile_expr(stmt.expr)
             self.emit("ASSIGN", stmt.name)
             return

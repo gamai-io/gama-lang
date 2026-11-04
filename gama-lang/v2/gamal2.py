@@ -1422,7 +1422,9 @@ class Checker:
         elif isinstance(s, Assign):
             t = self.expr(s.expr)
             cur = self.get(s.name)
-            if cur is None: self.set(s.name, t)
+            if cur is None and "." in s.name:
+                self.check_field_assign(s, t)
+            elif cur is None: self.set(s.name, t)
             elif t != "Any" and not self.compat(t, cur): raise GamaTypeError(f"{s.name}: {t} != {cur}", s.line, s.col)
         elif isinstance(s, Fn):
             self.fn(s)
@@ -1462,6 +1464,41 @@ class Checker:
         self.pop()
     def compat(self, got, want):
         return want in ("Any", got) or (want in NUM and got in NUM) or (want == "List" and got in ("List", "Table"))
+    def check_field_assign(self, s, value_type):
+        """Validate a dotted assignment target ``base.field[.field...]``.
+
+        The longest dotted prefix that names a variable is the receiver; the
+        remaining segments must be record fields, the last one being the
+        assigned field. The checker never records a shadow variable for the
+        dotted target, so later reads still resolve through the base record.
+        """
+        parts = s.name.split(".")
+        base_n = None
+        for i in range(len(parts) - 1, 0, -1):
+            if self.get(".".join(parts[:i])) is not None:
+                base_n = i
+                break
+        if base_n is None:
+            raise GamaTypeError(
+                f"unknown variable {parts[0]} in assignment target {s.name}",
+                s.line, s.col)
+        t = self.get(".".join(parts[:base_n]))
+        for part in parts[base_n:-1]:
+            t = self.record_field_type(t, part, s)
+        ftype = self.record_field_type(t, parts[-1], s)
+        if value_type != "Any" and not self.compat(value_type, ftype):
+            raise GamaTypeError(f"{s.name}: {value_type} != {ftype}",
+                                s.line, s.col)
+    def record_field_type(self, t, field, s):
+        if t not in self.records:
+            raise GamaTypeError(
+                f"cannot assign field {field!r} on non-record type {t}",
+                s.line, s.col)
+        fmap = dict(self.records[t].fields)
+        if field not in fmap:
+            raise GamaTypeError(f"unknown field {field!r} on {t}",
+                                s.line, s.col)
+        return fmap[field]
     def expr(self, e, row=None) -> str:
         if isinstance(e, Literal): return tname(e.value)
         if isinstance(e, Lambda):
@@ -2347,7 +2384,12 @@ class Interpreter:
     def stmt(self, s, env):
         self._tick(s.line, s.col)
         if isinstance(s, Let): env.set(s.name, self.expr(s.expr, env))
-        elif isinstance(s, Assign): env.assign(s.name, self.expr(s.expr, env))
+        elif isinstance(s, Assign):
+            value = self.expr(s.expr, env)
+            if "." in s.name and not self.env_has(env, s.name):
+                self.assign_field(s.name, value, env, s.line, s.col)
+            else:
+                env.assign(s.name, value)
         elif isinstance(s, Use): pass
         elif isinstance(s, RecordDecl): self.records[s.name] = s
         elif isinstance(s, EnumDecl):
@@ -2600,6 +2642,46 @@ class Interpreter:
                 "call depth exceeded the Python recursion limit", line, col) from None
         finally:
             self.call_depth -= 1
+    @staticmethod
+    def env_has(env, name):
+        try:
+            env.get(name)
+            return True
+        except GamaRuntimeError:
+            return False
+    def assign_field(self, name, value, env, line, col):
+        """Mutate a record field in place for a dotted assignment target.
+
+        The longest dotted prefix bound in ``env`` is the receiver; remaining
+        segments descend through nested records. Only ``RecordVal`` receivers
+        are supported: JSON/dict field assignment is a static type error.
+        """
+        parts = name.split(".")
+        base_n = None
+        for i in range(len(parts) - 1, 0, -1):
+            if self.env_has(env, ".".join(parts[:i])):
+                base_n = i
+                break
+        if base_n is None:
+            raise GamaRuntimeError(
+                f"unknown variable {parts[0]} in assignment target {name}",
+                line, col)
+        obj = env.get(".".join(parts[:base_n]))
+        for part in parts[base_n:-1]:
+            if not isinstance(obj, RecordVal):
+                raise GamaRuntimeError(
+                    f"cannot assign field {part!r} on non-record value",
+                    line, col)
+            if part not in obj.fields:
+                raise GamaRuntimeError(f"unknown field {name}", line, col)
+            obj = obj.fields[part]
+        if not isinstance(obj, RecordVal):
+            raise GamaRuntimeError(
+                f"cannot assign field {parts[-1]!r} on non-record value",
+                line, col)
+        if parts[-1] not in obj.fields:
+            raise GamaRuntimeError(f"unknown field {name}", line, col)
+        obj.fields[parts[-1]] = value
     def expr(self, e, env, row=None):
         """Evaluate one expression node and count it as one expression step.
 
