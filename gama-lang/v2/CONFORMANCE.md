@@ -44,25 +44,34 @@ clock, and every `GAMA_L_*` environment variable is stripped for each case.
 These are outside the T1–T10 checks or only partially covered; see
 `README.md` → *Not implemented yet*:
 
-1. **Proof chain bound to intent/lease (beyond T6).** The optional
-   `GAMA_L_PROOF_LEDGER=<file>` JSONL ledger provides persistent receipts and
-   cross-run idempotency, but binding a receipt to a specific intent or lease is
-   still roadmap. The ledger is append-only with no compaction or key rotation.
-2. **Real namespaced modules/exports.** `use` is currently a no-op; only
-   `import "file.gm"` is implemented.
-3. **Compiler pipeline / IR / bytecode and runtime limits.** The default runtime
-   is a tree-walking interpreter. An opt-in standalone bytecode IR prototype
-   (`gama_ir.py`, `gamal2 ir run|compile`) covers a documented subset but is not
-   the production path and has no production resource budget.
+1. **External intent/lease registry with expiry/revocation (beyond T6).** The
+   optional `GAMA_L_PROOF_LEDGER=<file>` JSONL ledger provides persistent
+   receipts and cross-run idempotency, and receipts can bind to
+   `GAMA_L_PROOF_INTENT`/`GAMA_L_PROOF_LEASE` with mismatch rejection. There is
+   no external registry, expiry, or revocation; the ledger is append-only with
+   no compaction or key rotation (the separate `gama_ledger.py` tool can verify
+   and explicitly truncate to a valid prefix, never silently).
+2. **Full export lists / renamed exports.** Aliased imports expose top-level
+   `fn` definitions and `let` constants; side-effect top-level statements are
+   rejected and `use` remains a no-op. Explicit export lists and renamed exports
+   are not implemented.
+3. **Compiler/IR integration and production resource budget.** A standalone
+   bytecode IR prototype (`gama_ir.py`) covers a documented subset and is
+   exposed via the opt-in `gamal2 ir run|compile` CLI, but it is not the
+   production run path. Runtime limits are enforced (call depth, output,
+   statement/expression steps, loop limit); there is no production resource
+   budget or cost model.
 4. **Full type system.** No full inference; records/enums/generics are missing.
 5. **Full AST formatter.** `fmt` is token-based; it preserves comments and
    strings but does not reflow multi-line strings (T10 still passes on
    determinism).
 6. **Deployed public registry, marketplace signing, published release.**
    Build/checksums and a local HTTP registry exist; publishing does not.
-7. **Full standard library** (`sql`, `http`, `mail`, `memory`, `proof`, `table`)
-   and the “one real example: invoice → SQL/ERP → proof with no hidden effects”
-   deliverable are only partially present.
+7. **Full standard library.** `sql`, `mail`, `memory`, and `proof` are present
+   (SQL uses the demo table or a read-only SQLite DB; mail is SMTP-gated); `http`
+   and a full `table` module are not implemented. The invoice demo exists as
+   `examples/invoice.gm` (SQL → pipe → `prove`/`verify`) but runs on the demo
+   table and a mock invoice, not a real ERP.
 
 ## Method
 

@@ -1,8 +1,14 @@
 name: ci
 on: [push, pull_request]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       matrix:
         python: ["3.10", "3.12"]
@@ -15,9 +21,22 @@ jobs:
         run: python3 -m unittest discover -s gama-lang/v2/tests -v
       - name: Run invoice example
         run: python3 gama-lang/v2/gamal2.py run gama-lang/v2/examples/invoice.gm
+      - name: Doctor (JSON)
+        working-directory: gama-lang/v2
+        run: python3 gamal2.py doctor --json
+      - name: Validate VS Code JSON
+        run: |
+          python3 -m json.tool gama-lang/v2/vscode/package.json > /dev/null
+          python3 -m json.tool gama-lang/v2/vscode/language-configuration.json > /dev/null
+          python3 -m json.tool gama-lang/v2/vscode/syntaxes/gama-l.tmLanguage.json > /dev/null
+          python3 -m json.tool gama-lang/v2/vscode/snippets/gama-l.json > /dev/null
+      - name: VS Code extension smoke test
+        working-directory: gama-lang/v2/vscode
+        run: node smoke.js
 
   release:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

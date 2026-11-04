@@ -218,6 +218,7 @@ error messages keep the interpreter's text and line/col.
 ```bash
 python3 -m unittest discover -s tests -v   # 1035/1035
 python3 gamal2.py doctor --json                # 8/8 checks
+../../scripts/ci_local.sh                      # py_compile + tests + doctor + VS Code JSON/smoke
 ```
 
 Conformance coverage: arithmetic/pipes (20 cases), type errors, effect
@@ -237,7 +238,7 @@ Conformance: see `CONFORMANCE.md` (SPEC 2.0 T1–T10: **PASS 10/10**, including 
 
 - deployed/public package registry (the HTTP server is implemented and testable)
 - full export lists/renamed exports; aliased modules export only `fn` definitions and top-level `let` constants, while side-effect top-level statements are rejected (`use` stays a no-op)
-- external intent/lease registry with expiry/revocation; IR/bytecode and expression-level step accounting
+- external intent/lease registry with expiry/revocation (env-bound intent/lease receipts are implemented; there is no external registry)
 - full type inference, records/enums/generics
 - full AST formatter (current `fmt` is token-based, preserves comments and
   strings, but does not reformat multi-line strings)
