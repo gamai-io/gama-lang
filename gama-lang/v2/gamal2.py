@@ -1206,12 +1206,15 @@ def _project_root(entry: pathlib.Path) -> pathlib.Path:
 
 _ALIAS_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-# Aliased modules expose only `fn` definitions. Everything else at the top
-# level would be silently dropped by the bounded namespace MVP, which turns
-# module-level state into a confusing runtime error later on. Reject it up
-# front instead. `use` is allowed because it is a harmless no-op in both the
-# checker and the interpreter.
-_ALIAS_ALLOWED_TOPLEVEL = (Fn, Import, Use)
+# Aliased modules expose `fn` definitions and top-level `let` constants.
+# Plain imports (flattened inside the module) and `use` are allowed as
+# declaration/no-op statements. Everything else at the top level is a side
+# effect (print/prove/verify/loops/assignments/expression statements) and is
+# rejected up front instead of being silently dropped by the bounded
+# namespace MVP. Top-level `let` values are evaluated at import time and
+# exposed as `alias.name`; module functions keep seeing them through the same
+# renamed binding.
+_ALIAS_ALLOWED_TOPLEVEL = (Fn, Let, Import, Use)
 _STMT_KIND = {Let: "let", Assign: "assignment", Print: "print",
               Prove: "prove", Verify: "verify",
               ExprStmt: "expression statement"}
@@ -1220,7 +1223,8 @@ def _alias_toplevel_error(stmt, alias: str) -> GamaError:
     kind = _STMT_KIND.get(type(stmt), type(stmt).__name__.lower())
     return GamaError(
         "aliased import %r: unsupported top-level statement %r "
-        "(only fn definitions, plain imports, and use are allowed)"
+        "(only fn definitions, top-level let constants, plain imports, "
+        "and use are allowed)"
         % (alias, kind),
         getattr(stmt, "line", 0), getattr(stmt, "col", 0))
 
@@ -1320,7 +1324,7 @@ def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
                     if isinstance(st, Fn):
                         declared.add(st.name)
                 continue
-            # Namespaced import: bounded MVP exposes only fn definitions.
+            # Namespaced import: expose fn definitions and let constants.
             if not _ALIAS_IDENT.match(s.alias):
                 raise GamaError("invalid import alias %r" % s.alias, s.line, s.col)
             if s.alias in aliases:
@@ -1340,9 +1344,12 @@ def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
                 if ex.src is None:
                     ex.src = str(target)
                 raise
-            sub_fns = [st for st in sub if isinstance(st, Fn)]
-            mapping = {st.name: s.alias + "." + st.name for st in sub_fns}
-            for st in sub_fns:
+            # Every exported declaration is renamed to `alias.name`; the
+            # mapping is also applied inside each node so module functions and
+            # constants keep referring to their siblings through the namespace.
+            sub_decls = [st for st in sub if isinstance(st, (Fn, Let))]
+            mapping = {st.name: s.alias + "." + st.name for st in sub_decls}
+            for st in sub_decls:
                 new_name = mapping[st.name]
                 if new_name in declared:
                     raise GamaError(

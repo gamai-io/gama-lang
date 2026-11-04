@@ -30,14 +30,27 @@ class NamespaceTests(unittest.TestCase):
         it = G.run_file(str(self.root / "main.gm"))
         self.assertEqual(it.out, ["5"])
 
-    def test_alias_rejects_top_level_let(self):
-        self._write("lib.gm", 'let hidden = 7\n')
-        self._write("main.gm", 'import "lib.gm" as math\nprint math.add(2,3)\n')
-        with self.assertRaisesRegex(
-            G.GamaError,
-            r"aliased import 'math'.*unsupported top-level statement 'let'",
-        ):
-            G.run_file(str(self.root / "main.gm"))
+    def test_namespaced_constant_read_from_main(self):
+        self._write("lib.gm", 'let pi: Decimal = 3.14\n')
+        self._write("main.gm", 'import "lib.gm" as math\nprint math.pi\n')
+        it = G.run_file(str(self.root / "main.gm"))
+        self.assertEqual(it.out, ["3.14"])
+
+    def test_module_function_reads_module_constant(self):
+        self._write("lib.gm", 'let factor = 10\n'
+                              'fn scale(x: Int) -> Int effects {} { return x * factor }\n')
+        self._write("main.gm", 'import "lib.gm" as math\nprint math.scale(3)\n')
+        it = G.run_file(str(self.root / "main.gm"))
+        self.assertEqual(it.out, ["30"])
+
+    def test_constant_before_function_reference(self):
+        # A constant declared before an unrelated function is in scope when
+        # that function body is checked and executed.
+        self._write("lib.gm", 'let base = 5\n'
+                              'fn plus(x: Int) -> Int effects {} { return base + x }\n')
+        self._write("main.gm", 'import "lib.gm" as math\nprint math.plus(2)\n')
+        it = G.run_file(str(self.root / "main.gm"))
+        self.assertEqual(it.out, ["7"])
 
     def test_alias_rejects_top_level_print(self):
         self._write("lib.gm", 'print "MODULE SIDE EFFECT"\n')
@@ -88,15 +101,28 @@ class NamespaceTests(unittest.TestCase):
         with self.assertRaises(G.GamaTypeError):
             G.run_file(str(self.root / "main.gm"))
 
-    def test_top_level_let_not_exposed_under_alias(self):
+    def test_missing_constant_is_rejected(self):
         self._write("lib.gm", 'let value = 5\n')
+        self._write("main.gm", 'import "lib.gm" as math\nprint math.missing\n')
+        with self.assertRaisesRegex(G.GamaTypeError, "unknown variable math.missing"):
+            G.run_file(str(self.root / "main.gm"))
+
+    def test_duplicate_constant_name_in_module_rejected(self):
+        self._write("lib.gm", 'let value = 5\nlet value = 6\n')
         self._write("main.gm", 'import "lib.gm" as math\nprint math.value\n')
-        # A module-level `let` is no longer silently dropped: the alias now
-        # fails loudly, naming the alias, the statement kind and its position.
         with self.assertRaisesRegex(
-            G.GamaError,
-            r"aliased import 'math'.*unsupported top-level statement 'let'.*"
-            r"line 1, col 1",
+            G.GamaError, r"import alias 'math' produces duplicate name 'math.value'"
+        ):
+            G.run_file(str(self.root / "main.gm"))
+
+    def test_constant_collides_with_existing_top_level_name(self):
+        self._write("lib.gm", 'let value = 5\n')
+        self._write(
+            "main.gm",
+            'let math.value = 1\nimport "lib.gm" as math\nprint math.value\n',
+        )
+        with self.assertRaisesRegex(
+            G.GamaError, r"import alias 'math' produces duplicate name 'math.value'"
         ):
             G.run_file(str(self.root / "main.gm"))
 

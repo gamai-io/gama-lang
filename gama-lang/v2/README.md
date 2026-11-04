@@ -61,13 +61,16 @@ Completion covers the current keywords, types (`Function`, `Result`, `Table`,
 names, and import aliases. For `import "lib.gm" as <cursor>` the only
 inferable alias is a sanitized module filename stem; it is omitted when it
 collides with a top-level name or an existing alias. After `alias.`, completion
-and hover read the imported file's direct top-level `fn` declarations.
+and hover read the imported file's direct top-level `fn` declarations
+(namespaced completion does not list module `let` constants yet).
 Signature help works for known builtins, user `fn`/lambda-typed `let` values,
 and namespaced module functions.
 
-Tooling limitations: namespaced completion does not follow re-exported imports
-and never exposes a module's top-level `let` values; the core rejects any
-non-`fn` top-level statement under an alias (`use` is allowed as a no-op).
+The core exposes a module's top-level `let` constants as `alias.name`, typed
+and evaluated at import time, and module functions see the same renamed
+binding. Any other non-declaration top-level statement under an alias
+(`print`, `prove`, `verify`, loops, assignments, expression statements) is
+rejected (`use` is allowed as a no-op).
 Builtin parameter names are LSP-only labels, since the core has no
 builtin parameter names. Diagnostics still use the in-memory `check(text)`
 path, so a document with an `import` reports the core's "import requires
@@ -112,7 +115,7 @@ python3 gamal2.py fmt --write file.gm  # write in place
 ## Implemented
 
 - `import "file.gm"` with cycle detection (relative to the importing file)
-- module namespaces: `import "lib.gm" as math`, then `math.add(2,3)`; plain imports still flatten (including top-level `let`); aliased modules expose only `fn` definitions and reject other top-level statements (`use` is allowed as a harmless no-op)
+- module namespaces: `import "lib.gm" as math`, then `math.add(2,3)` and `math.pi`; plain imports still flatten (including top-level `let`); aliased modules expose top-level `let` constants and `fn` definitions, evaluated at import time, and reject side-effect top-level statements (`use` is allowed as a harmless no-op)
 - `let` with optional type annotation, `:=` assignment
 - `fn` and SPEC `make` with typed parameters, defaults, return type, `effects { ... }`
 - first-class functions and lambdas: `fn(x: Int) -> Int { ... }`, `let f = ...`, `f(41)`, passing functions as values, named functions as values after definition, IIFE `(fn...)(41)`, and recursive lambdas
@@ -165,7 +168,7 @@ Conformance: see `CONFORMANCE.md` (SPEC 2.0 T1–T10: **PASS 10/10**, including 
 ## Not implemented yet
 
 - deployed/public package registry (the HTTP server is implemented and testable)
-- full export lists/renamed exports; aliased modules reject non-`fn` top-level statements instead of exporting module state (`use` stays a no-op)
+- full export lists/renamed exports; aliased modules export only `fn` definitions and top-level `let` constants, while side-effect top-level statements are rejected (`use` stays a no-op)
 - external intent/lease registry with expiry/revocation; IR/bytecode and expression-level step accounting
 - full type inference, records/enums/generics
 - full AST formatter (current `fmt` is token-based, preserves comments and
