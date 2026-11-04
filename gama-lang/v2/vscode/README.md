@@ -152,7 +152,7 @@ the v2 core (`gamal2.py`). Result helpers (`unwrap`, `unwrap_or`, `is_ok`,
 
 ## Snippets
 
-Besides `fn`, `let`, `if`, `prove`, pipe, and `import`, the snippet set covers
+Besides `fn`, `let`, `if`, `prove`, pipe, and `import` (plus namespaced `import ... as`, snippet `impas`), the snippet set covers
 the Result flow (`fnres`, `match`, `try`, `ok`, `err`), the core builtins
 (`ask`, `askwith`, `sql`, `sqlwrite`, `remember`, `wait`, `mail`, `round`,
 `len`, `text`, `number`), and functions/lambdas: `lambda`/`fnx` (anonymous

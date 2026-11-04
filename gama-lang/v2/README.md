@@ -90,6 +90,7 @@ python3 gamal2.py fmt --write file.gm  # write in place
 ## Implemented
 
 - `import "file.gm"` with cycle detection (relative to the importing file)
+- module namespaces: `import "lib.gm" as math`, then `math.add(2,3)`; plain imports still flatten
 - `let` with optional type annotation, `:=` assignment
 - `fn` and SPEC `make` with typed parameters, defaults, return type, `effects { ... }`
 - first-class functions and lambdas: `fn(x: Int) -> Int { ... }`, `let f = ...`, `f(41)`, passing functions as values, named functions as values after definition, IIFE `(fn...)(41)`, and recursive lambdas
@@ -111,13 +112,14 @@ python3 gamal2.py fmt --write file.gm  # write in place
   `GAMA_L_AI_MODEL`, `GAMA_L_AI_ALLOW_HTTP=1` for local HTTP; HTTPS by default,
   retries 429/5xx, 1 MiB response cap; redirects are refused
 - `prove` (hash-chained receipt, optional HMAC via `GAMA_L_PROOF_KEY`, optional persistent JSONL ledger via `GAMA_L_PROOF_LEDGER`) and `verify` (tamper detection)
+- runtime limits via `GAMA_L_MAX_CALL_DEPTH` (default 1000) and `GAMA_L_MAX_OUTPUT_CHARS` (default 1000000)
 - static type errors and static effect violations
 - CLI `run`, `check`, `fmt`, `test`, `pkg`, `lsp`
 
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 302/302
+python3 -m unittest discover -s tests -v   # 321/321
 python3 gamal2.py doctor --json                # 8/8 checks
 ```
 
@@ -137,8 +139,8 @@ Conformance: see `CONFORMANCE.md` (SPEC 2.0 T1–T10: **PASS 10/10**, including 
 ## Not implemented yet
 
 - deployed/public package registry (the HTTP server is implemented and testable)
-- real namespace/export modules (`use` is currently a no-op)
-- proof chain bound to intent/lease; IR/bytecode and runtime limits
+- full export lists/renamed exports; aliased modules expose `fn` definitions and ignore other top-level statements
+- proof chain bound to intent/lease; IR/bytecode and a global step limit
 - full type inference, records/enums/generics
 - full AST formatter (current `fmt` is token-based, preserves comments and
   strings, but does not reformat multi-line strings)

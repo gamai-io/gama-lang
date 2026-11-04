@@ -92,6 +92,13 @@
     ],
     "description": "Import another GAMA-L module."
   },
+  "Import module as namespace": {
+    "prefix": "impas",
+    "body": [
+      "import \"${1:lib.gm}\" as ${2:math}"
+    ],
+    "description": "Import a module under a namespace alias."
+  },
   "Result function": {
     "prefix": "fnres",
     "body": [

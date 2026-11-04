@@ -160,7 +160,7 @@
     },
     {
       "name": "keyword.control.gama-l",
-      "match": "\\b(let|fn|make|if|else|return|match|prove|verify|print|effects|filter|select|sum|limit|count|map|in|import|use|wait|for|while|break|continue)\\b"
+      "match": "\\b(let|fn|make|if|else|return|match|prove|verify|print|effects|filter|select|sum|limit|count|map|in|import|as|use|wait|for|while|break|continue)\\b"
     },
     {
       "name": "keyword.operator.try.gama-l",
