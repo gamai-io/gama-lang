@@ -11,6 +11,24 @@
       "match": "#.*$"
     },
     {
+      "name": "meta.import.alias.gama-l",
+      "match": "(\\bimport)\\s+(\"[^\"]*\")\\s+(as)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": {
+          "name": "keyword.control.import.gama-l"
+        },
+        "2": {
+          "name": "string.quoted.double.gama-l"
+        },
+        "3": {
+          "name": "keyword.control.as.gama-l"
+        },
+        "4": {
+          "name": "entity.name.namespace.gama-l"
+        }
+      }
+    },
+    {
       "name": "string.quoted.double.gama-l",
       "begin": "\"",
       "end": "\"",
@@ -169,6 +187,18 @@
     {
       "name": "keyword.operator.gama-l",
       "match": "==|!=|<=|>=|&&|\\|\\||:=|->|\\||[+*/%!<>=]|-"
+    },
+    {
+      "name": "meta.function-call.namespaced.gama-l",
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\.([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+      "captures": {
+        "1": {
+          "name": "entity.name.namespace.gama-l"
+        },
+        "2": {
+          "name": "entity.name.function.call.gama-l"
+        }
+      }
     },
     {
       "name": "entity.name.function.call.gama-l",

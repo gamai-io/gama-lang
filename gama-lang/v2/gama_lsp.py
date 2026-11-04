@@ -145,9 +145,17 @@ def publish(uri: str, text: str):
 KIND_KEYWORD = 14
 KIND_FUNCTION = 3
 KIND_VARIABLE = 6
+KIND_TYPE = 25
 
 NAME_RE = re.compile(r"\b(let|fn)\s+([A-Za-z_]\w*)")
 WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+ALIAS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+IMPORT_RE = re.compile(
+    r'(?m)^\s*import\s+"([^"]+)"(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?')
+IMPORT_ALIAS_CTX_RE = re.compile(
+    r'^\s*import\s+"([^"]*)"\s+as\s+([A-Za-z_][A-Za-z0-9_]*)?$')
+MEMBER_CTX_RE = re.compile(
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)?$")
 
 # short human descriptions for builtins and keyword-like builtins
 DESCRIPTIONS = {
@@ -172,6 +180,86 @@ DESCRIPTIONS = {
     "mail": "`mail`: Sends mail through the mail effect; returns Bool.",
 }
 
+# Call signatures for the current builtins: (parameter labels, return, effects).
+# Effects mirror ``G.BUILTINS``; the labels are tooling-only (the core does not
+# expose parameter names for builtins).
+SIGNATURES = {
+    "sql": (["query: Text"], "Table", {"sql.read"}),
+    "ask": (["question: Text"], "Text", {"ask"}),
+    "remember": (["key: Text", "value: Any"], "Bool", {"memory.write"}),
+    "recall": (["key: Text"], "Any", {"memory.read"}),
+    "wait_user": (["prompt: Text"], "Bool", {"hitl"}),
+    "len": (["value: Any"], "Int", set()),
+    "text": (["value: Any"], "Text", set()),
+    "number": (["value: Any"], "Decimal", set()),
+    "sql_write": (["query: Text"], "Bool", {"sql.write"}),
+    "mail": (["to: Text", "subject: Text", "body: Text"], "Bool", {"mail"}),
+    "round": (["value: Decimal", "digits: Int"], "Decimal", set()),
+    "Ok": (["value: Any"], "Result", set()),
+    "Err": (["error: Any"], "Result", set()),
+    "unwrap": (["value: Result"], "Any", set()),
+    "unwrap_or": (["value: Result", "default: Any"], "Any", set()),
+    "is_ok": (["value: Result"], "Bool", set()),
+    "is_err": (["value: Result"], "Bool", set()),
+    "split": (["text: Text", "separator: Text"], "List", set()),
+    "join": (["values: List", "separator: Text"], "Text", set()),
+    "contains": (["haystack: Text", "needle: Any"], "Bool", set()),
+    "trim": (["text: Text"], "Text", set()),
+    "upper": (["text: Text"], "Text", set()),
+    "lower": (["text: Text"], "Text", set()),
+    "replace": (["text: Text", "old: Text", "new: Text"], "Text", set()),
+    "starts_with": (["text: Text", "prefix: Text"], "Bool", set()),
+    "ends_with": (["text: Text", "suffix: Text"], "Bool", set()),
+    "keys": (["value: Json"], "List", set()),
+    "values": (["value: Json"], "List", set()),
+    "has": (["value: Json", "key: Text"], "Bool", set()),
+}
+
+TYPE_HOVERS = {
+    "Function": "GAMA-L type `Function`: a callable value (lambda or named "
+                "function used as a value); pass it to parameters typed "
+                "`Function`.",
+    "Result": "GAMA-L type `Result`: an `Ok(value)` or `Err(error)` value.",
+    "Table": "GAMA-L type `Table`: a list of row maps returned by `sql`.",
+    "Json": "GAMA-L type `Json`: a map value with text keys.",
+    "List": "GAMA-L type `List`: an ordered sequence of values.",
+    "Any": "GAMA-L type `Any`: the type checker does not constrain this value.",
+    "Null": "GAMA-L type `Null`: the `null` literal.",
+}
+
+
+def _effects_text(effects) -> str:
+    items = sorted(effects or ())
+    return (" effects { " + " ".join(items) + " }") if items else ""
+
+
+def signature_text(name: str, params, ret: str, effects) -> str:
+    return "%s(%s) -> %s%s" % (
+        name, ", ".join(params), ret or "Any", _effects_text(effects))
+
+
+def builtin_signature(name: str):
+    """(label, parameter labels) for a builtin, or None when unknown."""
+    if name not in SIGNATURES:
+        return None
+    params, ret, effects = SIGNATURES[name]
+    return signature_text(name, params, ret, effects), params
+
+
+def _param_label(param) -> str:
+    type_name = getattr(param, "type_name", None) or "Any"
+    return "%s: %s" % (param.name, type_name)
+
+
+def fn_signature(node) -> str:
+    return signature_text(node.name, [_param_label(p) for p in node.params],
+                          node.ret, node.effects)
+
+
+def lambda_signature(node, prefix="fn") -> str:
+    return signature_text(prefix, [_param_label(p) for p in node.params],
+                          node.ret, node.effects)
+
 
 def doc_names(text: str):
     """Return {name: kind} for let/fn declarations in the document."""
@@ -181,24 +269,212 @@ def doc_names(text: str):
     return out
 
 
-def completion(uri: str, text: str):
+def _line_prefix(text: str, line: int, character: int) -> str:
+    rows = (text or "").split("\n")
+    if line < 0 or line >= len(rows):
+        return ""
+    row = rows[line]
+    return row[:utf16_to_index(row, max(0, character))]
+
+
+def _line_text(text: str, line: int) -> str:
+    rows = (text or "").split("\n")
+    return rows[line] if 0 <= line < len(rows) else ""
+
+
+def _imports(text: str):
+    """Return import statements, parsing when possible and regex as fallback."""
+    out = []
+    seen = set()
+    try:
+        program = G.parse(text)
+    except Exception:
+        program = None
+    if program is not None:
+        for node in _walk(program):
+            if isinstance(node, G.Import):
+                key = (node.path, node.alias)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append({"path": node.path, "alias": node.alias,
+                            "line": node.line})
+    for m in IMPORT_RE.finditer(text or ""):
+        path, alias = m.group(1), m.group(2)
+        key = (path, alias)
+        if key in seen:
+            continue
+        seen.add(key)
+        line = (text or "")[:m.start()].count("\n")
+        out.append({"path": path, "alias": alias, "line": line})
+    return out
+
+
+def _alias_map(text: str):
+    out = {}
+    for imp in _imports(text):
+        if imp.get("alias"):
+            out[imp["alias"]] = imp
+    return out
+
+
+def _doc_root(uri: str):
+    p = uri_path(uri)
+    if not p:
+        return None
+    try:
+        return Path(p).resolve().parent
+    except Exception:
+        return None
+
+
+def _resolve_module(uri: str, path: str):
+    """Resolve an import relative to the document, confined to its root."""
+    root = _doc_root(uri)
+    if root is None or not path:
+        return None
+    try:
+        candidates = [root / path,
+                      root / ".gamal" / "modules" / path,
+                      root / "gama_modules" / path]
+    except Exception:
+        return None
+    for candidate in candidates:
+        try:
+            target = candidate.resolve()
+            if target != root and root not in target.parents:
+                continue
+            if target.is_file():
+                return target
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _module_functions(uri: str, path: str):
+    """Direct top-level ``fn`` declarations of an imported module, or None."""
+    target = _resolve_module(uri, path)
+    if target is None:
+        return None
+    try:
+        source = target.read_text(encoding="utf-8")
+        program = G.parse(source)
+    except Exception:
+        return None
+    return [n for n in program if isinstance(n, G.Fn)]
+
+
+def _namespaced_member(text: str, line: int, character: int):
+    """Return ``(alias, member)`` when the cursor is on ``alias.member``."""
+    row = _line_text(text, line)
+    if not row:
+        return None
+    pos = utf16_to_index(row, max(0, character))
+    for m in WORD_RE.finditer(row):
+        if m.start() <= pos <= m.end():
+            before = row[:m.start()]
+            am = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*$", before)
+            if am:
+                return am.group(1), m.group(0)
+            return None
+    return None
+
+
+def _alias_suggestion(path: str, taken) -> str | None:
+    try:
+        stem = Path(path.replace("\\", "/")).stem
+    except Exception:
+        return None
+    candidate = re.sub(r"[^A-Za-z0-9_]", "_", stem)
+    if not candidate:
+        return None
+    if candidate[0].isdigit():
+        candidate = "_" + candidate
+    if not ALIAS_RE.match(candidate) or candidate in taken:
+        return None
+    return candidate
+
+
+def completion(uri: str, text: str, line: int = 0, character: int = 0):
+    prefix = _line_prefix(text, line, character)
+
+    # Alias position: ``import "lib.gm" as <cursor>``. Only a name derived
+    # from the module filename is inferable; arbitrary aliases are not.
+    am = IMPORT_ALIAS_CTX_RE.match(prefix)
+    if am:
+        path, typed = am.group(1), am.group(2) or ""
+        taken = set(doc_names(text)) | set(_alias_map(text))
+        alias = _alias_suggestion(path, taken)
+        items = []
+        if alias and alias.startswith(typed):
+            items.append({
+                "label": alias,
+                "kind": KIND_VARIABLE,
+                "detail": "namespace alias for %s" % path,
+                "documentation": "Import `%s` as `%s`; call members as "
+                                 "`%s.fn(...)`." % (path, alias, alias),
+            })
+        return {"isIncomplete": False, "items": items}
+
+    # Member position: ``alias.<cursor>``. Offer the module's own top-level
+    # functions; re-exported imports and top-level lets are not exposed.
+    mm = MEMBER_CTX_RE.search(prefix)
+    if mm:
+        alias = mm.group(1)
+        imp = _alias_map(text).get(alias)
+        if imp is None:
+            return {"isIncomplete": False, "items": []}
+        fns = _module_functions(uri, imp["path"])
+        if fns is None:
+            return {"isIncomplete": False, "items": []}
+        items = []
+        for node in sorted(fns, key=lambda n: n.name):
+            items.append({
+                "label": node.name,
+                "kind": KIND_FUNCTION,
+                "detail": fn_signature(node),
+                "documentation": "From `%s` (imported as `%s`)."
+                                 % (imp["path"], alias),
+            })
+        return {"isIncomplete": False, "items": items}
+
     items = []
     seen = set()
-    for kw in sorted(G.KEYWORDS):
+    # ``as`` is an import keyword lexed as an identifier by the core parser.
+    for kw in sorted(set(G.KEYWORDS) | {"as"}):
         if kw in seen:
             continue
         seen.add(kw)
         items.append({"label": kw, "kind": KIND_KEYWORD})
+    for name in sorted(TYPE_NAMES):
+        if name in seen:
+            continue
+        seen.add(name)
+        items.append({"label": name, "kind": KIND_TYPE})
     for name in sorted(G.BUILTINS):
         if name in seen:
             continue
         seen.add(name)
-        items.append({"label": name, "kind": KIND_FUNCTION})
-    for name in sorted(doc_names(text)):
+        item = {"label": name, "kind": KIND_FUNCTION}
+        sig = builtin_signature(name)
+        if sig is not None:
+            item["detail"] = sig[0]
+        if name in DESCRIPTIONS:
+            item["documentation"] = DESCRIPTIONS[name]
+        items.append(item)
+    for name, kind in sorted(doc_names(text).items()):
         if name in seen:
             continue
         seen.add(name)
         items.append({"label": name, "kind": KIND_VARIABLE})
+    # Import aliases are callable through ``alias.fn`` and therefore useful
+    # completions in expression position.
+    for alias, imp in sorted(_alias_map(text).items()):
+        if alias in seen:
+            continue
+        seen.add(alias)
+        items.append({"label": alias, "kind": KIND_VARIABLE,
+                      "detail": "namespace alias for %s" % imp["path"]})
     return {"isIncomplete": False, "items": items}
 
 
@@ -443,20 +719,207 @@ def rename(uri: str, text: str, line: int, character: int, new_name: str):
     return {"changes": {uri: edits}}
 
 
+def _decl_by_name(text: str, name: str):
+    for node in _declarations(text):
+        if getattr(node, "name", None) == name:
+            return node
+    return None
+
+
+def _param_by_name(text: str, name: str):
+    for node in _declarations(text):
+        if isinstance(node, G.Fn):
+            for param in node.params:
+                if param.name == name:
+                    return param
+    return None
+
+
+def _decl_hover(text: str, name: str):
+    node = _decl_by_name(text, name)
+    if node is None:
+        return None
+    if isinstance(node, G.Fn):
+        return "`fn %s`\n\nGAMA-L function `%s`." % (fn_signature(node), name)
+    expr = getattr(node, "expr", None)
+    if isinstance(expr, G.Lambda):
+        return ("`let %s = %s`\n\nGAMA-L function value `%s`."
+                % (name, lambda_signature(expr), name))
+    type_name = getattr(node, "type_name", None)
+    if type_name:
+        return "GAMA-L let `%s`: `%s`" % (name, type_name)
+    return "GAMA-L let `%s`" % name
+
+
+def _member_hover(uri: str, text: str, line: int, character: int):
+    member = _namespaced_member(text, line, character)
+    if member is None:
+        return None
+    alias, name = member
+    imp = _alias_map(text).get(alias)
+    if imp is None:
+        return None
+    for node in _module_functions(uri, imp["path"]) or []:
+        if node.name == name:
+            return ("`%s.%s`\n\nGAMA-L function from `%s`."
+                    % (alias, fn_signature(node), imp["path"]))
+    return None
+
+
 def hover(uri: str, text: str, line: int, character: int):
     name = word_at(text, line, character)
     if not name:
         return None
-    value = None
-    if name in DESCRIPTIONS:
+    value = _member_hover(uri, text, line, character)
+    if value is None and name in TYPE_HOVERS:
+        value = TYPE_HOVERS[name]
+    elif value is None and name in TYPE_NAMES:
+        value = "GAMA-L type `%s`" % name
+    if value is None and name in DESCRIPTIONS:
         value = DESCRIPTIONS[name]
-    elif name in doc_names(text):
-        value = "GAMA-L %s `%s`" % (doc_names(text)[name], name)
-    elif name in G.KEYWORDS:
+        sig = builtin_signature(name)
+        if sig is not None:
+            value = "`%s`\n\n%s" % (sig[0], value)
+    if value is None and name in G.BUILTINS:
+        sig = builtin_signature(name)
+        if sig is not None:
+            value = "`%s`\n\nGAMA-L builtin `%s`." % (sig[0], name)
+        else:
+            value = "GAMA-L builtin `%s`" % name
+    if value is None:
+        value = _decl_hover(text, name)
+    if value is None:
+        param = _param_by_name(text, name)
+        if param is not None:
+            value = "GAMA-L parameter `%s`: `%s`" % (
+                name, param.type_name or "Any")
+    if value is None and name in _alias_map(text):
+        imp = _alias_map(text)[name]
+        value = ("GAMA-L namespace alias `%s` for `%s`; call members as "
+                 "`%s.fn(...)`." % (name, imp["path"], name))
+    if value is None and name in G.KEYWORDS:
         value = "GAMA-L keyword `%s`" % name
     if value is None:
         return None
     return {"contents": {"kind": "markdown", "value": value}}
+
+
+def _call_context(prefix: str):
+    """Return (callee, argument_text) for the innermost open call, or None."""
+    stack = []
+    quote = None
+    i = 0
+    while i < len(prefix):
+        ch = prefix[i]
+        if quote is not None:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch == "#":
+            break
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "(":
+            stack.append(i)
+        elif ch == ")" and stack:
+            stack.pop()
+        i += 1
+    if not stack:
+        return None
+    open_idx = stack[-1]
+    j = open_idx - 1
+    while j >= 0 and prefix[j] in " \t":
+        j -= 1
+    end = j
+    while j >= 0 and (prefix[j].isalnum() or prefix[j] in "_."):
+        j -= 1
+    callee = prefix[j + 1:end + 1]
+    return callee, prefix[open_idx + 1:] if callee else None
+
+
+def _active_parameter(args: str) -> int:
+    depth = 0
+    quote = None
+    commas = 0
+    i = 0
+    while i < len(args):
+        ch = args[i]
+        if quote is not None:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        elif ch == "," and depth == 0:
+            commas += 1
+        i += 1
+    return commas
+
+
+def _signature_help(signature, params):
+    active = 0
+    return {
+        "signatures": [{
+            "label": signature,
+            "parameters": [{"label": p} for p in params],
+        }],
+        "activeSignature": 0,
+        "activeParameter": active,
+    }
+
+
+def signature_help(uri: str, text: str, line: int, character: int):
+    prefix = _line_prefix(text, line, character)
+    ctx = _call_context(prefix)
+    if ctx is None:
+        return None
+    callee, args = ctx
+    active = _active_parameter(args)
+    sig = None
+
+    if "." in callee:
+        alias, member = callee.split(".", 1)
+        imp = _alias_map(text).get(alias)
+        if imp is not None:
+            for node in _module_functions(uri, imp["path"]) or []:
+                if node.name == member:
+                    sig = (fn_signature(node),
+                           [_param_label(p) for p in node.params])
+                    break
+    elif callee in SIGNATURES:
+        sig = builtin_signature(callee)
+    else:
+        node = _decl_by_name(text, callee)
+        if isinstance(node, G.Fn):
+            sig = (fn_signature(node),
+                   [_param_label(p) for p in node.params])
+        elif isinstance(node, G.Let) and isinstance(node.expr, G.Lambda):
+            sig = (lambda_signature(node.expr, "let " + node.name),
+                   [_param_label(p) for p in node.expr.params])
+        elif node is not None:
+            sig = ("%s(...)" % callee, [])
+        else:
+            param = _param_by_name(text, callee)
+            if param is not None and param.type_name == "Function":
+                sig = ("%s(...)" % callee, [])
+
+    if sig is None:
+        return None
+    result = _signature_help(sig[0], sig[1])
+    if result["signatures"][0]["parameters"]:
+        result["activeParameter"] = min(
+            active, len(result["signatures"][0]["parameters"]) - 1)
+    else:
+        result["activeParameter"] = 0
+    return result
 
 
 # ------------------------------------------------- document symbols & themes
@@ -464,7 +927,8 @@ KIND_SYMBOL_FUNCTION = 12
 KIND_SYMBOL_VARIABLE = 13
 
 TOKEN_TYPES = ["keyword", "type", "function", "variable", "string", "number", "operator"]
-TYPE_NAMES = {"Int", "Decimal", "Text", "Bool", "List", "Table", "Any"}
+TYPE_NAMES = {"Int", "Decimal", "Text", "Bool", "List", "Table", "Result",
+              "Json", "Null", "Any", "Function"}
 
 T_KEYWORD, T_TYPE, T_FUNCTION, T_VARIABLE, T_STRING, T_NUMBER, T_OP = range(7)
 
@@ -619,6 +1083,10 @@ def main():
                     "textDocumentSync": 1,
                     "completionProvider": {"triggerCharacters": [" ", "|", "."]},
                     "hoverProvider": True,
+                    "signatureHelpProvider": {
+                        "triggerCharacters": ["(", ","],
+                        "retriggerCharacters": [","],
+                    },
                     "definitionProvider": True,
                     "referencesProvider": True,
                     "renameProvider": True,
@@ -656,7 +1124,20 @@ def main():
             td = _obj(params.get("textDocument"))
             uri = td.get("uri") or ""
             text = docs.get(uri, td.get("text") or "")
-            send({"jsonrpc": "2.0", "id": mid, "result": completion(uri, text)})
+            pos = _obj(params.get("position"))
+            line = int(pos.get("line") or 0)
+            ch = int(pos.get("character") or 0)
+            send({"jsonrpc": "2.0", "id": mid,
+                  "result": completion(uri, text, line, ch)})
+        elif method == "textDocument/signatureHelp":
+            td = _obj(params.get("textDocument"))
+            uri = td.get("uri") or ""
+            text = docs.get(uri, td.get("text") or "")
+            pos = _obj(params.get("position"))
+            line = int(pos.get("line") or 0)
+            ch = int(pos.get("character") or 0)
+            send({"jsonrpc": "2.0", "id": mid,
+                  "result": signature_help(uri, text, line, ch)})
         elif method == "textDocument/hover":
             td = _obj(params.get("textDocument"))
             uri = td.get("uri") or ""

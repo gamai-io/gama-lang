@@ -50,14 +50,35 @@ python3 gamal2.py lsp
 ```
 
 JSON-RPC language server: `initialize`, `didOpen/didChange/didSave`
-diagnostics, completion, hover, definition, references, document symbols,
-semantic tokens, code actions, rename, document formatting, `shutdown`,
-`exit`. Malformed frames return a JSON-RPC error and no longer kill the
-server; multiline strings keep correct line/column positions. Positions are converted between LSP
-UTF-16 and Python indexes. A syntax-only VS Code package is in `vscode/`
-(TextMate grammar + snippets + a dependency-free LSP client). The extension
-requires a trusted workspace before spawning Python, supports `gama-lsp` from
-PATH or a configured script, and restarts with bounded backoff.
+diagnostics, completion, hover, signature help, definition, references,
+document symbols, semantic tokens, code actions, rename, document formatting,
+`shutdown`, `exit`. Malformed frames return a JSON-RPC error and no longer
+kill the server; multiline strings keep correct line/column positions.
+Positions are converted between LSP UTF-16 and Python indexes.
+
+Completion covers the current keywords, types (`Function`, `Result`, `Table`,
+`Json`, `Null`, …), all builtins with signature details, document `let`/`fn`
+names, and import aliases. For `import "lib.gm" as <cursor>` the only
+inferable alias is a sanitized module filename stem; it is omitted when it
+collides with a top-level name or an existing alias. After `alias.`, completion
+and hover read the imported file's direct top-level `fn` declarations.
+Signature help works for known builtins, user `fn`/lambda-typed `let` values,
+and namespaced module functions.
+
+Tooling limitations: namespaced completion does not follow re-exported imports
+and never exposes a module's top-level `let` values (the core exposes only
+functions). Builtin parameter names are LSP-only labels, since the core has no
+builtin parameter names. Diagnostics still use the in-memory `check(text)`
+path, so a document with an `import` reports the core's "import requires
+check_file/run_file" message even though the file would check/run fine on
+disk.
+
+A syntax-only VS Code package is in `vscode/` (TextMate grammar + snippets +
+a dependency-free LSP client). It highlights `import ... as` namespaces,
+`Function`, namespaced calls, and lambdas, and ships snippets for `impas`,
+`callns`, `iife`, and `fnlettype`. The extension requires a trusted workspace
+before spawning Python, supports `gama-lsp` from PATH or a configured script,
+and restarts with bounded backoff.
 
 ## Distribution
 
@@ -122,7 +143,7 @@ python3 gamal2.py fmt --write file.gm  # write in place
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 379/379
+python3 -m unittest discover -s tests -v   # 442/442
 python3 gamal2.py doctor --json                # 8/8 checks
 ```
 

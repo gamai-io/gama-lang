@@ -7,8 +7,22 @@ Minimal VS Code package for the GAMA-L 2 language.
 - Scope name: `source.gama-l`
 
 It provides TextMate syntax highlighting, bracket/comment configuration,
-snippets, and a **minimal built-in LSP client** for diagnostics
-(no `vscode-languageclient`, no npm dependencies).
+snippets, and a **minimal built-in LSP client** for diagnostics, completion,
+hover, and signature help (no `vscode-languageclient`, no npm dependencies).
+
+Namespace support: the grammar highlights `import "lib.gm" as math` and
+`math.add(...)`, and snippets include `impas` (import ... as), `callns`
+(namespaced call), `iife` (immediately invoked lambda), and `fnlettype`
+(Function-typed let). In the language server, `import "lib.gm" as ` suggests
+the filename stem as the alias (only when it does not collide), `math.`
+completes the imported file's top-level functions, and hover/signature help
+show their signatures.
+
+Limitations: alias completion cannot infer arbitrary aliases (it only derives
+one from the module filename); module member tooling does not follow
+re-exported imports or expose top-level `let` values; diagnostics use the
+in-memory checker, so `import` documents report "import requires
+check_file/run_file" until checked from disk.
 
 ## Requirements
 

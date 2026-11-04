@@ -7,7 +7,7 @@ const path = require('path');
 
 const LANG_ID = 'gama-l';
 const CLIENT_NAME = 'gama-l-vscode';
-const CLIENT_VERSION = '0.2.0';
+const CLIENT_VERSION = '0.3.0';
 
 // Automatic restarts after an unexpected exit: delays grow, total is capped.
 const RESTART_DELAYS_MS = [1000, 2000, 4000];

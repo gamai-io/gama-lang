@@ -97,7 +97,31 @@
     "body": [
       "import \"${1:lib.gm}\" as ${2:math}"
     ],
-    "description": "Import a module under a namespace alias."
+    "description": "Import a module under a namespace alias; call members as ${2:math}.fn(...). Only top-level fn declarations are exposed."
+  },
+  "Namespaced call": {
+    "prefix": "callns",
+    "body": [
+      "${1:math}.${2:add}(${3:2}, ${4:3})"
+    ],
+    "description": "Call a function from an imported module namespace."
+  },
+  "IIFE lambda": {
+    "prefix": "iife",
+    "body": [
+      "(fn(${1:x}: ${2:Int}) -> ${3:Int} { return ${4:x + 1} })(${5:41})"
+    ],
+    "description": "Immediately invoked lambda expression (IIFE)."
+  },
+  "Function-typed let": {
+    "prefix": [
+      "fnlettype",
+      "fnvar"
+    ],
+    "body": [
+      "let ${1:f}: Function = fn(${2:x}: ${3:Int}) -> ${4:Int} { return ${5:x + 1} }"
+    ],
+    "description": "Bind a lambda to a let annotated as Function."
   },
   "Result function": {
     "prefix": "fnres",
