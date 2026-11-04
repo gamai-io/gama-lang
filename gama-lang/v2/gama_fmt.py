@@ -685,7 +685,10 @@ class _AstFormatter:
                 payload = v[1] if len(v) > 1 else None
             else:
                 name, payload = v, None
-            parts.append(name + ("(" + payload + ")" if payload else ""))
+            if isinstance(payload, tuple):
+                parts.append(name + "(" + ", ".join(payload) + ")")
+            else:
+                parts.append(name + ("(" + payload + ")" if payload else ""))
         if not parts:
             return "enum " + s.name + " { }"
         return "enum " + s.name + " { " + ", ".join(parts) + " }"
@@ -844,12 +847,17 @@ class _AstFormatter:
         if outer is not None:
             arm_pairs = self._pairs(outer[0].line + 1, outer[1].line)
             prev_end = outer[0].line
-            for i, (name, var, body) in enumerate(s.arms):
+            for i, (name, bindings, body) in enumerate(s.arms):
                 pair = arm_pairs[i] if i < len(arm_pairs) else None
                 limit = pair[0].line if pair else outer[1].line
                 prev_end = self._flush_before(prev_end, limit, indent + 1,
                                               outer[0].line)
-                label = name if name == "_" or var is None else name + "(" + var + ")"
+                if name == "_" or not bindings:
+                    label = name
+                elif isinstance(bindings, str):
+                    label = name + "(" + bindings + ")"
+                else:
+                    label = name + "(" + ", ".join(bindings) + ")"
                 label += " {"
                 self._emit(_UNIT * (indent + 1) + label,
                            [pair[0].line] if pair else [s.line])
