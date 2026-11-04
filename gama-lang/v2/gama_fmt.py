@@ -37,9 +37,33 @@ Guarantees of the AST formatter:
     (``record Name { field: Type, ... }`` / ``enum Name { Variant, ... }``);
     named record literals (``Point { x: 1, y: 2 }``) keep field order.
 
+Line wrapping (added in this revision):
+  * Expressions longer than ``width`` (default 88) are wrapped deterministically
+    with two-space continuation indentation: list/map/record literals and call
+    argument lists go one entry per line with the closing delimiter lined up
+    with the opening expression, binary chains break after the operator, and
+    pipes put each ``| stage`` on its own line.  Short constructs are emitted
+    exactly as before (one line).
+  * No token is added or removed by wrapping (no trailing commas, no extra
+    parentheses), so the semantic token stream is unchanged.  Binary wrapping
+    relies on the parser accepting a newline after a binary operator.
+  * Comments inside a wrapped literal/call stay on the entry they annotate
+    (``1, # one``).  Comments between binary operands stay after the operator
+    line they followed, and comments on their own line are emitted just before
+    the next entry at the continuation indent.  Comments in an expression that
+    is *not* wrapped, and comments inside pipe stages, are still moved to the
+    nearest safe position (end of the statement / before the next statement);
+    that is the only unavoidable movement.
+  * Comments on the closing delimiter line stay with the statement (trailing
+    comment), as before.
+
 Known limitations (documented, not hidden):
-  * Comments inside an expression (e.g. between list items) are moved to the
-    end of that statement or to the following statement line (safe position).
+  * Comments inside a *short* expression (e.g. ``[1, # one`` on one physical
+    line) are moved to the end of that statement or to the following statement
+    line (safe position) unless the construct is expanded for other reasons.
+  * Comments inside ``|`` pipe stages are not attached per stage; the pipe is
+    wrapped but the comments use the safe-position fallback.
+  * ``record``/``enum`` declarations and ``fn`` headers are not width-wrapped.
   * Map keys are re-rendered from their decoded string value: a quoted
     identifier key (``"total"``) becomes a bare key (``total``).  The map entry
     and lookup semantics are identical.
@@ -282,6 +306,8 @@ def _legacy_format_source(src: str) -> str:
 
 _UNIT = "  "
 
+DEFAULT_WIDTH = 88
+
 _PREC = {"||": 1, "&&": 2, "==": 3, "!=": 3,
          "<": 4, "<=": 4, ">": 4, ">=": 4,
          "+": 5, "-": 5, "*": 6, "/": 6, "%": 6}
@@ -342,8 +368,9 @@ def _quote(text: str) -> str:
 
 
 class _AstFormatter:
-    def __init__(self, src: str):
+    def __init__(self, src: str, width: int = DEFAULT_WIDTH):
         self.src = src
+        self.width = max(20, int(width))
         self.lines = src.split("\n")
         offsets = [0]
         for line in self.lines[:-1]:
@@ -513,7 +540,13 @@ class _AstFormatter:
     # ------------------------------------------------------------- emitting
     def _emit(self, text: str, src_lines=(), attach: bool = True,
               suffix: str = ""):
-        self.out.append(text + suffix)
+        # A wrapped expression (or a multi-line string) arrives as a single
+        # string containing newlines; keep one element per physical line so
+        # comment attachment and blank-line handling stay line-accurate.
+        parts = text.split("\n")
+        for part in parts[:-1]:
+            self.out.append(part)
+        self.out.append(parts[-1] + suffix)
         if not attach:
             return
         for idx, c in enumerate(self.comments):
@@ -542,6 +575,344 @@ class _AstFormatter:
             self.used.add(idx)
             prev_end = max(prev_end, c.line)
         return prev_end
+
+    # ------------------------------------------------------------- wrapping
+    @staticmethod
+    def _pos_lt(a, b) -> bool:
+        return a[0] < b[0] or (a[0] == b[0] and a[1] < b[1])
+
+    def _span_for_container(self, node):
+        G = _G
+        if isinstance(node, G.ListExpr):
+            return self._delim_span("[", node.line, node.col)
+        if isinstance(node, (G.MapExpr, G.RecordLit)):
+            return self._delim_span("{", node.line, node.col)
+        if isinstance(node, (G.Call, G.CallExpr)):
+            return self._delim_span("(", node.line, node.col)
+        return None
+
+    def _delim_span(self, open_val, line, col):
+        """Return (open_line, open_col, close_line, close_col) of a delimiter.
+
+        The token at ``(line, col)`` may be a container's opening bracket, a
+        call name or a record name; the first ``open_val`` token at or after
+        that position on the same line is the opener, then brackets are
+        balanced (all three kinds) to find the matching close.
+        """
+        open_idx = None
+        for i, t in enumerate(self.sig):
+            if t.line < line:
+                continue
+            if t.line > line:
+                break
+            if t.col >= col and t.kind == "OP" and t.val == open_val:
+                open_idx = i
+                break
+        if open_idx is None:
+            return None
+        depth = 0
+        for t in self.sig[open_idx:]:
+            if t.kind != "OP":
+                continue
+            if t.val in "([{":
+                depth += 1
+            elif t.val in ")]}":
+                depth -= 1
+                if depth == 0:
+                    ot = self.sig[open_idx]
+                    return (ot.line, ot.col, t.line, t.col)
+        return None
+
+    def _expr_start_pos(self, node):
+        G = _G
+        if isinstance(node, G.Binary):
+            return self._expr_start_pos(node.left)
+        if isinstance(node, G.Unary):
+            return (node.line, node.col)
+        if isinstance(node, G.Attr):
+            return self._expr_start_pos(node.base)
+        if isinstance(node, G.Index):
+            return self._expr_start_pos(node.base)
+        if isinstance(node, G.Try):
+            return self._expr_start_pos(node.expr)
+        if isinstance(node, G.CallExpr):
+            return self._expr_start_pos(node.callee)
+        if isinstance(node, G.Pipe):
+            return self._expr_start_pos(node.base)
+        return (getattr(node, "line", 0), getattr(node, "col", 0))
+
+    def _expr_end_pos(self, node):
+        G = _G
+        if isinstance(node, G.Literal) and isinstance(node.value, str):
+            raw, end_line = self._raw_string(node.line, node.col)
+            if raw is not None and raw[:1] in "\"'":
+                start = self.offsets[node.line - 1] + (node.col - 2)
+                end_off = start + len(raw)
+                end_col = end_off - self.offsets[end_line - 1] + 1
+                return (end_line, end_col)
+            return (node.line, node.col + len(str(node.value)))
+        if isinstance(node, G.Literal):
+            return (node.line, node.col + len(self._literal(node)))
+        if isinstance(node, G.Var):
+            return (node.line, node.col + len(node.name))
+        if isinstance(node, G.Attr):
+            return (node.line, node.col + len(node.name))
+        if isinstance(node, G.Unary):
+            return self._expr_end_pos(node.right)
+        if isinstance(node, G.Binary):
+            return self._expr_end_pos(node.right)
+        if isinstance(node, G.Index):
+            span = self._delim_span("[", node.line, node.col)
+            if span:
+                return (span[2], span[3])
+            return (node.line, node.col + 1)
+        if isinstance(node, G.Try):
+            return (node.line, node.col + 1)
+        span = self._span_for_container(node)
+        if span is not None:
+            return (span[2], span[3])
+        if isinstance(node, G.Lambda):
+            if node.body:
+                return (self._stmt_end_line(node.body[-1]), 10 ** 6)
+            return (node.line, 10 ** 6)
+        if isinstance(node, G.Pipe):
+            return (node.line, 10 ** 6)
+        return (getattr(node, "line", 0), 10 ** 6)
+
+    def _interior_comments(self, span):
+        oline, ocol, cline, ccol = span
+        open_pos, close_pos = (oline, ocol), (cline, ccol)
+        out = []
+        for idx, c in enumerate(self.comments):
+            if idx in self.used:
+                continue
+            pos = (c.line, c.col)
+            if self._pos_lt(open_pos, pos) and self._pos_lt(pos, close_pos):
+                out.append((idx, c))
+        return out
+
+    def _flush_comment_range(self, lo, hi, indent, result, inline_lines,
+                             attach_line=None, attach_src_line=None):
+        """Move unused comments in (lo, hi) into ``result`` in source order.
+
+        A single-line comment on ``attach_src_line`` is appended to the
+        already-emitted ``attach_line`` (its attachment point); anything else
+        becomes its own line at ``indent``.
+        """
+        for idx, c in enumerate(self.comments):
+            if idx in self.used:
+                continue
+            pos = (c.line, c.col)
+            if not self._pos_lt(lo, pos):
+                continue
+            if not self._pos_lt(pos, hi):
+                break
+            if (not c.own_line and attach_line is not None
+                    and attach_src_line == c.line
+                    and attach_line not in inline_lines):
+                result[attach_line] += " " + c.text
+                inline_lines.add(attach_line)
+            else:
+                result.append(" " * indent + c.text)
+            self.used.add(idx)
+
+    def _fits(self, text: str, base_col: int) -> bool:
+        return "\n" not in text and base_col + len(text) <= self.width
+
+    def _binary_parts(self, node):
+        """Flatten a left-associative same-precedence chain.
+
+        Returns ``(parts, prec)`` where each part is
+        ``(operator, right_operand, operator_node)`` and the first part has
+        ``operator is None``.  Flattening keeps the original token order.
+        """
+        G = _G
+        p = _PREC[node.op]
+        out = []
+
+        def walk(n):
+            if isinstance(n, G.Binary) and _PREC[n.op] == p:
+                walk(n.left)
+                out.append((n.op, n.right, n))
+            else:
+                out.append((None, n, None))
+
+        walk(node)
+        return out, p
+
+    def _binary_has_comment(self, node) -> bool:
+        parts, _p = self._binary_parts(node)
+        first_pos = self._expr_start_pos(parts[0][1])
+        last_pos = self._expr_end_pos(parts[-1][1])
+        for idx, c in enumerate(self.comments):
+            if idx in self.used:
+                continue
+            pos = (c.line, c.col)
+            if not (self._pos_lt(first_pos, pos) and self._pos_lt(pos, last_pos)):
+                continue
+            if c.own_line:
+                return True
+        for op, right, opnode in parts[1:]:
+            if opnode is None:
+                continue
+            rs = self._expr_start_pos(right)
+            op_pos = (opnode.line, opnode.col)
+            for idx, c in enumerate(self.comments):
+                if idx in self.used:
+                    continue
+                pos = (c.line, c.col)
+                if not self._pos_lt(op_pos, pos):
+                    continue
+                if (c.line == rs[0] and self._pos_lt(pos, rs)) or \
+                        c.line < rs[0]:
+                    return True
+        return False
+
+    def _force_expand(self, node) -> bool:
+        G = _G
+        span = self._span_for_container(node)
+        if span is not None and self._interior_comments(span):
+            return True
+        if isinstance(node, G.Binary) and self._binary_has_comment(node):
+            return True
+        return False
+
+    def _wrap(self, node, close_indent: int, base_col: int,
+              minp: int = 0) -> str:
+        """Render ``node``, wrapping when it exceeds the configured width.
+
+        The first returned line has no indentation (the caller positions it);
+        continuation lines already carry absolute two-space indentation.
+        """
+        G = _G
+        text = self._expr(node, minp)
+        if self._fits(text, base_col) and not self._force_expand(node):
+            return text
+        if isinstance(node, (G.ListExpr, G.MapExpr, G.RecordLit,
+                             G.Call, G.CallExpr)):
+            return self._wrap_container(node, close_indent)
+        if isinstance(node, G.Binary):
+            return self._wrap_binary(node, close_indent, base_col, minp)
+        if isinstance(node, G.Pipe):
+            return self._wrap_pipe(node, close_indent, base_col, minp)
+        return text
+
+    def _wrap_container(self, node, close_indent) -> str:
+        G = _G
+        inner = close_indent + 2
+
+        def lit_renderer(item):
+            return lambda ii, bc: self._wrap(item, ii, bc, 0)
+
+        def map_renderer(key, val):
+            k = key if _bare_key_ok(key) else _quote(key)
+            return lambda ii, bc: (
+                k + ": " + self._wrap(val, ii, ii + len(k) + 2, 0))
+
+        if isinstance(node, G.ListExpr):
+            open_text, close_text = "[", "]"
+            entries = [(self._expr_start_pos(it), self._expr_end_pos(it),
+                        lit_renderer(it)) for it in node.items]
+        elif isinstance(node, G.MapExpr):
+            open_text, close_text = "{", "}"
+            entries = [(self._expr_start_pos(v), self._expr_end_pos(v),
+                        map_renderer(k, v)) for k, v in node.items.items()]
+        elif isinstance(node, G.RecordLit):
+            open_text, close_text = node.name + " {", "}"
+            entries = [(self._expr_start_pos(v), self._expr_end_pos(v),
+                        map_renderer(k, v)) for k, v in node.fields]
+        elif isinstance(node, G.Call):
+            open_text, close_text = node.name + "(", ")"
+            entries = [(self._expr_start_pos(a), self._expr_end_pos(a),
+                        lit_renderer(a)) for a in node.args]
+        else:  # CallExpr
+            open_text = self._expr(node.callee, _POSTFIX_PREC) + "("
+            close_text = ")"
+            entries = [(self._expr_start_pos(a), self._expr_end_pos(a),
+                        lit_renderer(a)) for a in node.args]
+
+        result = [open_text]
+        inline_lines: set[int] = set()
+        span = self._span_for_container(node)
+        if span is None:
+            for i, (_s, _e, render) in enumerate(entries):
+                tl = render(inner, inner).split("\n")
+                tl[0] = " " * inner + tl[0]
+                if i < len(entries) - 1:
+                    tl[-1] += ","
+                result.extend(tl)
+            result.append(" " * close_indent + close_text)
+            return "\n".join(result)
+
+        oline, ocol, cline, ccol = span
+        open_pos, close_pos = (oline, ocol), (cline, ccol)
+        cursor = open_pos
+        prev_line = 0
+        prev_src = oline
+        for i, (start, end, render) in enumerate(entries):
+            self._flush_comment_range(
+                cursor, start, inner, result, inline_lines,
+                attach_line=prev_line, attach_src_line=prev_src)
+            tl = render(inner, inner).split("\n")
+            tl[0] = " " * inner + tl[0]
+            if i < len(entries) - 1:
+                tl[-1] += ","
+            result.extend(tl)
+            last_line = len(result) - 1
+            self._flush_comment_range(
+                start, end, inner, result, inline_lines,
+                attach_line=last_line, attach_src_line=end[0])
+            if self._pos_lt(cursor, end):
+                cursor = end
+            prev_line = last_line
+            prev_src = end[0]
+        self._flush_comment_range(
+            cursor, close_pos, inner, result, inline_lines,
+            attach_line=prev_line, attach_src_line=prev_src)
+        result.append(" " * close_indent + close_text)
+        return "\n".join(result)
+
+    def _wrap_binary(self, node, close_indent, base_col, minp) -> str:
+        parts, p = self._binary_parts(node)
+        cont = close_indent + 2
+        lines = [self._wrap(parts[0][1], close_indent, base_col, p)]
+        inline_lines: set[int] = set()
+        for op, right, opnode in parts[1:]:
+            lines[-1] += " " + op
+            rs = self._expr_start_pos(right)
+            if opnode is not None:
+                self._flush_comment_range(
+                    (opnode.line, opnode.col), rs, cont, lines, inline_lines,
+                    attach_line=len(lines) - 1, attach_src_line=opnode.line)
+            rl = self._wrap(right, cont, cont, p + 1).split("\n")
+            rl[0] = " " * cont + rl[0]
+            lines.extend(rl)
+        return "\n".join(lines)
+
+    def _wrap_pipe(self, node, close_indent, base_col, minp) -> str:
+        if _PIPE_PREC < minp:
+            return self._expr(node, minp)
+        cont = close_indent + 2
+        text = self._wrap(node.base, close_indent, base_col, 1)
+        lines = text.split("\n")
+        for stage, args in node.stages:
+            if stage in ("filter", "limit"):
+                part = stage + " " + self._expr(args[0])
+            elif stage == "select":
+                part = "select " + ", ".join(args)
+            elif stage in ("sum", "map"):
+                part = stage + " " + args[0]
+            else:
+                part = stage
+            lines.append(" " * cont + "| " + part)
+        return "\n".join(lines)
+
+    def _emit_expr_stmt(self, ind, prefix, stmt, indent, semi):
+        node = stmt.expr
+        base_col = len(ind) + len(prefix)
+        text = self._wrap(node, len(ind), base_col)
+        end_line = self._stmt_end_line(stmt)
+        self._emit(ind + prefix + text, [stmt.line, end_line], suffix=semi)
 
     # --------------------------------------------------------------- output
     def format(self) -> str:
@@ -585,24 +956,20 @@ class _AstFormatter:
         if isinstance(s, G.Let):
             tn = (": " + s.type_name) if s.type_name else ""
             prefix = "export " if getattr(s, "exported", False) else ""
-            self._emit(ind + prefix + "let " + s.name + tn + " = " +
-                       self._expr(s.expr), [s.line], suffix=semi)
+            self._emit_expr_stmt(
+                ind, prefix + "let " + s.name + tn + " = ", s, indent, semi)
             return
         if isinstance(s, G.Assign):
-            self._emit(ind + s.name + " := " + self._expr(s.expr),
-                       [s.line], suffix=semi)
+            self._emit_expr_stmt(ind, s.name + " := ", s, indent, semi)
             return
         if isinstance(s, G.Return):
-            self._emit(ind + "return " + self._expr(s.expr),
-                       [s.line], suffix=semi)
+            self._emit_expr_stmt(ind, "return ", s, indent, semi)
             return
         if isinstance(s, G.Print):
-            self._emit(ind + "print " + self._expr(s.expr),
-                       [s.line], suffix=semi)
+            self._emit_expr_stmt(ind, "print ", s, indent, semi)
             return
         if isinstance(s, G.Verify):
-            self._emit(ind + "verify " + self._expr(s.expr),
-                       [s.line], suffix=semi)
+            self._emit_expr_stmt(ind, "verify ", s, indent, semi)
             return
         if isinstance(s, G.Prove):
             self._emit(ind + self._prove_text(s), [s.line], suffix=semi)
@@ -630,7 +997,7 @@ class _AstFormatter:
             self._render_match(s, indent, semi)
             return
         if isinstance(s, G.ExprStmt):
-            self._emit(ind + self._expr(s.expr), [s.line], suffix=semi)
+            self._emit_expr_stmt(ind, "", s, indent, semi)
             return
         raise _G.GamaError("unsupported statement " + type(s).__name__,
                            getattr(s, "line", 0), getattr(s, "col", 0))
@@ -1065,16 +1432,18 @@ class _AstFormatter:
 # Public API
 # ---------------------------------------------------------------------------
 
-def format_source(src: str) -> str:
+def format_source(src: str, width: int = DEFAULT_WIDTH) -> str:
     """Format GAMA-L source canonically.
 
     The AST formatter is the default; invalid sources fall back to the legacy
     token formatter so ``fmt`` never crashes on a snippet that does not parse.
+    ``width`` is the soft column limit for wrapping long expressions
+    (default 88); short constructs are never wrapped.
     """
     text = src.replace("\r\n", "\n").replace("\r", "\n")
     if _G is None:
         return _legacy_format_source(text)
     try:
-        return _AstFormatter(text).format()
+        return _AstFormatter(text, width=width).format()
     except _G.GamaError:
         return _legacy_format_source(text)

@@ -31,7 +31,7 @@ clock, and every `GAMA_L_*` environment variable is stripped for each case.
 | **T7** — module import cycle rejected with a clear error | **PASS** | `T7ImportCycles.test_t7_import_cycle_rejected` | Temp project (`a.gm` ↔ `b.gm`) raises `GamaError: import cycle: …` before execution. |
 | **T8** — `ask` records prompt hash and model; offline returns `Unavailable` | **PASS** | `T8AskMetadata.test_t8_offline_ask_unavailable_with_metadata` | Offline: output `Unavailable`, `last_ask.model == "mock"`, `last_ask.prompt_hash == sha256(prompt)`. |
 | **T9** — 10 example programs run from a clean checkout without network | **PASS** | `T9ExamplesOffline.test_t9_examples_run_offline` | All 11 shipped examples run with every `GAMA_L_*` network/env knob removed (contract requires ≥10). |
-| **T10** — `gamal check` and `gamal fmt` are deterministic | **PASS** (current formatter) | `T10Determinism.test_t10_fmt_deterministic_and_idempotent`, `..._check_deterministic`, `..._preserves_multiline_string` | `fmt` output is identical across calls and idempotent, and formatted output still checks. Errors are byte-identical across repeated `check` calls. Caveat: the formatter is AST-based but still moves comments inside expressions to a safe position and does not line-wrap long expressions. |
+| **T10** — `gamal check` and `gamal fmt` are deterministic | **PASS** (current formatter) | `T10Determinism.test_t10_fmt_deterministic_and_idempotent`, `..._check_deterministic`, `..._preserves_multiline_string` | `fmt` output is identical across calls and idempotent, and formatted output still checks. Errors are byte-identical across repeated `check` calls. The formatter is AST-based and now wraps long list/map/record/call/binary/pipe expressions at a configurable width (default 88), keeping expression comments on their entry/operator line where possible. Caveat: comments in short (unwrapped) expressions and in pipe stages still use the safe-position fallback. |
 
 ## Summary
 
@@ -72,9 +72,12 @@ These are outside the T1–T10 checks or only partially covered; see
    multi-payload/generic enum variants, record methods,
    field update/copy syntax, and structural subtyping are missing; the IR
    prototype supports records and nullary enums for its documented subset.
-5. **Formatter edges.** `fmt` is AST-based; it preserves comments and strings
-   and is idempotent, but comments inside expressions may move to a safe
-   position and long expressions are not line-wrapped (T10 still passes).
+5. **Formatter edges.** `fmt` is AST-based; it preserves comments and strings,
+   is idempotent, and wraps long list/map/record/call/binary/pipe expressions
+   at a configurable width (default 88, `fmt --width`). Comments in short
+   (unwrapped) expressions and inside pipe stages still move to a safe
+   position; declarations, `fn` headers, control-flow headers and `prove` are
+   not width-wrapped (T10 still passes).
 6. **Deployed public registry, marketplace signing, published release.**
    Build/checksums and a local HTTP registry exist; publishing does not.
 7. **Full standard library.** `sql`, `mail`, `memory`, and `proof` are present

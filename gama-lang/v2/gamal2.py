@@ -639,7 +639,12 @@ class Parser:
     def binary(self, minp):
         left = self.unary()
         while self.at("OP") and self.peek().val in self.PREC and self.PREC[self.peek().val] >= minp:
-            op = self.take(); p = self.PREC[op.val]; right = self.binary(p + 1)
+            op = self.take(); p = self.PREC[op.val]
+            # A long expression may continue on the next line after the
+            # operator.  Nothing is skipped before the operator, so statement
+            # boundaries (and therefore existing programs) are unaffected.
+            self.skip_nl()
+            right = self.binary(p + 1)
             left = Binary(left, op.val, right, op.line, op.col)
         return left
     def unary(self):
@@ -1977,11 +1982,11 @@ def _brace_delta(line: str) -> int:
         i += 1
     return d
 
-def fmt_source(src: str) -> str:
+def fmt_source(src: str, width: int = 88) -> str:
     """Canonical formatter (falls back to indentation-only if module absent)."""
     try:
         from gama_fmt import format_source
-        return format_source(src)
+        return format_source(src, width=width)
     except ImportError:
         pass
     lines = [ln.rstrip() for ln in src.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
@@ -3170,6 +3175,8 @@ def main(argv=None):
                     help="fmt: report if the file is unformatted, write nothing (rc 1 if so)")
     ap.add_argument("--write", action="store_true",
                     help="fmt: rewrite the file in place with the formatted source")
+    ap.add_argument("--width", type=int, default=88,
+                    help="fmt: soft column limit for wrapping long expressions (default 88)")
     a = ap.parse_intermixed_args(argv)
     if a.cmd != "fmt" and (a.check or a.write):
         print("error: --check/--write are only valid with the 'fmt' command", file=sys.stderr)
@@ -3190,7 +3197,7 @@ def main(argv=None):
                 return 2
             path = pathlib.Path(a.file)
             src = path.read_text(encoding="utf-8"); parse(src)
-            formatted = fmt_source(src)
+            formatted = fmt_source(src, width=a.width)
             if a.check:
                 if formatted == src:
                     return 0

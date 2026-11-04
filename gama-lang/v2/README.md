@@ -201,7 +201,7 @@ error messages keep the interpreter's text and line/col.
 - `expr?` Result propagation: unwraps `Ok`, returns `Err` from the enclosing function; the function must return `Result`
 - core builtins: `unwrap`, `unwrap_or`, `is_ok`, `is_err`; `split`, `join`, `contains`, `trim`, `upper`, `lower`, `replace`, `starts_with`, `ends_with`; `keys`, `values`, `has`; numeric `abs`, `min`, `max`, `floor`, `ceil`; text/list `reverse`, `slice`, `index_of`, `sort`; conversion `to_int` (`to_text` is already covered by `text`)
 - literals: text, int, decimal, bool, null, list, map
-- arithmetic/comparison/boolean operators
+- arithmetic/comparison/boolean operators; a newline immediately after a binary operator continues the expression on the next line (statement boundaries still require the operator to be on the same line)
 - pipes: `filter`, `select`, `sum`, `limit`, `count`, `map`
 - `ask` (offline mock, or OpenAI-compatible `GAMA_L_ASK_URL`), `sql` (demo table, or read-only SQLite via `GAMA_L_DB`), `remember/recall`
 - `wait_user` (non-interactive returns `Denied`; falsy)
@@ -222,7 +222,7 @@ error messages keep the interpreter's text and line/col.
 - nominal record (struct) types: `record Point { x: Int, y: Int }`, positional construction `Point(1, 2)`, named construction `Point { x: 3, y: 4 }` (local record names only), typed fields, dotted access `p.x` (including nested `l.a.x`), `let p: Point = ...`, and nominal/value equality. Constructors enforce arity, missing/extra/duplicate fields and field types (`GamaTypeError`); unknown field access is rejected statically when the base type is a record. Printing is deterministic: declaration-order fields, `Name { x: 1, y: "text" }`, decimals with their plain fixed form, and text JSON-quoted. Records are exported through aliased imports (`geo.Point`) and their type names are namespaced (`geo.Point { ... }`). Gaps: no record methods/update/with syntax, constructor calls are not first-class values, `record` is contextual (not a reserved word), named construction requires a local declaration, the IR backend now supports records/enums for the documented subset, and LSP has record/enum completion/hover
 - LSP completion/hover for records/enums (fields, variants, declarations) and VS Code grammar/snippets
 - reproducible benchmark suite (`scripts/bench.py`) for interpreter vs IR and core operations
-- AST-based formatter for the current language (comments and multi-line strings preserved; idempotent; records/enums included)
+- AST-based formatter for the current language (comments and multi-line strings preserved; idempotent; records/enums included; deterministic width wrapping at 88 columns by default, configurable via `fmt --width`)
 - static type errors and static effect violations
 - CLI `run`, `check`, `fmt`, `test`, `pkg`, `lsp`, `ir`
 
@@ -271,7 +271,7 @@ samples.
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 1479/1479
+python3 -m unittest discover -s tests -v   # 1501/1501
 python3 gamal2.py doctor --json                # 8/8 checks
 ../../scripts/ci_local.sh                      # py_compile + tests + doctor + VS Code JSON/smoke
 ```
@@ -295,7 +295,7 @@ Conformance: see `CONFORMANCE.md` (SPEC 2.0 T1–T10: **PASS 10/10**, including 
 - renamed exports (`export fn a as b`), `export enum`, and selective re-exports; explicit export lists mark the alias surface, but modules without any `export` keep the legacy all-visible alias behaviour
 - external intent/lease registry with expiry/revocation (env-bound intent/lease receipts are implemented; there is no external registry)
 - full type inference and generics; multi-payload/generic enum variants; record methods/field update/structural subtyping
-- formatter remaining edges: comments inside expressions may move to a safe position, and long expressions are not line-wrapped
+- formatter remaining edges: comments inside short (unwrapped) expressions and inside pipe stages may move to a safe position; `record`/`enum` declarations, `fn` headers, control-flow headers and `prove` are not width-wrapped; indivisible tokens longer than the width still overflow
 - VS Code Marketplace signing/publishing (VSIX packaging is reproducible locally)
 - publishing a built release to PyPI (build/checksums/verify work)
 
