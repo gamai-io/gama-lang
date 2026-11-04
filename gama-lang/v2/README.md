@@ -210,7 +210,9 @@ error messages keep the interpreter's text and line/col.
 - optional global step limit via `GAMA_L_MAX_STEPS` (unset, blank, malformed, or negative = disabled): counts every executed statement dispatch (including nested block and function-body statements) plus one tick per `for`/`while` body iteration; expression evaluation and the function call itself are not counted separately. On exceed raises `GamaRuntimeError` with the count, the limit, and the source line/col. `GAMA_L_LOOP_LIMIT` (default 1000000) still bounds `while` iterations independently; a present but blank or non-integer value raises `GamaRuntimeError` instead of leaking `ValueError`
 - optional expression step limit via `GAMA_L_MAX_EXPR_STEPS` (unset, blank, malformed, or negative = disabled): counts every `Interpreter.expr` evaluation; nested calls count individually (e.g. `1 + 2` is three steps: the `Binary` plus both `Literal`s). On exceed raises `GamaRuntimeError` with the count, the limit, and the source line/col. It is independent of `GAMA_L_MAX_STEPS`, call depth, output, and loop limits, and remains counted when the cap is disabled
 - standalone bytecode IR prototype (`gama_ir.py`) for a documented subset: statements/expressions, `if`/`else if`, `while`, `for`, list/map literals and indexing, `break`/`continue`, `fn`, `Ok`/`Err` + `match`, and the core builtins `len`/`text`/`number`/`round`; opt-in via `gamal2 ir run|compile` (see above), the interpreter and default `run` backend are unchanged
-- nominal record (struct) types: `record Point { x: Int, y: Int }`, positional construction `Point(1, 2)`, named construction `Point { x: 3, y: 4 }` (local record names only), typed fields, dotted access `p.x` (including nested `l.a.x`), `let p: Point = ...`, and nominal/value equality. Constructors enforce arity, missing/extra/duplicate fields and field types (`GamaTypeError`); unknown field access is rejected statically when the base type is a record. Printing is deterministic: declaration-order fields, `Name { x: 1, y: "text" }`, decimals with their plain fixed form, and text JSON-quoted. Records are exported through aliased imports (`geo.Point`) and their type names are namespaced (`geo.Point { ... }`). Gaps: no record methods/update/with syntax, constructor calls are not first-class values, `record` is contextual (not a reserved word), named construction requires a local declaration, the IR backend raises `IRUnsupported` for records, and LSP/formatter have no record-specific completion or reflow
+- simple nullary enums: `enum Color { Red, Green, Blue }`, `Color.Red`, `let c: Color = ...`, equality and deterministic printing; `match` accepts `Color.Red`/`_` arms (no payload variants)
+- nominal record (struct) types: `record Point { x: Int, y: Int }`, positional construction `Point(1, 2)`, named construction `Point { x: 3, y: 4 }` (local record names only), typed fields, dotted access `p.x` (including nested `l.a.x`), `let p: Point = ...`, and nominal/value equality. Constructors enforce arity, missing/extra/duplicate fields and field types (`GamaTypeError`); unknown field access is rejected statically when the base type is a record. Printing is deterministic: declaration-order fields, `Name { x: 1, y: "text" }`, decimals with their plain fixed form, and text JSON-quoted. Records are exported through aliased imports (`geo.Point`) and their type names are namespaced (`geo.Point { ... }`). Gaps: no record methods/update/with syntax, constructor calls are not first-class values, `record` is contextual (not a reserved word), named construction requires a local declaration, the IR backend raises `IRUnsupported` for records, and LSP has no record-specific completion
+- AST-based formatter for the current language (comments and multi-line strings preserved; idempotent; records/enums included)
 - static type errors and static effect violations
 - CLI `run`, `check`, `fmt`, `test`, `pkg`, `lsp`, `ir`
 
@@ -240,11 +242,10 @@ Conformance: see `CONFORMANCE.md` (SPEC 2.0 T1–T10: **PASS 10/10**, including 
 - deployed/public package registry (the HTTP server is implemented and testable)
 - full export lists/renamed exports; aliased modules export only `fn` definitions and top-level `let` constants, while side-effect top-level statements are rejected (`use` stays a no-op)
 - external intent/lease registry with expiry/revocation (env-bound intent/lease receipts are implemented; there is no external registry)
-- full type inference, enums/generics (records are nominal and deliberately shallow: no methods, field update/copy syntax, or structural subtyping)
-- full AST formatter (current `fmt` is token-based, preserves comments and
-  strings, but does not reformat multi-line strings)
-- Marketplace packaging/signing for the VS Code extension
-- publishing a built release (build/checksums work)
+- full type inference and generics; payload enum variants; record methods/field update/structural subtyping
+- formatter remaining edges: comments inside expressions may move to a safe position, and long expressions are not line-wrapped
+- VS Code Marketplace signing/publishing (VSIX packaging is reproducible locally)
+- publishing a built release to PyPI (build/checksums/verify work)
 
 The old v0.1 transpiler remains in `gama-lang/` for reference. Do not call this
 full 2.0 until the remaining conformance tests and connectors are done.

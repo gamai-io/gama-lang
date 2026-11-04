@@ -31,7 +31,7 @@ clock, and every `GAMA_L_*` environment variable is stripped for each case.
 | **T7** — module import cycle rejected with a clear error | **PASS** | `T7ImportCycles.test_t7_import_cycle_rejected` | Temp project (`a.gm` ↔ `b.gm`) raises `GamaError: import cycle: …` before execution. |
 | **T8** — `ask` records prompt hash and model; offline returns `Unavailable` | **PASS** | `T8AskMetadata.test_t8_offline_ask_unavailable_with_metadata` | Offline: output `Unavailable`, `last_ask.model == "mock"`, `last_ask.prompt_hash == sha256(prompt)`. |
 | **T9** — 10 example programs run from a clean checkout without network | **PASS** | `T9ExamplesOffline.test_t9_examples_run_offline` | All 11 shipped examples run with every `GAMA_L_*` network/env knob removed (contract requires ≥10). |
-| **T10** — `gamal check` and `gamal fmt` are deterministic | **PASS** (current formatter) | `T10Determinism.test_t10_fmt_deterministic_and_idempotent`, `..._check_deterministic`, `..._preserves_multiline_string` | `fmt` output is identical across calls and idempotent, and formatted output still checks. Errors are byte-identical across repeated `check` calls. Caveat: `fmt` is token-based, not a full AST reformatter; multi-line strings are preserved verbatim. |
+| **T10** — `gamal check` and `gamal fmt` are deterministic | **PASS** (current formatter) | `T10Determinism.test_t10_fmt_deterministic_and_idempotent`, `..._check_deterministic`, `..._preserves_multiline_string` | `fmt` output is identical across calls and idempotent, and formatted output still checks. Errors are byte-identical across repeated `check` calls. Caveat: the formatter is AST-based but still moves comments inside expressions to a safe position and does not line-wrap long expressions. |
 
 ## Summary
 
@@ -63,12 +63,13 @@ These are outside the T1–T10 checks or only partially covered; see
    budget or cost model.
 4. **Full type system.** No full inference. Nominal records with typed fields,
    positional/named construction and dotted field access are implemented
-   (`tests/test_records.py`), but enums, generics, record methods, field
-   update/copy syntax, and structural subtyping are missing; the IR prototype
-   does not compile record declarations or literals.
-5. **Full AST formatter.** `fmt` is token-based; it preserves comments and
-   strings but does not reflow multi-line strings (T10 still passes on
-   determinism).
+   (`tests/test_records.py`); simple nullary enums are implemented
+   (`tests/test_enums.py`). Generics, payload enum variants, record methods,
+   field update/copy syntax, and structural subtyping are missing; the IR
+   prototype does not compile record/enum declarations or literals.
+5. **Formatter edges.** `fmt` is AST-based; it preserves comments and strings
+   and is idempotent, but comments inside expressions may move to a safe
+   position and long expressions are not line-wrapped (T10 still passes).
 6. **Deployed public registry, marketplace signing, published release.**
    Build/checksums and a local HTTP registry exist; publishing does not.
 7. **Full standard library.** `sql`, `mail`, `memory`, and `proof` are present
