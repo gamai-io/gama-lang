@@ -24,6 +24,11 @@ class LspNamespaceTests(unittest.TestCase):
         self.root = pathlib.Path(self.tmp.name)
         (self.root / "lib.gm").write_text(
             'let hidden = 7\n'
+            'let pi: Decimal = 3.14159\n'
+            'let name = "gama"\n'
+            'let flag = true\n'
+            'let xs = [1, 2]\n'
+            'let conf = {"a": 1}\n'
             'fn add(a: Int, b: Int) -> Int effects {} { return a + b }\n'
             'fn quad(x: Int) -> Int effects {} { return x * 4 }\n',
             encoding="utf-8",
@@ -105,7 +110,9 @@ class LspNamespaceTests(unittest.TestCase):
         self.open(DOC)
         res = self.completion(2, len("print math."))
         labels = {it["label"] for it in res["items"]}
-        self.assertEqual(labels, {"add", "quad"})  # top-level let is not exposed
+        self.assertEqual(
+            labels, {"hidden", "pi", "name", "flag", "xs", "conf",
+                     "add", "quad"})
         add_item = next(i for i in res["items"] if i["label"] == "add")
         self.assertIn("add(a: Int, b: Int) -> Int", add_item["detail"])
 
@@ -114,6 +121,98 @@ class LspNamespaceTests(unittest.TestCase):
         member = self.hover(2, 11)  # inside `add`
         self.assertIn("math.add", member["contents"]["value"])
         self.assertIn("a: Int, b: Int", member["contents"]["value"])
+
+    def test_member_completion_includes_constants_with_types(self):
+        self.open(DOC)
+        res = self.completion(2, len("print math."))
+        items = {
+            it["label"]: it for it in res["items"]
+            if it["kind"] == 21
+        }
+        self.assertEqual(
+            set(items),
+            {"hidden", "pi", "name", "flag", "xs", "conf"})
+        self.assertEqual(items["hidden"]["detail"], "let hidden: Int")
+        self.assertEqual(items["pi"]["detail"], "let pi: Decimal")
+        self.assertEqual(items["name"]["detail"], "let name: Text")
+        self.assertEqual(items["flag"]["detail"], "let flag: Bool")
+        self.assertEqual(items["xs"]["detail"], "let xs: List")
+        self.assertEqual(items["conf"]["detail"], "let conf: Json")
+        kinds = {it["label"]: it["kind"] for it in res["items"]}
+        self.assertEqual(kinds["add"], 3)
+        self.assertEqual(kinds["quad"], 3)
+
+    def test_member_hover_constant_type_and_value(self):
+        self.open(
+            'import "lib.gm" as math\n'
+            'print math.hidden\n'
+            'print math.pi\n'
+            'print math.name\n'
+            'print math.flag\n'
+            'print math.xs\n'
+        )
+        hidden = self.hover(1, len("print math.hid"))
+        self.assertIn("math.hidden", hidden["contents"]["value"])
+        self.assertIn("type `Int`", hidden["contents"]["value"])
+        self.assertIn("value `7`", hidden["contents"]["value"])
+
+        pi = self.hover(2, len("print math.pi"))
+        self.assertIn("type `Decimal`", pi["contents"]["value"])
+        self.assertIn("value `3.14159`", pi["contents"]["value"])
+
+        name = self.hover(3, len("print math.na"))
+        self.assertIn("type `Text`", name["contents"]["value"])
+        self.assertIn('value `"gama"`', name["contents"]["value"])
+
+        flag = self.hover(4, len("print math.fl"))
+        self.assertIn("type `Bool`", flag["contents"]["value"])
+        self.assertIn("value `true`", flag["contents"]["value"])
+
+        # Non-literal / collection values expose the type but no value.
+        xs = self.hover(5, len("print math.xs"))
+        self.assertIn("type `List`", xs["contents"]["value"])
+        self.assertNotIn("value `", xs["contents"]["value"])
+
+    def test_missing_module_member_features_are_quiet(self):
+        self.open('import "nope.gm" as m\nprint m.thing\n')
+        res = self.completion(1, len("print m."))
+        self.assertEqual(res["items"], [])
+        self.assertIsNone(self.hover(1, len("print m.th")))
+
+    def test_side_effect_module_is_ignored(self):
+        (self.root / "side.gm").write_text(
+            'print 1\n'
+            'let k = 2\n'
+            'fn f() -> Int effects {} { return 1 }\n',
+            encoding="utf-8",
+        )
+        self.open('import "side.gm" as s\nprint s.f()\n')
+        res = self.completion(1, len("print s."))
+        self.assertEqual(res["items"], [])
+        self.assertIsNone(self.hover(1, len("print s.f")))
+
+    def test_side_effect_through_plain_import_is_ignored(self):
+        (self.root / "inner.gm").write_text(
+            'print 1\n'
+            'fn g() -> Int effects {} { return 1 }\n',
+            encoding="utf-8",
+        )
+        (self.root / "outer.gm").write_text(
+            'import "inner.gm"\n'
+            'let k = 2\n',
+            encoding="utf-8",
+        )
+        self.open('import "outer.gm" as o\nprint o.k\n')
+        res = self.completion(1, len("print o."))
+        self.assertEqual(res["items"], [])
+
+    def test_malformed_module_does_not_crash(self):
+        (self.root / "broken.gm").write_text(
+            "fn broken( {\n", encoding="utf-8")
+        self.open('import "broken.gm" as b\nprint b.f\n')
+        res = self.completion(1, len("print b."))
+        self.assertEqual(res["items"], [])
+        self.assertIsNone(self.hover(1, len("print b.f")))
 
     def test_hover_function_type_builtin_and_lambda(self):
         self.open(

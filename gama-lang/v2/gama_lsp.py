@@ -304,6 +304,7 @@ def publish(uri: str, text: str):
 KIND_KEYWORD = 14
 KIND_FUNCTION = 3
 KIND_VARIABLE = 6
+KIND_CONSTANT = 21
 KIND_TYPE = 25
 
 NAME_RE = re.compile(r"\b(let|fn)\s+([A-Za-z_]\w*)")
@@ -510,17 +511,91 @@ def _resolve_module(uri: str, path: str):
     return None
 
 
-def _module_functions(uri: str, path: str):
-    """Direct top-level ``fn`` declarations of an imported module, or None."""
+def _module_declarations(uri: str, path: str):
+    """Exported ``fn``/``let`` declarations of an aliased module, or ``None``.
+
+    Mirrors the core alias-import rules: the module (including plain imports
+    it inlines) may only contain ``fn``/``let`` declarations, plain imports and
+    ``use`` at the top level. Malformed, missing or side-effect modules are
+    treated as unavailable so completion and hover stay quiet instead of
+    advertising members the runtime would reject.
+    """
     target = _resolve_module(uri, path)
-    if target is None:
+    root = _doc_root(uri)
+    if target is None or root is None:
         return None
     try:
-        source = target.read_text(encoding="utf-8")
-        program = G.parse(source)
+        flat_fn = getattr(G, "_flatten", None)
+        if flat_fn is not None:
+            stmts = flat_fn(target, root)
+        else:  # pragma: no cover - older cores without namespace flattening
+            stmts = G.parse(target.read_text(encoding="utf-8"))
+        allowed = getattr(G, "_ALIAS_ALLOWED_TOPLEVEL",
+                          (G.Fn, G.Let, G.Import, G.Use))
+        if not all(isinstance(st, allowed) for st in stmts):
+            return None
     except Exception:
         return None
-    return [n for n in program if isinstance(n, G.Fn)]
+    return [st for st in stmts if isinstance(st, (G.Fn, G.Let))]
+
+
+def _module_functions(uri: str, path: str):
+    """Exported top-level ``fn`` declarations of an imported module, or None."""
+    declarations = _module_declarations(uri, path)
+    if declarations is None:
+        return None
+    return [node for node in declarations if isinstance(node, G.Fn)]
+
+
+def _expr_type(expr):
+    """Best-effort static type for a literal-ish constant expression."""
+    if isinstance(expr, G.Literal):
+        return G.tname(expr.value)
+    if isinstance(expr, G.Lambda):
+        return "Function"
+    if isinstance(expr, G.ListExpr):
+        kinds = {_expr_type(item) for item in expr.items}
+        return "Table" if kinds and kinds <= {"Json"} else "List"
+    if isinstance(expr, G.MapExpr):
+        return "Json"
+    return None
+
+
+def _const_type(node):
+    declared = getattr(node, "type_name", None)
+    if declared:
+        return declared
+    try:
+        return _expr_type(getattr(node, "expr", None))
+    except Exception:
+        return None
+
+
+def _const_value(node, limit: int = 120):
+    """Literal value text for hover, or None when it is not safe to show.
+
+    Only parsed literals are rendered; arbitrary expressions are never
+    evaluated at completion or hover time.
+    """
+    expr = getattr(node, "expr", None)
+    if not isinstance(expr, G.Literal):
+        return None
+    value = expr.value
+    if value is None:
+        text = "null"
+    elif isinstance(value, bool):
+        text = "true" if value else "false"
+    elif isinstance(value, str):
+        text = '"%s"' % value.replace("\\", "\\\\").replace('"', '\\"')
+    else:
+        decimal_type = getattr(G, "Decimal", ())
+        if isinstance(value, int) or isinstance(value, decimal_type):
+            text = str(value)
+        else:
+            return None
+    if len(text) > limit:
+        text = text[:limit - 1] + "\u2026"
+    return text
 
 
 def _namespaced_member(text: str, line: int, character: int):
@@ -575,26 +650,42 @@ def completion(uri: str, text: str, line: int = 0, character: int = 0):
             })
         return {"isIncomplete": False, "items": items}
 
-    # Member position: ``alias.<cursor>``. Offer the module's own top-level
-    # functions; re-exported imports and top-level lets are not exposed.
+    # Member position: ``alias.<cursor>``. Offer the module's exported
+    # functions and top-level `let` constants, mirroring the core namespace.
     mm = MEMBER_CTX_RE.search(prefix)
     if mm:
         alias = mm.group(1)
         imp = _alias_map(text).get(alias)
         if imp is None:
             return {"isIncomplete": False, "items": []}
-        fns = _module_functions(uri, imp["path"])
-        if fns is None:
+        declarations = _module_declarations(uri, imp["path"])
+        if declarations is None:
             return {"isIncomplete": False, "items": []}
         items = []
-        for node in sorted(fns, key=lambda n: n.name):
-            items.append({
-                "label": node.name,
-                "kind": KIND_FUNCTION,
-                "detail": fn_signature(node),
-                "documentation": "From `%s` (imported as `%s`)."
-                                 % (imp["path"], alias),
-            })
+        seen_members = set()
+        for node in sorted(declarations, key=lambda n: n.name):
+            if node.name in seen_members:
+                continue
+            seen_members.add(node.name)
+            if isinstance(node, G.Fn):
+                items.append({
+                    "label": node.name,
+                    "kind": KIND_FUNCTION,
+                    "detail": fn_signature(node),
+                    "documentation": "From `%s` (imported as `%s`)."
+                                     % (imp["path"], alias),
+                })
+            else:
+                type_name = _const_type(node)
+                detail = ("let %s: %s" % (node.name, type_name)
+                          if type_name else "let %s" % node.name)
+                items.append({
+                    "label": node.name,
+                    "kind": KIND_CONSTANT,
+                    "detail": detail,
+                    "documentation": "Constant from `%s` (imported as `%s`)."
+                                     % (imp["path"], alias),
+                })
         return {"isIncomplete": False, "items": items}
 
     items = []
@@ -918,10 +1009,22 @@ def _member_hover(uri: str, text: str, line: int, character: int):
     imp = _alias_map(text).get(alias)
     if imp is None:
         return None
-    for node in _module_functions(uri, imp["path"]) or []:
-        if node.name == name:
+    for node in _module_declarations(uri, imp["path"]) or []:
+        if node.name != name:
+            continue
+        if isinstance(node, G.Fn):
             return ("`%s.%s`\n\nGAMA-L function from `%s`."
                     % (alias, fn_signature(node), imp["path"]))
+        type_name = _const_type(node)
+        value = _const_value(node)
+        facts = []
+        if type_name:
+            facts.append("type `%s`" % type_name)
+        if value is not None:
+            facts.append("value `%s`" % value)
+        detail = ", ".join(facts) if facts else "constant"
+        return ("`%s.%s`\n\nGAMA-L constant from `%s` (%s)."
+                % (alias, name, imp["path"], detail))
     return None
 
 
