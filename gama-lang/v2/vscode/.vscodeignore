@@ -1,2 +1,5 @@
 # Development-only files, not part of the published extension.
 smoke.js
+package.sh
+.gitignore
+dist/**
