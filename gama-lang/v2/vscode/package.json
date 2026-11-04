@@ -2,7 +2,7 @@
   "name": "gama-l",
   "displayName": "GAMA-L",
   "description": "Syntax highlighting and LSP diagnostics for the GAMA-L 2 language (.gm files).",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "publisher": "gama",
   "license": "MIT",
   "main": "./extension.js",

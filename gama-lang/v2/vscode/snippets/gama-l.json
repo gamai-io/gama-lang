@@ -49,5 +49,130 @@
       "import \"${1:file.gm}\""
     ],
     "description": "Import another GAMA-L module."
+  },
+  "Result function": {
+    "prefix": "fnres",
+    "body": [
+      "fn ${1:name}(${2:value}: ${3:Int}) -> Result effects {} {",
+      "\t$0",
+      "}"
+    ],
+    "description": "Declare a function that returns a Result."
+  },
+  "Match Result": {
+    "prefix": "match",
+    "body": [
+      "match ${1:result} {",
+      "\tOk(${2:value}) {",
+      "\t\t$0",
+      "\t}",
+      "\tErr(${3:error}) {",
+      "\t\t",
+      "\t}",
+      "\t_ {",
+      "\t\t",
+      "\t}",
+      "}"
+    ],
+    "description": "Match a Result with Ok(v), Err(e) and wildcard arms."
+  },
+  "Result propagation": {
+    "prefix": "try",
+    "body": [
+      "let ${1:value} = ${2:expr}?"
+    ],
+    "description": "Unwrap Ok or return Err from the enclosing Result function."
+  },
+  "Ok value": {
+    "prefix": "ok",
+    "body": [
+      "Ok(${1:value})"
+    ],
+    "description": "Wrap a value in Ok."
+  },
+  "Err value": {
+    "prefix": "err",
+    "body": [
+      "Err(\"${1:message}\")"
+    ],
+    "description": "Wrap an error in Err."
+  },
+  "Ask the model": {
+    "prefix": "ask",
+    "body": [
+      "ask \"${1:question}\""
+    ],
+    "description": "Ask the configured AI endpoint; returns Text."
+  },
+  "Ask with context": {
+    "prefix": "askwith",
+    "body": [
+      "ask \"${1:question}\" with ${2:context}"
+    ],
+    "description": "Ask the configured AI endpoint with extra context."
+  },
+  "SQL query": {
+    "prefix": "sql",
+    "body": [
+      "sql(\"${1:select konto, naziv from customers}\")"
+    ],
+    "description": "Run a read-only SQL query; returns a Table."
+  },
+  "SQL write": {
+    "prefix": "sqlwrite",
+    "body": [
+      "sql_write(\"${1:INSERT INTO table (column) VALUES ('value')}\")"
+    ],
+    "description": "Guarded INSERT/UPDATE/DELETE (requires GAMA_L_ALLOW_WRITE=1)."
+  },
+  "Remember and recall": {
+    "prefix": "remember",
+    "body": [
+      "remember ${1:key} = ${2:value}",
+      "recall ${1:key}"
+    ],
+    "description": "Write a memory key/value, then read it back."
+  },
+  "Wait for the user": {
+    "prefix": "wait",
+    "body": [
+      "wait user \"${1:approve this?}\""
+    ],
+    "description": "Human-in-the-loop gate; non-interactive runs return Denied."
+  },
+  "Send mail": {
+    "prefix": "mail",
+    "body": [
+      "mail(\"${1:to@example.com}\", \"${2:subject}\", \"${3:body}\")"
+    ],
+    "description": "Guarded SMTP mail (requires GAMA_L_MAIL_ENABLED=1)."
+  },
+  "Round a number": {
+    "prefix": "round",
+    "body": [
+      "round(${1:value}, ${2:2})"
+    ],
+    "description": "Round a decimal to the given number of digits."
+  },
+  "Length": {
+    "prefix": "len",
+    "body": [
+      "len(${1:value})"
+    ],
+    "description": "Length of a list or text as Int."
+  },
+  "Convert to text": {
+    "prefix": "text",
+    "body": [
+      "text(${1:value})"
+    ],
+    "description": "Convert a value to Text."
+  },
+  "Convert to number": {
+    "prefix": "number",
+    "body": [
+      "number(${1:value})"
+    ],
+    "description": "Convert a value to Decimal."
   }
 }

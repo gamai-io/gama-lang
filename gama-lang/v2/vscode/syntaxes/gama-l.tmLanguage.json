@@ -49,7 +49,7 @@
       }
     },
     {
-      "match": "(\\bfn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "match": "(\\bfn|\\bmake)\\s+([A-Za-z_][A-Za-z0-9_]*)",
       "captures": {
         "1": {
           "name": "keyword.control.fn.gama-l"
@@ -82,20 +82,43 @@
       }
     },
     {
+      "name": "support.class.constructor.gama-l",
+      "match": "\\b(Ok|Err)\\b"
+    },
+    {
+      "name": "variable.language.wildcard.gama-l",
+      "match": "\\b_\\b"
+    },
+    {
+      "match": "(\\bwait)\\s+(user)\\b",
+      "captures": {
+        "1": {
+          "name": "keyword.control.wait.gama-l"
+        },
+        "2": {
+          "name": "keyword.other.user.gama-l"
+        }
+      }
+    },
+    {
       "name": "constant.language.gama-l",
       "match": "\\b(true|false|null)\\b"
     },
     {
       "name": "support.type.gama-l",
-      "match": "\\b(Int|Decimal|Text|Bool|List|Table|Any)\\b"
+      "match": "\\b(Int|Decimal|Text|Bool|List|Table|Result|Json|Null|Any)\\b"
     },
     {
       "name": "support.function.builtin.gama-l",
-      "match": "\\b(sql|ask|wait_user|sql_write|mail|len|text|number)\\b"
+      "match": "\\b(sql|ask|wait_user|sql_write|mail|len|text|number|remember|recall|round)\\b"
     },
     {
       "name": "keyword.control.gama-l",
-      "match": "\\b(let|fn|if|else|return|prove|verify|print|effects|filter|select|sum|limit|count|map|in|import)\\b"
+      "match": "\\b(let|fn|make|if|else|return|match|prove|verify|print|effects|filter|select|sum|limit|count|map|in|import|use|wait|for|while|break|continue)\\b"
+    },
+    {
+      "name": "keyword.operator.try.gama-l",
+      "match": "\\?"
     },
     {
       "name": "keyword.operator.gama-l",

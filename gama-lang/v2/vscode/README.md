@@ -105,10 +105,29 @@ directory, or package it with `vsce` (not included here).
 - Comments starting with `#`
 - Single- and double-quoted strings with escapes
 - Integers and decimals
-- Keywords, type names, and builtin functions
+- Keywords, including `match`, `make`, `use`, `wait`, `for`, `while`,
+  `break`, and `continue`
+- Type names (`Int`, `Decimal`, `Text`, `Bool`, `List`, `Table`, `Result`,
+  `Json`, `Null`, `Any`)
+- Result constructors `Ok` / `Err` and the match wildcard `_`
+- Builtin functions from the v2 core: `sql`, `ask`, `wait_user`, `remember`,
+  `recall`, `sql_write`, `mail`, `len`, `text`, `number`, `round`
+- The postfix Result propagation operator `?`
 - Pipe stages (`filter`, `select`, `sum`, `limit`, `count`, `map`)
 - Operators and punctuation
-- Function names after `fn`, bindings after `let`, and `prove` targets
+- Function names after `fn` / `make`, bindings after `let`, and `prove` targets
+- `wait user "..."` as a unit (keyword + `user`)
+
+The grammar is syntax-only and intentionally tracks only names that exist in
+the v2 core (`gamal2.py`). It does **not** highlight `unwrap`, `unwrap_or`,
+`split`, or `join`, because those are not part of the v2 core yet.
+
+## Snippets
+
+Besides `fn`, `let`, `if`, `prove`, pipe, and `import`, the snippet set covers
+the Result flow (`fnres`, `match`, `try`, `ok`, `err`) and the core builtins
+(`ask`, `askwith`, `sql`, `sqlwrite`, `remember`, `wait`, `mail`, `round`,
+`len`, `text`, `number`).
 
 ## License
 
