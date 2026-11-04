@@ -308,7 +308,7 @@ class _Compiler:
 
     def compile_if(self, stmt: g2.If) -> None:
         if isinstance(stmt.other, g2.If):
-            _unsupported(stmt.other, "else-if chains are rejected by the reference interpreter")
+            _unsupported(stmt.other, "else-if chains are not supported by this IR prototype")
         self.compile_expr(stmt.cond)
         jump_false = self.emit("JUMP_IF_FALSE", None)
 

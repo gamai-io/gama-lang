@@ -16,8 +16,8 @@ Guarantees exercised here:
 
 The generator is intentionally small and deterministic: 120 valid programs,
 60 deletions and 60 duplications (240 cases), all well under the 10 s budget.
-Any confirmed core leak is pinned by an ``expectedFailure`` regression test
-next to the fuzz cases instead of being hidden.
+Former core leaks are covered by focused regression tests next to the fuzz
+cases instead of being hidden.
 """
 import os
 import pathlib
@@ -419,65 +419,61 @@ for _i, _src in enumerate(_MALFORMED_DUPLICATE):
 
 
 class KnownCoreLeakRegressionTests(unittest.TestCase):
-    """Confirmed core leaks (reported, not hidden).
+    """Regression pins for confirmed core leaks that are now closed.
 
-    Each ``expectedFailure`` below asserts the *contract*: a bad call must
-    surface as a ``GamaError`` subclass.  While the core is left untouched
-    these fail with bare Python exceptions and are reported as expected
-    failures.  When the core is fixed the tests will start passing and
-    ``unittest`` reports them as unexpected successes, flagging that the
-    regression pins can be removed.
+    Each test asserts the *contract*: a bad call must surface as a
+    ``GamaError`` subclass, and an ``else if`` chain must run and check both
+    branches.  These were previously pinned with ``expectedFailure`` while the
+    core was left untouched.
     """
 
-    @unittest.expectedFailure
     def test_zero_arity_builtin_raises_gama_error(self):
-        # BUG: len()/text()/number()/round() index e.args[0] directly and
-        # leak IndexError instead of a GamaError.
+        # len()/text()/number()/round() used to index e.args[0] directly and
+        # leak IndexError; the static arity guard now raises GamaTypeError.
         for src in ("print len()\n", "print text()\n",
                     "print number()\n", "print round()\n"):
             with self.subTest(src=src):
                 with self.assertRaises(G.GamaError):
                     G.run(src)
 
-    @unittest.expectedFailure
     def test_len_non_sized_raises_gama_error(self):
-        # BUG: len(5) / len(null) pass the checker and leak TypeError.
+        # len(5) / len(null) used to pass the checker and leak TypeError.
         for src in ("print len(5)\n", "print len(null)\n"):
             with self.subTest(src=src):
                 with self.assertRaises(G.GamaError):
                     G.run(src)
 
-    @unittest.expectedFailure
     def test_number_non_numeric_raises_gama_error(self):
-        # BUG: number("abc") / number(null) leak decimal.InvalidOperation.
+        # number("abc") / number(null) used to leak decimal.InvalidOperation.
         for src in ('print number("abc")\n', "print number(null)\n"):
             with self.subTest(src=src):
                 with self.assertRaises(G.GamaError):
                     G.run(src)
 
-    @unittest.expectedFailure
     def test_round_non_numeric_raises_gama_error(self):
-        # BUG: round("x") leaks decimal.InvalidOperation (ArithmeticError).
+        # round("x") used to leak decimal.InvalidOperation (ArithmeticError).
         with mock.patch.dict(os.environ, {"GAMA_L_MAX_STEPS": "50"}):
             with self.assertRaises(G.GamaError):
                 G.run('print round("x")\n')
 
-    @unittest.expectedFailure
-    def test_else_if_chain_raises_gama_error_or_runs(self):
-        # BUG found by fuzz seeds 14/28/42/70: the parser represents
-        # ``else if`` as an ``If`` node in ``If.other``, but Checker.stmt
-        # (and Interpreter.stmt) iterate ``s.other`` directly, leaking
-        # ``TypeError: 'If' object is not iterable`` from check/run.
+    def test_else_if_chain_runs_and_prints_b(self):
+        # The parser represents ``else if`` as an ``If`` node in ``If.other``;
+        # Checker.stmt/Interpreter.stmt used to iterate it directly, leaking
+        # ``TypeError: 'If' object is not iterable``.
         src = ('let x = 7\n'
                'if (x > 8) {\n  print "a"\n'
                '} else if (x > 2) {\n  print "b"\n'
                '} else {\n  print "c"\n}\n')
-        try:
-            G.run(src)
-        except G.GamaError:
-            return
-        except Exception as ex:  # noqa: BLE001 - pin the confirmed leak
-            self.fail("else-if leaked %s: %s" % (type(ex).__name__, ex))
+        it = G.run(src)
+        self.assertEqual(it.out, ["b"])
+
+    def test_else_if_chain_checks_nested_branch(self):
+        # Both the nested else-if branch and its final else must be checked.
+        src = ('if (true) {\n  print "a"\n'
+               '} else if (true) {\n  print 1 + "x"\n'
+               '} else {\n  print "c"\n}\n')
+        with self.assertRaises(G.GamaTypeError):
+            G.check(src)
 
 
 if __name__ == "__main__":

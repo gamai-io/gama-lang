@@ -31,7 +31,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 _NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect())
 from dataclasses import dataclass, fields, is_dataclass, replace
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 # ------------------------------------------------------------------ errors
@@ -572,6 +572,29 @@ _CORE_SIGS: dict[str, tuple[int, int, list]] = {
     "to_int": (1, 1, [{"Int", "Decimal", "Text"}]),
 }
 
+# Builtins whose runtime handlers read positional arguments directly need a
+# static arity guard so a bad call is a ``GamaTypeError`` instead of a bare
+# ``IndexError``.  ``len`` additionally has a known argument domain.
+_SIMPLE_ARITY: dict[str, tuple[int, int]] = {
+    "len": (1, 1),
+    "text": (1, 1),
+    "number": (1, 1),
+    "round": (1, 2),
+}
+_LEN_TYPES = {"Text", "List", "Table", "Json"}
+
+def check_simple_sig(name: str, types: list, call: Call) -> None:
+    """Validate arity (and, for ``len``, the argument domain) of a builtin."""
+    mn, mx = _SIMPLE_ARITY[name]
+    if not (mn <= len(types) <= mx):
+        raise GamaTypeError(
+            f"{name} expects {mn}..{mx} args, got {len(types)}", call.line, call.col)
+    if name == "len":
+        t = types[0]
+        if t != "Any" and t not in _LEN_TYPES:
+            raise GamaTypeError(
+                f"len expects Text/List/Table/Json, got {t}", call.line, call.col)
+
 def _dyn_numeric(types: list) -> str:
     """Numeric builtins preserve Decimal when present, otherwise Int."""
     if any(t == "Any" for t in types):
@@ -958,7 +981,14 @@ class Checker:
             if ct != "Bool": raise GamaTypeError(f"if condition must be Bool, got {ct}", s.line, s.col)
             self.push(); [self.stmt(x, allowed) for x in s.then]; self.pop()
             if s.other:
-                self.push(); [self.stmt(x, allowed) for x in s.other]; self.pop()
+                self.push()
+                # ``else if`` stores a nested If node rather than a block;
+                # both branches (and its nested else) must be checked.
+                if isinstance(s.other, If):
+                    self.stmt(s.other, allowed)
+                else:
+                    [self.stmt(x, allowed) for x in s.other]
+                self.pop()
         elif isinstance(s, Return):
             if self.ret_type is None: raise GamaTypeError("return outside function", s.line, s.col)
             rt = self.expr(s.expr)
@@ -1065,6 +1095,8 @@ class Checker:
                 types = [self.expr(a, row) for a in e.args]
                 if e.name in _CORE_SIGS:
                     check_core_sig(e.name, types, e)
+                if e.name in _SIMPLE_ARITY:
+                    check_simple_sig(e.name, types, e)
                 if e.name in _DYN_RET:
                     return _DYN_RET[e.name](types)
                 if e.name == "sql":
@@ -1552,7 +1584,11 @@ class Interpreter:
                 for x in s.then: self.stmt(x, blk)
             elif s.other:
                 blk = Env(env)
-                for x in s.other: self.stmt(x, blk)
+                # ``else if`` is a nested If node; run it in this scope.
+                if isinstance(s.other, If):
+                    self.stmt(s.other, blk)
+                else:
+                    for x in s.other: self.stmt(x, blk)
         elif isinstance(s, Return): raise ReturnSignal(self.expr(s.expr, env))
         elif isinstance(s, Prove):
             val = self.expr(s.expr, env)
@@ -1817,8 +1853,17 @@ class Interpreter:
             if e.name in _CORE_SIGS:
                 return eval_core_builtin(
                     e.name, [self.expr(a, env, row) for a in e.args], e.line, e.col)
-            if e.name == "len": return len(self.expr(e.args[0], env, row))
-            if e.name == "text": return str(self.expr(e.args[0], env, row))
+            if e.name == "len":
+                _need_args("len", e.args, 1, e.line, e.col)
+                value = self.expr(e.args[0], env, row)
+                if not isinstance(value, (str, list, tuple, dict)):
+                    raise GamaRuntimeError(
+                        f"len expects Text, List or Json, got {tname(value)}",
+                        e.line, e.col)
+                return len(value)
+            if e.name == "text":
+                _need_args("text", e.args, 1, e.line, e.col)
+                return str(self.expr(e.args[0], env, row))
             if e.name == "sql_write":
                 q = str(self.expr(e.args[0], env, row)) if e.args else ""
                 return sql_write(q, e.line, e.col)
@@ -1831,11 +1876,33 @@ class Interpreter:
                     return send_mail(str(vals[0]), str(vals[1]), str(vals[2]), e.line, e.col)
                 except MailError as ex:
                     raise GamaRuntimeError(str(ex), e.line, e.col) from None
-            if e.name == "number": return Decimal(str(self.expr(e.args[0], env, row)))
+            if e.name == "number":
+                _need_args("number", e.args, 1, e.line, e.col)
+                raw = self.expr(e.args[0], env, row)
+                try:
+                    return Decimal(str(raw))
+                except (InvalidOperation, ValueError, TypeError):
+                    raise GamaRuntimeError(
+                        f"number: cannot convert {raw!r} to Decimal",
+                        e.line, e.col) from None
             if e.name == "round":
-                value = Decimal(str(self.expr(e.args[0], env, row)))
-                digits = int(self.expr(e.args[1], env, row)) if len(e.args) > 1 else 0
-                return value.quantize(Decimal(1).scaleb(-digits))
+                if not (1 <= len(e.args) <= 2):
+                    raise GamaRuntimeError(
+                        f"round expects 1..2 args, got {len(e.args)}",
+                        e.line, e.col)
+                raw = self.expr(e.args[0], env, row)
+                try:
+                    digits = int(self.expr(e.args[1], env, row)) if len(e.args) > 1 else 0
+                except (ValueError, TypeError):
+                    raise GamaRuntimeError(
+                        "round: digits must be Int", e.line, e.col) from None
+                try:
+                    value = Decimal(str(raw))
+                    return value.quantize(Decimal(1).scaleb(-digits))
+                except (InvalidOperation, ValueError, TypeError):
+                    raise GamaRuntimeError(
+                        f"round: cannot round {raw!r} to Decimal",
+                        e.line, e.col) from None
             if e.name in self.funcs:
                 fn, closure = self.funcs[e.name]
                 return self.invoke(
