@@ -11,15 +11,20 @@ use), never silently given a different meaning.
 Supported statements
 --------------------
 ``let`` / ``:=`` (assign), ``print``, ``if``/``else`` (including ``else if``
-chains), ``while``, ``break``, ``continue``, ``fn`` (named function
-definitions), ``return`` (inside functions only), and expression statements.
+chains), ``while``, ``for`` (list/text iteration), ``break``, ``continue``,
+``match`` on ``Ok``/``Err``, ``fn`` (named function definitions), ``return``
+(inside functions only), and expression statements.
 
 Supported expressions
 ---------------------
-Literals: ``Int``, ``Decimal``, ``Text``, ``Bool``, ``null``.
+Literals: ``Int``, ``Decimal``, ``Text``, ``Bool``, ``null``, list literals
+``[a, b]`` and map literals ``{k: v}``.
 Variables, unary ``!``/``-``; binary ``+ - * / %``, comparisons
-``== != < <= > >=`` and short-circuit ``&&``/``||``; calls to *named,
-user-defined* functions (including recursion and default parameters).
+``== != < <= > >=`` and short-circuit ``&&``/``||``; indexing ``base[i]``
+(list/text, with the reference interpreter's ``int`` coercion and Python-style
+negative indices); calls to *named, user-defined* functions (including
+recursion and default parameters); and the core builtins ``len``, ``text``,
+``number``, ``round`` and ``Ok``/``Err``.
 
 Runtime model
 -------------
@@ -28,17 +33,25 @@ The VM is a stack machine with absolute jump targets, lexical frames
 recursion (one ``_exec`` per call).  ``let`` defines in the current frame,
 ``:=`` updates the nearest binding and otherwise creates a global, ``if``
 branches get their own frame, and ``while`` bodies share the enclosing frame
-exactly like the reference interpreter.  Rendering of printed values and
-decimal division/modulo follow the reference implementation byte-for-byte.
+exactly like the reference interpreter.  ``for`` creates a fresh frame per item
+(so the loop variable does not leak) and ``match`` keeps its subject in a
+private scope frame, which lets ``break``/``continue`` unwind it cleanly.
+Rendering of printed values and decimal division/modulo follow the reference
+implementation byte-for-byte.
 
 Limitations (raise ``IRUnsupported`` / documented runtime errors)
 ------------------------------------------------------------------
-* ``for``, ``match``, ``prove``/``verify`` (and dotted proof names), ``import``.
-* List and map literals, indexing, dotted names / field access (``a.b``) and
-  dotted calls / namespaces (``mod.fn``), pipes and ``try``.
-* All builtins (``sql``, ``ask``, ``len``, ``text``, ``number``, ``round``,
-  ``upper``, ``Ok``/``Err``, result/text/collection helpers, ``mail``,
+* ``prove``/``verify`` (and dotted proof names) and ``import``.
+* Dotted names / field access (``a.b``), dotted calls / namespaces
+  (``mod.fn``), pipes and ``try``.
+* Builtins other than ``len``, ``text``, ``number``, ``round``, ``Ok``/``Err``
+  (``sql``, ``ask``, ``upper``, result/text/collection helpers, ``mail``,
   ``remember``/``recall``, ``wait_user``, ...).
+* ``match`` is supported only for ``Ok``/``Err`` results; there is no
+  structural pattern matching beyond those arms.
+* Map literals are JSON values: field access (``m.k``) stays unsupported in the
+  IR, and ``m[0]`` uses the reference ``int`` coercion, so text-keyed maps are
+  not indexable in either runtime.
 * Lambdas, first-class function values and expression callees (``f()`` where
   ``f`` is a variable).  Calling such a value fails with a clear runtime error.
 * ``break``/``continue`` outside a loop and ``return`` outside a function are
@@ -47,7 +60,8 @@ Limitations (raise ``IRUnsupported`` / documented runtime errors)
   enforced by the IR (the optional ``GAMA_L_MAX_CALL_DEPTH`` guard is).  The
   IR is a prototype, not a hardened runtime.
 * Errors produced while running supported code raise :class:`IRRuntimeError`
-  with messages aligned to the reference runtime, but they are distinct types.
+  (a subclass of :class:`gamal2.GamaError`) with messages aligned to the
+  reference runtime; they remain catchable as :class:`IRError` too.
 
 The public API is :func:`compile_program`, :func:`run_program`, the
 :class:`Program` (with :meth:`Program.disassemble`) and :class:`RunResult`.
@@ -57,7 +71,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import gamal2 as g2
@@ -86,8 +100,19 @@ class IRUnsupported(IRError):
     """Raised when the AST contains a construct outside the documented subset."""
 
 
-class IRRuntimeError(IRError):
-    """Raised when supported code fails at run time (bad call, unknown name...)."""
+class IRRuntimeError(IRError, g2.GamaError):
+    """Raised when supported code fails at run time (bad call, unknown name...).
+
+    Also a :class:`gamal2.GamaError`, so callers that catch the language error
+    family (rather than the IR-specific ``IRError``) still see IR failures.
+    """
+
+    def __init__(self, msg: str, line: int = 0, col: int = 0):
+        IRError.__init__(self, msg)
+        self.msg, self.line, self.col = msg, line, col
+
+    def __str__(self) -> str:
+        return f"{self.msg} (line {self.line}, col {self.col})"
 
 
 # ------------------------------------------------------------------ IR data
@@ -211,12 +236,15 @@ def _binop(op: str, left: Any, right: Any):
         raise IRRuntimeError(f"{op}: {exc}") from None
 
 
-# Builtins implemented by the reference interpreter.  The IR supports none of
-# them; naming the full set lets us fail at compile time with a clear message
-# instead of a confusing runtime "unknown function".
+# Core builtins the IR implements with reference semantics.
+_SUPPORTED_BUILTINS = {"len", "text", "number", "round", "Ok", "Err"}
+
+# Builtins implemented by the reference interpreter but outside the IR subset.
+# Naming them lets us fail at compile time with a clear message instead of a
+# confusing runtime "unknown function".
 _UNSUPPORTED_BUILTINS = {
-    "sql", "ask", "remember", "recall", "wait_user", "len", "text", "number",
-    "sql_write", "mail", "round", "Ok", "Err", "unwrap", "unwrap_or", "is_ok",
+    "sql", "ask", "remember", "recall", "wait_user",
+    "sql_write", "mail", "unwrap", "unwrap_or", "is_ok",
     "is_err", "split", "join", "contains", "trim", "upper", "lower", "replace",
     "starts_with", "ends_with", "keys", "values", "has",
 }
@@ -232,6 +260,79 @@ def _unsupported(node: Any, why: str | None = None) -> None:
     raise IRUnsupported(f"{msg} (line {line}, col {col})")
 
 
+class _ForState:
+    """Cursor for one active ``for`` loop (kept on the VM value stack)."""
+
+    __slots__ = ("items", "index")
+
+    def __init__(self, items: list):
+        self.items = items
+        self.index = 0
+
+
+def _result_matches(kind: str, value: Any) -> bool:
+    if not isinstance(value, g2.ResultVal):
+        return False
+    if kind == "Ok":
+        return value.ok
+    if kind == "Err":
+        return not value.ok
+    return False
+
+
+def _builtin(name: str, args: list, line: int, col: int) -> Any:
+    """Evaluate a supported builtin on already-evaluated arguments.
+
+    Messages mirror ``gamal2.Interpreter.expr`` so IR/interpreted failures are
+    directly comparable; all failures are :class:`IRRuntimeError` (a
+    ``GamaError``), never raw Python exceptions.
+    """
+    if name in ("Ok", "Err"):
+        if len(args) != 1:
+            raise IRRuntimeError(f"{name} expects 1 arg", line, col)
+        return g2.ResultVal(name == "Ok", args[0])
+    if name == "len":
+        if len(args) != 1:
+            raise IRRuntimeError(f"len expects 1 args, got {len(args)}", line, col)
+        value = args[0]
+        if not isinstance(value, (str, list, tuple, dict)):
+            raise IRRuntimeError(
+                f"len expects Text, List or Json, got {g2.tname(value)}", line, col)
+        return len(value)
+    if name == "text":
+        if len(args) != 1:
+            raise IRRuntimeError(f"text expects 1 args, got {len(args)}", line, col)
+        return str(args[0])
+    if name == "number":
+        if len(args) != 1:
+            raise IRRuntimeError(f"number expects 1 args, got {len(args)}", line, col)
+        raw = args[0]
+        try:
+            return Decimal(str(raw))
+        except (InvalidOperation, ValueError, TypeError):
+            raise IRRuntimeError(
+                f"number: cannot convert {raw!r} to Decimal", line, col) from None
+    if name == "round":
+        if not (1 <= len(args) <= 2):
+            raise IRRuntimeError(
+                f"round expects 1..2 args, got {len(args)}", line, col)
+        raw = args[0]
+        try:
+            digits = int(args[1]) if len(args) > 1 else 0
+        except (InvalidOperation, ArithmeticError, ValueError, TypeError):
+            # ``int(Decimal('NaN'))`` raises ``InvalidOperation`` (an
+            # ``ArithmeticError``); the IR reports a language error instead of
+            # leaking a Python exception.
+            raise IRRuntimeError("round: digits must be Int", line, col) from None
+        try:
+            value = Decimal(str(raw))
+            return value.quantize(Decimal(1).scaleb(-digits))
+        except (InvalidOperation, ValueError, TypeError):
+            raise IRRuntimeError(
+                f"round: cannot round {raw!r} to Decimal", line, col) from None
+    raise IRRuntimeError(f"unknown builtin {name}", line, col)  # pragma: no cover
+
+
 # ------------------------------------------------------------------ compiler
 class _Compiler:
     """Compiles one instruction stream (main program, a function body or a
@@ -243,6 +344,7 @@ class _Compiler:
         self.frame_depth = 0
         self.loops: list[dict] = []
         self.in_function = in_function
+        self.match_seq = 0
 
     # -- emission helpers ------------------------------------------------
     def emit(self, op: str, arg: Any = None) -> int:
@@ -285,6 +387,12 @@ class _Compiler:
             return
         if isinstance(stmt, g2.While):
             self.compile_while(stmt)
+            return
+        if isinstance(stmt, g2.For):
+            self.compile_for(stmt)
+            return
+        if isinstance(stmt, g2.Match):
+            self.compile_match(stmt)
             return
         if isinstance(stmt, g2.Break):
             self.compile_break(stmt)
@@ -346,6 +454,83 @@ class _Compiler:
         for index in ctx["breaks"]:
             self.patch(index, end)
 
+    def compile_for(self, stmt: g2.For) -> None:
+        # Reference semantics: evaluate the iterable once, then run the body in
+        # a fresh child frame per item.  The sequence cursor lives on the value
+        # stack so ``continue`` can resume it without copying Python iterators.
+        self.compile_expr(stmt.iterable)
+        self.emit("ITER_PREP", (stmt.line, stmt.col))
+        base_depth = self.frame_depth
+        start = self.here()
+        next_jump = self.emit("FOR_NEXT", None)
+
+        self.emit("NEW_FRAME")
+        self.frame_depth += 1
+        self.emit("LET", stmt.name)
+
+        ctx = {
+            "base_depth": base_depth,
+            "continue": start,
+            "breaks": [],
+            # ``break`` must also discard the sequence cursor left on the stack.
+            "break_cleanup": ["POP"],
+        }
+        self.loops.append(ctx)
+        self.compile_statements(stmt.body)
+        self.loops.pop()
+
+        self.frame_depth -= 1
+        self.emit("POP_FRAME")
+        self.emit("JUMP", start)
+
+        end = self.here()
+        self.patch(next_jump, end)
+        for index in ctx["breaks"]:
+            self.patch(index, end)
+
+    def compile_match(self, stmt: g2.Match) -> None:
+        # Keep the subject in a private scope frame (not on the value stack) so
+        # ``break``/``continue`` inside an arm can unwind it with frames alone.
+        self.compile_expr(stmt.expr)
+        self.emit("MATCH_PREP", (stmt.line, stmt.col))
+        match_base = self.frame_depth
+        self.emit("NEW_FRAME")
+        self.frame_depth = match_base + 1
+        hidden = f"$match#{self.match_seq}"
+        self.match_seq += 1
+        self.emit("LET", hidden)
+
+        end_jumps: list[int] = []
+        for kind, var, body in stmt.arms:
+            next_arm = None
+            if kind != "_":
+                self.emit("LOAD", hidden)
+                next_arm = self.emit("MATCH_JUMP_UNLESS", [kind, None])
+
+            self.emit("NEW_FRAME")
+            self.frame_depth = match_base + 2
+            if var:
+                self.emit("LOAD", hidden)
+                self.emit("GET_RESULT_VALUE")
+                self.emit("LET", var)
+            self.compile_statements(body)
+
+            self.emit("POP_FRAME")  # arm frame
+            self.emit("POP_FRAME")  # match scope
+            end_jumps.append(self.emit("JUMP", None))
+            if next_arm is not None:
+                self.code.instrs[next_arm].arg[1] = self.here()
+            # Fall-through for the next arm still runs inside the match scope.
+            self.frame_depth = match_base + 1
+
+        self.emit("POP_FRAME")
+        self.frame_depth = match_base
+        self.emit("MATCH_FAIL", (stmt.line, stmt.col))
+
+        end = self.here()
+        for index in end_jumps:
+            self.patch(index, end)
+
     def compile_break(self, stmt: g2.Break) -> None:
         if not self.loops:
             _unsupported(stmt, "break outside a loop")
@@ -353,6 +538,8 @@ class _Compiler:
         unwind = self.frame_depth - ctx["base_depth"]
         if unwind:
             self.emit("UNWIND", unwind)
+        for op in ctx.get("break_cleanup", ()):
+            self.emit(op)
         index = self.emit("JUMP", None)
         ctx["breaks"].append(index)
 
@@ -392,6 +579,23 @@ class _Compiler:
                 _unsupported(expr, "dotted names / field access")
             self.emit("LOAD", expr.name)
             return
+        if isinstance(expr, g2.ListExpr):
+            for item in expr.items:
+                self.compile_expr(item)
+            self.emit("BUILD_LIST", len(expr.items))
+            return
+        if isinstance(expr, g2.MapExpr):
+            # ``MapExpr.items`` is an insertion-ordered dict of str -> expr; the
+            # keys are static, so only the values are evaluated.
+            for value in expr.items.values():
+                self.compile_expr(value)
+            self.emit("BUILD_MAP", tuple(expr.items.keys()))
+            return
+        if isinstance(expr, g2.Index):
+            self.compile_expr(expr.base)
+            self.compile_expr(expr.index)
+            self.emit("INDEX", (expr.line, expr.col))
+            return
         if isinstance(expr, g2.Unary):
             if expr.op not in ("!", "-"):
                 _unsupported(expr, f"unary {expr.op!r}")
@@ -409,6 +613,14 @@ class _Compiler:
         if isinstance(expr, g2.Call):
             if expr.name in _UNSUPPORTED_BUILTINS:
                 _unsupported(expr, f"builtin {expr.name!r} is not supported")
+            if expr.name in _SUPPORTED_BUILTINS:
+                for arg in expr.args:
+                    self.compile_expr(arg)
+                self.emit(
+                    "BUILTIN",
+                    (expr.name, len(expr.args), expr.line, expr.col),
+                )
+                return
             if "." in expr.name:
                 _unsupported(expr, "dotted calls / namespaces")
             self.emit("CHECK_CALL", (expr.name, len(expr.args)))
@@ -517,6 +729,64 @@ class _VM:
                 stack.append(stack[-1])
             elif op == "POP":
                 stack.pop()
+            elif op == "BUILD_LIST":
+                count = arg or 0
+                items = stack[-count:] if count else []
+                if count:
+                    del stack[-count:]
+                stack.append(list(items))
+            elif op == "BUILD_MAP":
+                keys = arg or ()
+                count = len(keys)
+                values = stack[-count:] if count else []
+                if count:
+                    del stack[-count:]
+                stack.append(dict(zip(keys, values)))
+            elif op == "INDEX":
+                line, col = arg
+                index = stack.pop()
+                base = stack.pop()
+                try:
+                    stack.append(base[int(index)])
+                except (IndexError, KeyError, TypeError, ValueError):
+                    raise IRRuntimeError(
+                        "index out of range or invalid", line, col) from None
+            elif op == "ITER_PREP":
+                line, col = arg
+                seq = stack.pop()
+                if isinstance(seq, str):
+                    seq = list(seq)
+                if not isinstance(seq, (list, tuple)):
+                    raise IRRuntimeError("for needs list/text", line, col)
+                stack.append(_ForState(list(seq)))
+            elif op == "FOR_NEXT":
+                state = stack[-1]
+                if state.index >= len(state.items):
+                    stack.pop()
+                    ip = arg
+                else:
+                    stack.append(state.items[state.index])
+                    state.index += 1
+            elif op == "BUILTIN":
+                name, argc, line, col = arg
+                args = stack[-argc:] if argc else []
+                if argc:
+                    del stack[-argc:]
+                stack.append(_builtin(name, args, line, col))
+            elif op == "MATCH_PREP":
+                line, col = arg
+                if not isinstance(stack[-1], g2.ResultVal):
+                    raise IRRuntimeError("match expects Result", line, col)
+            elif op == "GET_RESULT_VALUE":
+                stack.append(stack.pop().value)
+            elif op == "MATCH_JUMP_UNLESS":
+                kind, target = arg
+                value = stack.pop()
+                if not _result_matches(kind, value):
+                    ip = target
+            elif op == "MATCH_FAIL":
+                line, col = arg
+                raise IRRuntimeError("match: no arm matched", line, col)
             elif op == "PRINT":
                 self.out.append(_render(stack.pop()))
             elif op == "JUMP":

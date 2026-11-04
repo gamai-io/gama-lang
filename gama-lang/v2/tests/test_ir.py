@@ -170,31 +170,20 @@ class IRMatchesInterpreter(unittest.TestCase):
 
 
 class IRRejectsUnsupported(unittest.TestCase):
+    # ``for``, list/map literals, indexing, ``match`` and the core builtins
+    # (``len``/``text``/``number``/``round``/``Ok``/``Err``) are now supported;
+    # their IR-vs-interpreter comparisons live in ``test_ir_subset.py``.
+
     def assert_unsupported(self, src):
         with self.assertRaises(IR.IRUnsupported) as ctx:
             IR.compile_program(G.parse(src))
         self.assertIn("IR does not support", str(ctx.exception))
-
-    def test_for_loop(self):
-        self.assert_unsupported('for i in [1,2] { print i }\n')
-
-    def test_list_literal(self):
-        self.assert_unsupported('let xs = [1, 2]\n')
-
-    def test_map_literal(self):
-        self.assert_unsupported('let m = { a: 1 }\n')
-
-    def test_index_expression(self):
-        self.assert_unsupported('print xs[0]\n')
 
     def test_dotted_name_and_field_access(self):
         self.assert_unsupported('print m.a\n')
 
     def test_pipe(self):
         self.assert_unsupported('print xs | count\n')
-
-    def test_match_statement(self):
-        self.assert_unsupported('match x { _ { print 1 } }\n')
 
     def test_prove_statement(self):
         self.assert_unsupported('prove p = { a: 1 }\n')
@@ -207,9 +196,6 @@ class IRRejectsUnsupported(unittest.TestCase):
 
     def test_expression_callee(self):
         self.assert_unsupported('print (fn(x: Int) -> Int { return x })(1)\n')
-
-    def test_builtin_call(self):
-        self.assert_unsupported('print len("abc")\n')
 
     def test_builtin_sql_call(self):
         self.assert_unsupported('print sql("select 1")\n')
