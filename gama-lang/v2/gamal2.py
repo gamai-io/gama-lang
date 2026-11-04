@@ -447,7 +447,177 @@ BUILTINS = {
     "round": (set(), "Decimal"),
     "Ok": (set(), "Result"),
     "Err": (set(), "Result"),
+    # Result helpers
+    "unwrap": (set(), "Any"),
+    "unwrap_or": (set(), "Any"),
+    "is_ok": (set(), "Bool"),
+    "is_err": (set(), "Bool"),
+    # Text helpers
+    "split": (set(), "List"),
+    "join": (set(), "Text"),
+    "contains": (set(), "Bool"),
+    "trim": (set(), "Text"),
+    "upper": (set(), "Text"),
+    "lower": (set(), "Text"),
+    "replace": (set(), "Text"),
+    "starts_with": (set(), "Bool"),
+    "ends_with": (set(), "Bool"),
+    # Collection helpers
+    "keys": (set(), "List"),
+    "values": (set(), "List"),
+    "has": (set(), "Bool"),
 }
+
+# Static signatures for the pure core builtins: (min_args, max_args, wants).
+# `wants` is indexed by argument position; the last entry repeats. A `None`
+# slot means "any type"; the type "Any" always skips the static check.
+_CORE_SIGS: dict[str, tuple[int, int, list]] = {
+    "unwrap": (1, 1, [{"Result"}]),
+    "unwrap_or": (2, 2, [{"Result"}, None]),
+    "is_ok": (1, 1, [{"Result"}]),
+    "is_err": (1, 1, [{"Result"}]),
+    "split": (2, 2, [{"Text"}, {"Text"}]),
+    "join": (2, 2, [{"List", "Table"}, {"Text"}]),
+    "contains": (2, 2, [{"Text", "List", "Table"}, None]),
+    "trim": (1, 1, [{"Text"}]),
+    "upper": (1, 1, [{"Text"}]),
+    "lower": (1, 1, [{"Text"}]),
+    "replace": (3, 3, [{"Text"}, {"Text"}, {"Text"}]),
+    "starts_with": (2, 2, [{"Text"}, {"Text"}]),
+    "ends_with": (2, 2, [{"Text"}, {"Text"}]),
+    "keys": (1, 1, [{"Json"}]),
+    "values": (1, 1, [{"Json"}]),
+    "has": (2, 2, [{"Json"}, {"Text"}]),
+}
+
+def check_core_sig(name: str, types: list, call: Call) -> None:
+    """Validate arity and argument types for a pure core builtin."""
+    mn, mx, wants = _CORE_SIGS[name]
+    if not (mn <= len(types) <= mx):
+        raise GamaTypeError(
+            f"{name} expects {mn}..{mx} args, got {len(types)}", call.line, call.col)
+    for i, t in enumerate(types):
+        want = wants[min(i, len(wants) - 1)]
+        if want is None or t == "Any":
+            continue
+        if t not in want:
+            raise GamaTypeError(
+                f"{name}: arg {i + 1} is {t}, expected {'/'.join(sorted(want))}",
+                call.line, call.col)
+
+def _need_args(name: str, args: list, n: int, line: int = 0, col: int = 0) -> None:
+    if len(args) != n:
+        raise GamaRuntimeError(
+            f"{name} expects {n} args, got {len(args)}", line, col)
+
+def _as_text(v, name: str, line: int = 0, col: int = 0) -> str:
+    if isinstance(v, str):
+        return v
+    if isinstance(v, Decimal):
+        return format(v, "f")
+    raise GamaRuntimeError(f"{name} expects Text, got {tname(v)}", line, col)
+
+def _join_item(v) -> str:
+    if isinstance(v, str):
+        return v
+    if isinstance(v, Decimal):
+        return format(v, "f")
+    if v is None:
+        return ""
+    return str(v)
+
+def eval_core_builtin(name: str, args: list, line: int = 0, col: int = 0):
+    """Evaluate a pure core builtin on already-evaluated arguments."""
+    if name == "unwrap":
+        _need_args(name, args, 1, line, col)
+        r = args[0]
+        if not isinstance(r, ResultVal):
+            raise GamaRuntimeError("unwrap expects Result", line, col)
+        if not r.ok:
+            raise GamaRuntimeError(f"unwrap: {r}", line, col)
+        return r.value
+    if name == "unwrap_or":
+        _need_args(name, args, 2, line, col)
+        r = args[0]
+        if not isinstance(r, ResultVal):
+            raise GamaRuntimeError("unwrap_or expects Result", line, col)
+        return r.value if r.ok else args[1]
+    if name == "is_ok":
+        _need_args(name, args, 1, line, col)
+        r = args[0]
+        if not isinstance(r, ResultVal):
+            raise GamaRuntimeError("is_ok expects Result", line, col)
+        return r.ok
+    if name == "is_err":
+        _need_args(name, args, 1, line, col)
+        r = args[0]
+        if not isinstance(r, ResultVal):
+            raise GamaRuntimeError("is_err expects Result", line, col)
+        return not r.ok
+    if name == "split":
+        _need_args(name, args, 2, line, col)
+        s = _as_text(args[0], name, line, col)
+        sep = _as_text(args[1], name, line, col)
+        if sep == "":
+            raise GamaRuntimeError("split: separator must not be empty", line, col)
+        return s.split(sep)
+    if name == "join":
+        _need_args(name, args, 2, line, col)
+        seq = args[0]
+        if not isinstance(seq, (list, tuple)):
+            raise GamaRuntimeError("join expects List", line, col)
+        sep = _as_text(args[1], name, line, col)
+        return sep.join(_join_item(x) for x in seq)
+    if name == "contains":
+        _need_args(name, args, 2, line, col)
+        hay, needle = args
+        if isinstance(hay, str):
+            return _as_text(needle, name, line, col) in hay
+        if isinstance(hay, (list, tuple)):
+            return needle in hay
+        raise GamaRuntimeError("contains expects Text or List", line, col)
+    if name == "trim":
+        _need_args(name, args, 1, line, col)
+        return _as_text(args[0], name, line, col).strip()
+    if name == "upper":
+        _need_args(name, args, 1, line, col)
+        return _as_text(args[0], name, line, col).upper()
+    if name == "lower":
+        _need_args(name, args, 1, line, col)
+        return _as_text(args[0], name, line, col).lower()
+    if name == "replace":
+        _need_args(name, args, 3, line, col)
+        s = _as_text(args[0], name, line, col)
+        old = _as_text(args[1], name, line, col)
+        new = _as_text(args[2], name, line, col)
+        return s.replace(old, new)
+    if name == "starts_with":
+        _need_args(name, args, 2, line, col)
+        s = _as_text(args[0], name, line, col)
+        return s.startswith(_as_text(args[1], name, line, col))
+    if name == "ends_with":
+        _need_args(name, args, 2, line, col)
+        s = _as_text(args[0], name, line, col)
+        return s.endswith(_as_text(args[1], name, line, col))
+    if name == "keys":
+        _need_args(name, args, 1, line, col)
+        m = args[0]
+        if not isinstance(m, dict):
+            raise GamaRuntimeError("keys expects Json", line, col)
+        return list(m.keys())
+    if name == "values":
+        _need_args(name, args, 1, line, col)
+        m = args[0]
+        if not isinstance(m, dict):
+            raise GamaRuntimeError("values expects Json", line, col)
+        return list(m.values())
+    if name == "has":
+        _need_args(name, args, 2, line, col)
+        m, key = args
+        if not isinstance(m, dict):
+            raise GamaRuntimeError("has expects Json", line, col)
+        return _as_text(key, name, line, col) in m
+    raise GamaRuntimeError(f"unknown builtin {name}", line, col)
 
 def sqlite_schema() -> dict[str, set[str]] | None:
     """All user tables and columns in GAMA_L_DB (read-only), or None."""
@@ -664,7 +834,9 @@ class Checker:
             if e.name in BUILTINS:
                 eff, rt = BUILTINS[e.name]
                 self.effects |= eff
-                for a in e.args: self.expr(a, row)
+                types = [self.expr(a, row) for a in e.args]
+                if e.name in _CORE_SIGS:
+                    check_core_sig(e.name, types, e)
                 if e.name == "sql":
                     q = e.args[0].value if e.args and isinstance(e.args[0], Literal) else ""
                     fields = sql_fields(q)
@@ -1063,6 +1235,9 @@ class Interpreter:
                 if not self.interactive:
                     return Denied()
                 return input(f"[GAMA-L] {self.expr(e.args[0], env, row)} ").strip().lower() in ("yes", "y", "da")
+            if e.name in _CORE_SIGS:
+                return eval_core_builtin(
+                    e.name, [self.expr(a, env, row) for a in e.args], e.line, e.col)
             if e.name == "len": return len(self.expr(e.args[0], env, row))
             if e.name == "text": return str(self.expr(e.args[0], env, row))
             if e.name == "sql_write":
