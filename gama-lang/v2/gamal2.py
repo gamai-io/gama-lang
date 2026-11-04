@@ -1201,6 +1201,37 @@ def _proof_raw(name, value):
     return json.dumps({"name": name, "value": value}, sort_keys=True,
                       ensure_ascii=False, separators=(",", ":"), default=str)
 
+def _proof_env(name):
+    """Read an intent/lease env var; empty or whitespace means unset."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    raw = raw.strip()
+    return raw or None
+
+def _proof_binding(intent, lease):
+    """Canonical intent/lease suffix for proof hashing and signing.
+
+    Unset (None, None) returns an empty suffix so legacy receipts keep the
+    exact legacy payload ``prev + raw`` and their old hashes/signatures.
+    Set values are appended deterministically so the chain hash binds the
+    receipt to its intent and lease as well.
+    """
+    if intent is None and lease is None:
+        return ""
+    parts = []
+    if intent is not None:
+        parts.append("intent=" + json.dumps(
+            intent, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    if lease is not None:
+        parts.append("lease=" + json.dumps(
+            lease, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    return "\n" + "\n".join(parts)
+
+def _proof_payload(prev, raw, intent=None, lease=None):
+    """Single canonical payload for both the hash chain and the HMAC signature."""
+    return str(prev) + raw + _proof_binding(intent, lease)
+
 class Interpreter:
     def __init__(self, interactive=False):
         self.env = Env(); self.funcs = {}; self.out = []; self.memory = {}
@@ -1352,19 +1383,48 @@ class Interpreter:
         if isinstance(v, (dict, list)): return json.dumps(v, ensure_ascii=False, default=str)
         if isinstance(v, ResultVal): return str(v)
         return str(v)
+    @staticmethod
+    def _check_proof_binding(name, rec, intent, lease):
+        """Enforce ``(intent, lease, key)`` uniqueness for one proof key.
+
+        A proof key is bound to the intent/lease recorded when it was first
+        created (or loaded from the ledger). Re-proving the same key under a
+        different binding is an error, never a silent idempotent hit, so a
+        receipt cannot be replayed under another intent or lease.
+        """
+        if intent is not None:
+            old_intent = rec.get("intent")
+            if old_intent != intent:
+                raise GamaRuntimeError(
+                    f"prove: proof {name!r} is bound to intent {old_intent!r}, "
+                    f"not {intent!r}")
+        if lease is not None:
+            old_lease = rec.get("lease")
+            if old_lease != lease:
+                raise GamaRuntimeError(
+                    f"prove: proof {name!r} is bound to lease {old_lease!r}, "
+                    f"not {lease!r}")
     def prove(self, name, val):
         raw = _proof_raw(name, val)
+        intent = _proof_env("GAMA_L_PROOF_INTENT")
+        lease = _proof_env("GAMA_L_PROOF_LEASE")
         if name in self.proofs:
             old = self.proofs[name]
             if old.get("value") == val or _proof_raw(old.get("name"), old.get("value")) == raw:
+                self._check_proof_binding(name, old, intent, lease)
                 return old
             raise GamaRuntimeError(f"prove: duplicate key {name!r} with different value")
-        h = hashlib.sha256((self.prev_proof + raw).encode()).hexdigest()
+        payload = _proof_payload(self.prev_proof, raw, intent, lease)
+        h = hashlib.sha256(payload.encode()).hexdigest()
         rec = {"name": name, "value": val, "sha256": h, "prev": self.prev_proof,
                "id": h[:16], "ts": __import__("time").time()}
+        if intent is not None:
+            rec["intent"] = intent
+        if lease is not None:
+            rec["lease"] = lease
         key = os.environ.get("GAMA_L_PROOF_KEY", "").encode()
         if key:
-            rec["sig"] = hmac.new(key, (self.prev_proof + raw).encode(), hashlib.sha256).hexdigest()
+            rec["sig"] = hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()
         self.prev_proof = h
         self.proof_chain.append(h)
         self.proofs[name] = rec
@@ -1373,7 +1433,11 @@ class Interpreter:
     def verify(self, rec):
         if not isinstance(rec, dict) or "sha256" not in rec: return {"ok": False, "errors": ["not_a_proof"]}
         raw = _proof_raw(rec.get("name"), rec.get("value"))
-        exp = hashlib.sha256((rec.get("prev", "GENESIS") + raw).encode()).hexdigest()
+        rec_intent = rec.get("intent")
+        rec_lease = rec.get("lease")
+        prev = rec.get("prev", "GENESIS")
+        payload = _proof_payload(prev, raw, rec_intent, rec_lease)
+        exp = hashlib.sha256(payload.encode()).hexdigest()
         errs = []
         if not hmac.compare_digest(exp, str(rec.get("sha256"))): errs.append("hash_mismatch")
         if rec.get("prev") not in ("GENESIS",) and rec.get("prev") not in self.proof_chain:
@@ -1384,10 +1448,27 @@ class Interpreter:
             if not key:
                 errs.append("missing_key")
             else:
-                want = hmac.new(key, (str(rec.get("prev", "GENESIS")) + raw).encode(), hashlib.sha256).hexdigest()
+                want = hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()
                 if not hmac.compare_digest(want, str(sig)): errs.append("bad_signature")
         elif os.environ.get("GAMA_L_REQUIRE_SIG") == "1":
             errs.append("missing_signature")
+        env_intent = _proof_env("GAMA_L_PROOF_INTENT")
+        env_lease = _proof_env("GAMA_L_PROOF_LEASE")
+        if env_intent is not None:
+            if rec_intent is None:
+                errs.append("intent_missing")
+            elif rec_intent != env_intent:
+                errs.append("intent_mismatch")
+        if env_lease is not None:
+            if rec_lease is None:
+                errs.append("lease_missing")
+            elif rec_lease != env_lease:
+                errs.append("lease_mismatch")
+        if os.environ.get("GAMA_L_REQUIRE_INTENT_LEASE") == "1":
+            if env_intent is None:
+                errs.append("intent_not_configured")
+            if env_lease is None:
+                errs.append("lease_not_configured")
         return {"ok": not errs, "expected": exp, "errors": errs}
     def invoke(self, fv, args, env, row, line, col):
         depth_limit = self._env_int("GAMA_L_MAX_CALL_DEPTH", 1000)

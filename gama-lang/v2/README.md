@@ -111,7 +111,7 @@ python3 gamal2.py fmt --write file.gm  # write in place
 - `ask` uses `gama_ai` when `GAMA_L_AI_URL` is set; config via `GAMA_L_AI_KEY`,
   `GAMA_L_AI_MODEL`, `GAMA_L_AI_ALLOW_HTTP=1` for local HTTP; HTTPS by default,
   retries 429/5xx, 1 MiB response cap; redirects are refused
-- `prove` (hash-chained receipt, optional HMAC via `GAMA_L_PROOF_KEY`, optional persistent JSONL ledger via `GAMA_L_PROOF_LEDGER`) and `verify` (tamper detection)
+- `prove` (hash-chained receipt, optional HMAC via `GAMA_L_PROOF_KEY`, optional persistent JSONL ledger via `GAMA_L_PROOF_LEDGER`, optional intent/lease binding via `GAMA_L_PROOF_INTENT`/`GAMA_L_PROOF_LEASE`) and `verify` (tamper detection, intent/lease mismatch rejection; `GAMA_L_REQUIRE_INTENT_LEASE=1` requires both env values and a match)
 - runtime limits via `GAMA_L_MAX_CALL_DEPTH` (default 1000; CPython frames may trigger first, lower it for predictable caps) and `GAMA_L_MAX_OUTPUT_CHARS` (default 1000000)
 - static type errors and static effect violations
 - CLI `run`, `check`, `fmt`, `test`, `pkg`, `lsp`
@@ -119,7 +119,7 @@ python3 gamal2.py fmt --write file.gm  # write in place
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 321/321
+python3 -m unittest discover -s tests -v   # 337/337
 python3 gamal2.py doctor --json                # 8/8 checks
 ```
 
