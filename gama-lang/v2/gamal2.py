@@ -119,7 +119,7 @@ def lex(src: str) -> list[Tok]:
         two = src[i:i+2]
         if two in ("==","!=","<=",">=","&&","||",":=","->"):
             out.append(Tok("OP", two, line, col)); i += 2; col += 2; continue
-        if c in "+-*/%<>!|(){}[],:;=":
+        if c in "+-*/%<>!|(){}[],:;=?":
             out.append(Tok("OP", c, line, col)); i += 1; col += 1; continue
         raise GamaError(f"unexpected character {c!r}", line, col)
     out.append(Tok("EOF", None, line, col))
@@ -176,6 +176,9 @@ class Return: expr: Any; line: int; col: int
 class Prove: name: str; expr: Any; line: int; col: int
 @dataclass
 class Verify: expr: Any; line: int; col: int
+@dataclass
+class Try: expr: Any; line: int; col: int
+
 @dataclass
 class Print: expr: Any; line: int; col: int
 @dataclass
@@ -350,9 +353,14 @@ class Parser:
         return self.postfix()
     def postfix(self):
         e = self.primary()
-        while self.at("OP", "["):
-            x = self.take(); idx = self.expr(); self.expect("OP", "]")
-            e = Index(e, idx, x.line, x.col)
+        while True:
+            if self.at("OP", "["):
+                x = self.take(); idx = self.expr(); self.expect("OP", "]")
+                e = Index(e, idx, x.line, x.col)
+            elif self.at("OP", "?"):
+                x = self.take(); e = Try(e, x.line, x.col)
+            else:
+                break
         return e
     def primary(self):
         x = self.peek()
@@ -604,6 +612,15 @@ class Checker:
                 raise GamaTypeError("index needs List/Table/Text", e.line, e.col)
             if it != "Int": raise GamaTypeError("index must be Int", e.line, e.col)
             return "Text" if bt == "Text" else ("Json" if bt == "Table" else "Any")
+        if isinstance(e, Try):
+            t = self.expr(e.expr, row)
+            if t not in ("Result", "Any"):
+                raise GamaTypeError("? expects Result", e.line, e.col)
+            if self.ret_type is None:
+                raise GamaTypeError("? outside function", e.line, e.col)
+            if self.ret_type not in ("Result", "Any"):
+                raise GamaTypeError("? requires function returning Result", e.line, e.col)
+            return "Any"
         if isinstance(e, Attr):
             t = self.expr(e.base)
             if t not in ("Json", "Any", "Table"): raise GamaTypeError("field access needs Json/Table", e.line, e.col)
@@ -797,6 +814,9 @@ def fmt_source(src: str) -> str:
 class ReturnSignal(Exception):
     def __init__(self, value): self.value = value
 
+class PropagateSignal(Exception):
+    def __init__(self, value): self.value = value
+
 class BreakSignal(Exception): pass
 class ContinueSignal(Exception): pass
 
@@ -823,7 +843,10 @@ class Interpreter:
         self.proofs = {}; self.proof_chain = []; self.prev_proof = "GENESIS"; self.interactive = interactive
         self.last_ask = None
     def run(self, stmts):
-        for s in stmts: self.stmt(s, self.env)
+        try:
+            for s in stmts: self.stmt(s, self.env)
+        except PropagateSignal:
+            raise GamaRuntimeError("? outside function") from None
         return self
     def stmt(self, s, env):
         if isinstance(s, Let): env.set(s.name, self.expr(s.expr, env))
@@ -932,6 +955,13 @@ class Interpreter:
                 return base[int(idx)]
             except (IndexError, KeyError, TypeError, ValueError):
                 raise GamaRuntimeError("index out of range or invalid", e.line, e.col) from None
+        if isinstance(e, Try):
+            v = self.expr(e.expr, env, row)
+            if not isinstance(v, ResultVal):
+                raise GamaRuntimeError("? expects Result", e.line, e.col)
+            if v.ok:
+                return v.value
+            raise PropagateSignal(v.value)
         if isinstance(e, Attr):
             base = self.expr(e.base, env, row)
             if not isinstance(base, dict): raise GamaRuntimeError("field access needs Json/Table", e.line, e.col)
@@ -1061,6 +1091,7 @@ class Interpreter:
                 try:
                     for s in fn.body: self.stmt(s, local)
                 except ReturnSignal as r: return r.value
+                except PropagateSignal as p: return ResultVal(False, p.value)
                 return None
             raise GamaRuntimeError(f"unknown function {e.name}", e.line, e.col)
         if isinstance(e, Pipe):

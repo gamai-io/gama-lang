@@ -95,6 +95,7 @@ python3 gamal2.py fmt --write file.gm  # write in place
 - `if` / `else` blocks, `return`
 - `for x in list/text`, `while cond`, `break`/`continue`, list/text indexing
 - `Ok`/`Err` Result values and `match` arms (`Ok(v)`, `Err(e)`, `_`)
+- `expr?` Result propagation: unwraps `Ok`, returns `Err` from the enclosing function; the function must return `Result`
 - literals: text, int, decimal, bool, null, list, map
 - arithmetic/comparison/boolean operators
 - pipes: `filter`, `select`, `sum`, `limit`, `count`, `map`
@@ -114,7 +115,7 @@ python3 gamal2.py fmt --write file.gm  # write in place
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 217/217
+python3 -m unittest discover -s tests -v   # 221/221
 ```
 
 Conformance coverage: arithmetic/pipes (20 cases), type errors, effect
@@ -131,7 +132,7 @@ reproducible release metadata.
 ## Not implemented yet
 
 - deployed/public package registry (the HTTP server is implemented and testable)
-- `?` propagation and real namespace/export modules (`use` is currently a no-op)
+- real namespace/export modules (`use` is currently a no-op)
 - lambdas/first-class functions
 - persistent proof chain bound to intent/lease; IR/bytecode and runtime limits
 - full type inference, records/enums/generics
