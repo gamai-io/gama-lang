@@ -149,7 +149,14 @@ python3 gamal2.py ir compile --json FILE.gm
 ```
 
 `ir run` parses and type-checks the file with the normal front end, compiles the
-checked AST with `gama_ir`, and prints the VM output. A construct outside the IR
+checked AST with `gama_ir`, and prints the VM output. Plain
+`import "lib.gm"` statements are resolved by the same core loader `run` uses
+(flattened, with the project-root bound, cycle detection and depth limit), so
+imported functions, constants and records work in the IR backend too. Aliased
+imports (`import "lib.gm" as m`) flatten, but `m.fn(...)` is a dotted call and
+is rejected with `IRUnsupported`; `gama_ir.compile_program` on a bare source
+string has no filesystem context for imports — use `gama_ir.compile_file` for
+files. A construct outside the IR
 subset exits nonzero with `IRUnsupported: IR does not support ... (line, col)`;
 an IR runtime failure reports `IRRuntimeError`; parse/check/file errors keep
 their usual message. `compile`/`disasm` print one `index  OPCODE [arg]` line per

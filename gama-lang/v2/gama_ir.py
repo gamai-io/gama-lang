@@ -52,7 +52,12 @@ implementation byte-for-byte.
 
 Limitations (raise ``IRUnsupported`` / documented runtime errors)
 ------------------------------------------------------------------
-* ``prove``/``verify`` (and dotted proof names) and ``import``.
+* ``prove``/``verify`` (and dotted proof names).  Plain ``import "lib.gm"`` is
+  supported only through :func:`compile_file` (and the ``gamal2 ir run|compile
+  FILE`` CLI), where the core loader flattens imported statements before
+  compiling; compiling a bare source string has no filesystem context to
+  resolve imports.  Aliased imports flatten too, but their ``alias.fn`` calls
+  remain dotted calls.
 * Dotted *calls* / namespaces (``mod.fn``), pipes and ``try``.  (Dotted *names*
   are supported: ``p.x`` field access and ``Color.Red`` enum variants.)
 * Builtins other than ``len``, ``text``, ``number``, ``round``, ``Ok``/``Err``
@@ -438,6 +443,14 @@ class _Compiler:
         if isinstance(stmt, g2.For):
             self.compile_for(stmt)
             return
+        if isinstance(stmt, g2.Import):
+            # A source string has no file to resolve against; ``compile_file``
+            # lets the core loader flatten plain imports before we get here.
+            _unsupported(
+                stmt,
+                "imports are resolved only by compile_file() / 'ir run FILE'; "
+                "a bare source string has no filesystem context",
+            )
         if isinstance(stmt, g2.Match):
             self.compile_match(stmt)
             return
@@ -1045,6 +1058,9 @@ def compile_program(ast: Any) -> Program:
     ``ast`` is the list of statement nodes returned by ``gamal2.parse`` or
     ``gamal2.check``.  Passing a :class:`Program` returns it unchanged; passing
     a source string is a convenience that parses and checks it first.
+
+    Imports cannot be resolved from a source string; use :func:`compile_file`
+    for a ``.gm`` file (plain imports are flattened by the core loader).
     """
     if isinstance(ast, Program):
         return ast
@@ -1059,6 +1075,23 @@ def compile_program(ast: Any) -> Program:
     return Program(compiler.code, top_records, top_enums)
 
 
+def compile_file(path: Any) -> Program:
+    """Compile a ``.gm`` file, resolving imports first via the core loader.
+
+    ``gamal2.check_file`` is the same front end ``gamal2 run`` uses: it applies
+    ``_flatten`` (plain imports are expanded in place), the project-root import
+    bound, cycle detection and the import depth limit, then type-checks the
+    flattened program.  Nothing about that filesystem policy is reimplemented
+    here; this is purely a file-aware wrapper around :func:`compile_program`.
+
+    Plain ``import "lib.gm"`` therefore works in the IR backend.  Aliased
+    imports (``import "lib.gm" as m``) also flatten, but ``m.fn(...)`` stays a
+    dotted call and is rejected with :class:`IRUnsupported`, matching the IR
+    subset's documented namespace limitation.
+    """
+    return compile_program(g2.check_file(str(path)))
+
+
 def run_program(ast: Any, env: Any = None) -> RunResult:
     """Compile (if needed) and run a program, returning printed output + globals.
 
@@ -1069,3 +1102,12 @@ def run_program(ast: Any, env: Any = None) -> RunResult:
     vm = _VM(env, program.records, program.enums)
     vm._exec(program.main, vm.root)
     return RunResult(list(vm.out), dict(vm.root.outermost().vars))
+
+
+def run_file(path: Any, env: Any = None) -> RunResult:
+    """Compile a ``.gm`` file with :func:`compile_file` and run it on the VM.
+
+    This is the file-aware counterpart of :func:`run_program`, so plain imports
+    (and missing/cyclic import errors) behave exactly like the interpreter.
+    """
+    return run_program(compile_file(path), env=env)
