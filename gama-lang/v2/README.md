@@ -149,14 +149,17 @@ python3 gamal2.py ir compile --json FILE.gm
 ```
 
 `ir run` parses and type-checks the file with the normal front end, compiles the
-checked AST with `gama_ir`, and prints the VM output. Plain
-`import "lib.gm"` statements are resolved by the same core loader `run` uses
-(flattened, with the project-root bound, cycle detection and depth limit), so
-imported functions, constants and records work in the IR backend too. Aliased
-imports (`import "lib.gm" as m`) flatten, but `m.fn(...)` is a dotted call and
-is rejected with `IRUnsupported`; `gama_ir.compile_program` on a bare source
-string has no filesystem context for imports — use `gama_ir.compile_file` for
-files. A construct outside the IR
+checked AST with `gama_ir`, and prints the VM output. `import "lib.gm"`
+statements are resolved by the same core loader `run` uses (flattened, with the
+project-root bound, cycle detection and depth limit), so imported functions,
+constants and records work in the IR backend too. Aliased imports
+(`import "lib.gm" as m`) flatten into dotted declarations (`m.fn`, `m.pi`,
+`m.Point`) and are supported: `m.fn(...)`, `m.pi` and positional record
+construction `m.Point(1, 2)` (including `let p: m.Point`) resolve against the
+same tables as local names. Aliased `enum` declarations are still rejected by
+the core loader, so `m.Color.Red` is unavailable to both backends.
+`gama_ir.compile_program` on a bare source string has no filesystem context for
+imports — use `gama_ir.compile_file` for files. A construct outside the IR
 subset exits nonzero with `IRUnsupported: IR does not support ... (line, col)`;
 an IR runtime failure reports `IRRuntimeError`; parse/check/file errors keep
 their usual message. `compile`/`disasm` print one `index  OPCODE [arg]` line per
@@ -177,10 +180,13 @@ Exact supported subset:
 - Builtins: `len`, `text`, `number`, `round`, `Ok`, `Err` only.
 
 Not supported (raises `IRUnsupported`; the normal interpreter still supports
-them): `prove`/`verify`, `import`, field access `a.b`, namespaced/dotted calls,
-pipes, `try`/`expr?`, lambdas and first-class/expression callees, structural
-matching beyond the `Ok`/`Err` arms, and all other builtins (`sql`, `ask`,
-`split`, `unwrap`, `wait_user`, mail, remember/recall, ...). The IR also does
+them): `prove`/`verify`, unresolved `import` nodes (file imports go through
+`compile_file`), bare `Attr` expression nodes, pipes, `try`/`expr?`, lambdas and
+first-class/expression callees (including reading a namespaced function as a
+value), structural matching beyond `Ok`/`Err`/nullary-enum arms, aliased `enum`
+declarations (rejected earlier by the core loader for both backends), and all
+other builtins (`sql`, `ask`, `split`, `unwrap`, `wait_user`, mail,
+remember/recall, ...). The IR also does
 not enforce `GAMA_L_MAX_STEPS`/`GAMA_L_LOOP_LIMIT` (it does honour
 `GAMA_L_MAX_CALL_DEPTH`); it is a prototype, not a hardened runtime. Map
 literals are JSON values, so text-keyed maps are not indexable. Successful
@@ -217,7 +223,7 @@ error messages keep the interpreter's text and line/col.
 - runtime limits via `GAMA_L_MAX_CALL_DEPTH` (default 200; the effective cap is additionally clamped to `(sys.getrecursionlimit() - 100) // 4`, so an explicit higher value cannot exhaust the CPython stack — deep recursion raises `GamaError`, never `RecursionError`) and `GAMA_L_MAX_OUTPUT_CHARS` (default 1000000)
 - optional global step limit via `GAMA_L_MAX_STEPS` (unset, blank, malformed, or negative = disabled): counts every executed statement dispatch (including nested block and function-body statements) plus one tick per `for`/`while` body iteration; expression evaluation and the function call itself are not counted separately. On exceed raises `GamaRuntimeError` with the count, the limit, and the source line/col. `GAMA_L_LOOP_LIMIT` (default 1000000) still bounds `while` iterations independently; a present but blank or non-integer value raises `GamaRuntimeError` instead of leaking `ValueError`
 - optional expression step limit via `GAMA_L_MAX_EXPR_STEPS` (unset, blank, malformed, or negative = disabled): counts every `Interpreter.expr` evaluation; nested calls count individually (e.g. `1 + 2` is three steps: the `Binary` plus both `Literal`s). On exceed raises `GamaRuntimeError` with the count, the limit, and the source line/col. It is independent of `GAMA_L_MAX_STEPS`, call depth, output, and loop limits, and remains counted when the cap is disabled
-- standalone bytecode IR prototype (`gama_ir.py`) for a documented subset: statements/expressions, `if`/`else if`, `while`, `for`, list/map literals and indexing, `break`/`continue`, `fn`, `Ok`/`Err` + `match`, and the core builtins `len`/`text`/`number`/`round`; also records/enums, field access and enum variants; plain imports resolve through `compile_file`, aliased/dotted calls remain unsupported; opt-in via `gamal2 ir run|compile` (see above), the interpreter and default `run` backend are unchanged
+- standalone bytecode IR prototype (`gama_ir.py`) for a documented subset: statements/expressions, `if`/`else if`, `while`, `for`, list/map literals and indexing, `break`/`continue`, `fn`, `Ok`/`Err` + `match`, and the core builtins `len`/`text`/`number`/`round`; also records/enums, field access and enum variants; plain and aliased imports resolve through `compile_file` (`m.fn(...)`, `m.pi`, `m.Point(1, 2)` and `let p: m.Point` work; aliased `enum` declarations are rejected by the core loader); opt-in via `gamal2 ir run|compile` (see above), the interpreter and default `run` backend are unchanged
 - enums: nullary `enum Color { Red, Green, Blue }` and payload `enum Option { Some(Int, Text), None }`; values are `Enum.Variant` (nullary) or `Variant(args...)` / `Enum.Variant(args...)` (one or more payloads), annotation `let x: Option = Some(5)`, nominal equality (cross-enum `==` is a type error), and `match` arms `Enum.Variant`, `Variant`, `Variant(x)`, `Enum.Variant(x)`, `_`. Payload printing is deterministic: `Enum.Variant(<field-value>)` where the payload is rendered like a record field value (text JSON-quoted, decimals plain fixed form, `null` for null) and nullary variants print `Enum.Variant`. Wrong payload type/arity, unknown or ambiguous constructors, and nullary/payload pattern mismatches raise `GamaTypeError`. Limits: payload variants are non-generic (types must be simple identifiers); a bare constructor must be unique across enums (otherwise qualify `Enum.Variant(...)`); nullary variants cannot be called with `()`; payload variants cannot be used as a bare value; enums remain top-level and distinct from records/functions
 - nominal record (struct) types: `record Point { x: Int, y: Int }`, positional construction `Point(1, 2)`, named construction `Point { x: 3, y: 4 }` (local record names only), typed fields, dotted access `p.x` (including nested `l.a.x`), in-place field assignment `p.x := 3` / `l.a.x := 5`, `let p: Point = ...`, and nominal/value equality. Constructors enforce arity, missing/extra/duplicate fields and field types (`GamaTypeError`); unknown field access is rejected statically when the base type is a record. Assignment resolves the longest dotted variable prefix as the receiver and mutates the record in place (aliases observe the update; namespaced constants such as `geo.origin.x := 7` work). Wrong field/type, a non-record receiver and an unknown base variable are `GamaTypeError`. Printing is deterministic: declaration-order fields, `Name { x: 1, y: "text" }`, decimals with their plain fixed form, and text JSON-quoted. Records are exported through aliased imports (`geo.Point`) and their type names are namespaced (`geo.Point { ... }`). Gaps: no record methods or copy/`with` syntax, constructor calls are not first-class values, `record` is contextual (not a reserved word), named construction requires a local declaration, the IR backend now supports records/enums for the documented subset (field assignment is not part of the IR subset), and LSP has record/enum completion, hover, definition, references and rename
 - LSP completion/hover for records/enums (fields, variants, declarations) and VS Code grammar/snippets

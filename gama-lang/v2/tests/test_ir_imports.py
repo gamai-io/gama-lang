@@ -1,10 +1,10 @@
-"""IR backend: plain ``import`` resolution.
+"""IR backend: ``import`` resolution.
 
 The opt-in IR backend must see the same flattened program the interpreter
 runs.  ``gama_ir.compile_file`` delegates to the core loader
 (``gamal2.check_file``), so root bounds, cycle detection and import depth are
-not reimplemented here.  These tests pin that behaviour plus the documented
-limits (aliased/namespaced imports stay outside the IR subset).
+not reimplemented here.  These tests pin plain imports plus the aliased import
+path (dotted functions, constants and records resolve like local names).
 """
 import pathlib
 import subprocess
@@ -148,26 +148,21 @@ class IrImportTests(unittest.TestCase):
             IR.compile_file(main)
         self.assertIn("import outside project root", str(ctx.exception))
 
-    # -- documented limits --------------------------------------------------
-    def test_namespaced_import_is_irunsupported(self):
+    # -- aliased imports ----------------------------------------------------
+    def test_namespaced_import_matches_interpreter(self):
         self.write("lib.gm", "fn double(x: Int) -> Int { return x * 2 }\n")
         main = self.write("main.gm", 'import "lib.gm" as m\nprint m.double(21)\n')
-        # The reference interpreter handles it...
-        self.assertEqual(G.run_file(str(main)).out, ["42"])
-        # ...but the IR subset rejects dotted calls, with a precise location.
-        with self.assertRaises(IR.IRUnsupported) as ctx:
-            IR.compile_file(main)
-        self.assertIn("dotted calls / namespaces", str(ctx.exception))
-        self.assertIn("line 2", str(ctx.exception))
+        self.assertEqual(self.assert_parity(main), ["42"])
 
-    def test_namespaced_import_cli_fails_clearly(self):
+    def test_namespaced_import_cli_matches_default_run(self):
         self.write("lib.gm", "fn double(x: Int) -> Int { return x * 2 }\n")
         main = self.write("main.gm", 'import "lib.gm" as m\nprint m.double(21)\n')
-        p = self.run_cli("ir", "run", str(main))
-        self.assertNotEqual(p.returncode, 0)
-        self.assertEqual(p.stdout, "")
-        self.assertIn("IRUnsupported:", p.stderr)
-        self.assertIn("dotted calls / namespaces", p.stderr)
+        ref = self.run_cli("run", str(main))
+        got = self.run_cli("ir", "run", str(main))
+        self.assertEqual(ref.returncode, 0, ref.stderr + ref.stdout)
+        self.assertEqual(got.returncode, 0, got.stderr + got.stdout)
+        self.assertEqual(got.stdout, ref.stdout)
+        self.assertIn("42", got.stdout)
 
     def test_compile_program_source_string_import_points_to_file_api(self):
         # ``compile_program(str)`` has no filesystem context; the core checker

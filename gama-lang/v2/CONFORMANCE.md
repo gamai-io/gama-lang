@@ -61,10 +61,11 @@ These are outside the T1–T10 checks or only partially covered; see
    bytecode IR prototype (`gama_ir.py`) covers a documented subset and is
    exposed via the opt-in `gamal2 ir run|compile` CLI, but it is not the
    production run path. File entry points (`gama_ir.compile_file`/`run_file`)
-   flatten plain imports through the core loader; aliased imports still hit the
-   IR subset's dotted-call limit. Runtime limits are enforced (call depth, output,
-   statement/expression steps, loop limit); there is no production resource
-   budget or cost model.
+   flatten plain and aliased imports through the core loader; aliased functions,
+   constants and records (dotted names) are supported, while aliased `enum`
+   declarations are still rejected by the loader before either backend runs.
+   Runtime limits are enforced (call depth, output, statement/expression steps,
+   loop limit); there is no production resource budget or cost model.
 4. **Full type system.** No full inference. Nominal records with typed fields,
    positional/named construction, dotted field access and in-place field
    assignment are implemented (`tests/test_records.py`,

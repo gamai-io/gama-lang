@@ -209,10 +209,8 @@ class IRSubsetStillRejectsUnsupported(unittest.TestCase):
     def test_import_statement(self):
         self.assert_unsupported('import "x.gm"\n')
 
-    def test_dotted_call_and_namespace(self):
-        # Dotted names (field access / enum variants) are part of the subset;
-        # dotted calls through namespaces remain unsupported.
-        self.assert_unsupported('print mod.fn()\n')
+    # Dotted calls (``mod.fn()``) are supported now; their IR-vs-interpreter
+    # parity lives in ``test_ir_namespaces.py``.
 
     def test_lambda(self):
         self.assert_unsupported('let f = fn(x: Int) -> Int { return x }\n')

@@ -603,7 +603,7 @@ class IRUnsupportedTests(unittest.TestCase):
         ("unsupported helper", "print is_ok(Ok(1))\n"),
         ("break outside loop", "break\n"),
         ("return outside function", "return 1\n"),
-        ("dotted call", "print a.b(1)\n"),
+        ("expression callee", "print (fn(x: Int) -> Int { return x })(1)\n"),
     )
 
     def test_case_count(self):

@@ -56,10 +56,18 @@ Limitations (raise ``IRUnsupported`` / documented runtime errors)
   supported only through :func:`compile_file` (and the ``gamal2 ir run|compile
   FILE`` CLI), where the core loader flattens imported statements before
   compiling; compiling a bare source string has no filesystem context to
-  resolve imports.  Aliased imports flatten too, but their ``alias.fn`` calls
-  remain dotted calls.
-* Dotted *calls* / namespaces (``mod.fn``), pipes and ``try``.  (Dotted *names*
-  are supported: ``p.x`` field access and ``Color.Red`` enum variants.)
+  resolve imports.  Aliased imports flatten too and are supported: the loader
+  exposes module declarations as dotted names (``math.add``, ``math.pi``,
+  ``geo.Point``) and this backend resolves them against the same function,
+  global and nominal-type tables it uses for local names.
+* Namespaced *enum variants* (``geo.Color.Red``) are not reachable through
+  ``compile_file``: the core loader rejects an aliased ``enum`` declaration up
+  front, and both backends surface that identical ``GamaError``.  Nullary
+  variants of plainly imported enums (``Color.Red``) work.  Named record
+  construction with a dotted type name (``geo.Point { ... }``) is likewise not
+  accepted by the parser; positional construction ``geo.Point(1, 2)`` works.
+* Pipes, ``try``/``expr?`` and first-class function values (including reading a
+  namespaced function as a value).
 * Builtins other than ``len``, ``text``, ``number``, ``round``, ``Ok``/``Err``
   (``sql``, ``ask``, ``upper``, result/text/collection helpers, ``mail``,
   ``remember``/``recall``, ``wait_user``, ...).
@@ -312,8 +320,9 @@ def _match_kind(kind: str, value: Any) -> bool:
     if kind in ("Ok", "Err"):
         return _result_matches(kind, value)
     if isinstance(value, g2.EnumVal):
-        base, _, variant = kind.partition(".")
-        return value.enum == base and value.variant == variant
+        # Compare the full label so a namespaced enum (``geo.Color.Red``) also
+        # matches without assuming the enum name contains no dots.
+        return kind == f"{value.enum}.{value.variant}"
     return False
 
 
@@ -712,9 +721,14 @@ class _Compiler:
                     (expr.name, len(expr.args), expr.line, expr.col),
                 )
                 return
-            if "." in expr.name:
-                _unsupported(expr, "dotted calls / namespaces")
-            self.emit("CHECK_CALL", (expr.name, len(expr.args)))
+            # Dotted calls (``math.add``) resolve through the same function
+            # table as plain names: the core loader stores aliased module
+            # functions under their dotted name, so CHECK_CALL / CALL need no
+            # special casing.  Positional record constructors were handled
+            # above.  A name that is missing at run time reports the same
+            # "unknown function" error as the reference interpreter.
+            self.emit(
+                "CHECK_CALL", (expr.name, len(expr.args), expr.line, expr.col))
             for arg in expr.args:
                 self.compile_expr(arg)
             self.emit("CALL", len(expr.args))
@@ -792,6 +806,24 @@ class _VM:
             return 1000
 
     # -- dotted names / records / enums ----------------------------------
+    def _enum_value(self, name: str, line: int, col: int):
+        """Resolve ``Enum.Variant`` where ``Enum`` may itself be namespaced.
+
+        The longest dot-separated prefix that names a declared enum wins, so
+        ``geo.Color.Red`` resolves when the enum table stores ``geo.Color``.
+        Returns ``None`` when no prefix names an enum (field access et al.).
+        """
+        parts = name.split(".")
+        for i in range(len(parts) - 1, 0, -1):
+            enum_name = ".".join(parts[:i])
+            if enum_name not in self.enums:
+                continue
+            variant = ".".join(parts[i:])
+            if variant not in self.enums[enum_name]:
+                raise IRRuntimeError(f"unknown enum variant {name}", line, col)
+            return g2.EnumVal(enum_name, variant)
+        return None
+
     def _load_name(self, frame: Frame, arg) -> Any:
         """Resolve a dotted name exactly like ``gamal2.Interpreter.expr``.
 
@@ -803,11 +835,9 @@ class _VM:
             return frame.get(name)
         except IRRuntimeError:
             pass
-        base, _, variant = name.partition(".")
-        if base in self.enums:
-            if variant not in self.enums[base]:
-                raise IRRuntimeError(f"unknown enum variant {name}", line, col)
-            return g2.EnumVal(base, variant)
+        variant_value = self._enum_value(name, line, col)
+        if variant_value is not None:
+            return variant_value
         parts = name.split(".")
         base_n = None
         for i in range(len(parts) - 1, 0, -1):
@@ -1002,15 +1032,16 @@ class _VM:
                     if len(frames) > 1:
                         frames.pop()
             elif op == "CHECK_CALL":
-                name, argc = arg
+                name, argc, line, col = arg
                 entry = self.functions.get(name)
                 if entry is None:
-                    raise IRRuntimeError(f"unknown function {name}")
+                    raise IRRuntimeError(f"unknown function {name}", line, col)
                 proto, closure = entry
                 required = sum(1 for p in proto.params if p.default is None)
                 if not (required <= argc <= len(proto.params)):
                     raise IRRuntimeError(
-                        f"{name} expects {required}..{len(proto.params)} args, got {argc}")
+                        f"{name} expects {required}..{len(proto.params)} args, got {argc}",
+                        line, col)
                 stack.append(_CallTarget(proto, closure))
             elif op == "CALL":
                 argc = arg
@@ -1090,9 +1121,11 @@ def compile_file(path: Any) -> Program:
     here; this is purely a file-aware wrapper around :func:`compile_program`.
 
     Plain ``import "lib.gm"`` therefore works in the IR backend.  Aliased
-    imports (``import "lib.gm" as m``) also flatten, but ``m.fn(...)`` stays a
-    dotted call and is rejected with :class:`IRUnsupported`, matching the IR
-    subset's documented namespace limitation.
+    imports (``import "lib.gm" as m``) also flatten: the loader exposes module
+    functions, constants and records as dotted names (``m.fn``, ``m.pi``,
+    ``geo.Point``), and this backend resolves them through the same tables it
+    uses for local declarations.  Aliased ``enum`` declarations are still
+    rejected by the loader itself, before either backend runs.
     """
     return compile_program(g2.check_file(str(path)))
 

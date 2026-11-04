@@ -209,14 +209,22 @@ class IRRecordEnumRuntimeErrorsMatchInterpreter(unittest.TestCase):
             'match c { Color.Red { print 1 } }\n')
 
 
-class IRRecordsAndEnumsUnsupported(unittest.TestCase):
-    def assert_unsupported(self, src):
-        with self.assertRaises(IR.IRUnsupported) as ctx:
-            IR.compile_program(G.parse(src))
-        self.assertIn("IR does not support", str(ctx.exception))
+class IRDottedCallsResolveLikeFunctions(unittest.TestCase):
+    def test_dotted_call_compiles_through_the_function_table(self):
+        # Dotted calls are ordinary function calls: the core loader stores
+        # aliased module functions under their dotted name.
+        program = IR.compile_program(G.parse('print mod.fn()\n'))
+        listing = program.disassemble()
+        self.assertIn("CHECK_CALL", listing)
+        self.assertIn("mod.fn", listing)
 
-    def test_dotted_call_still_unsupported(self):
-        self.assert_unsupported('print mod.fn()\n')
+    def test_dotted_missing_function_error_matches_interpreter(self):
+        src = 'print mod.fn()\n'
+        with self.assertRaises(G.GamaError) as ref:
+            G.Interpreter().run(G.parse(src))
+        with self.assertRaises(IR.IRError) as got:
+            IR.run_program(G.parse(src))
+        self.assertEqual(str(got.exception), str(ref.exception))
 
 
 class IRProgramTypeTables(unittest.TestCase):
