@@ -7,8 +7,10 @@ definition, references, shutdown and exit.
 from __future__ import annotations
 import dataclasses
 import json
+import os
 import re
 import sys
+import tempfile
 import urllib.parse
 from pathlib import Path
 
@@ -108,11 +110,75 @@ def utf16_to_index(line: str, col: int) -> int:
     return i
 
 
-def diagnostics(uri: str, text: str):
+# Emitted by the in-memory checker whenever it meets a top-level `import`.
+# It is an environment limitation of `check(text)`, not a source error.
+IMPORT_IN_MEMORY_MSG = "import requires check_file/run_file"
+
+
+def _file_backed(uri: str):
+    """Return the existing on-disk Path for a file:// document, else None."""
     try:
-        G.check(text)
+        if urllib.parse.urlparse(uri).scheme != "file":
+            return None
+        path = Path(uri_path(uri))
+    except (ValueError, OSError):
+        return None
+    try:
+        return path if path.is_file() else None
+    except OSError:
+        return None
+
+
+def _check_disk_aware(path: Path, text: str):
+    """Type-check ``text`` with imports resolved against ``path``'s directory.
+
+    When the buffer differs from disk (an unsaved edit with a real path), the
+    text is written to a hidden sibling temp file so relative imports still
+    resolve; the temp file is always removed.
+    """
+    try:
+        on_disk = path.read_text(encoding="utf-8")
+    except OSError:
+        on_disk = None
+    if on_disk == text:
+        G.check_file(str(path))
+        return
+    tmp = None
+    try:
+        try:
+            fd, name = tempfile.mkstemp(
+                prefix=".gama_lsp_", suffix=".gm", dir=str(path.parent))
+        except OSError:
+            # Read-only directory: diagnose the on-disk revision instead of
+            # turning an environmental failure into a source diagnostic.
+            G.check_file(str(path))
+            return
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        tmp = Path(name)
+        G.check_file(str(tmp))
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def diagnostics(uri: str, text: str):
+    text = text if isinstance(text, str) else ("" if text is None else str(text))
+    path = _file_backed(uri)
+    try:
+        if path is not None:
+            _check_disk_aware(path, text)
+        else:
+            G.check(text)
         return []
     except G.GamaError as e:
+        # Only untitled/unsaved documents use the in-memory checker; its
+        # import complaint is spurious there. Other syntax/type errors pass.
+        if path is None and e.msg == IMPORT_IN_MEMORY_MSG:
+            return []
         rows = (text or "").split("\n") or [""]
         line = max(0, int(e.line or 1) - 1)
         # Clamp to the last line: EOF/unterminated errors can point past it.
