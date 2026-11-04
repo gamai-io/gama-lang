@@ -20,10 +20,10 @@ without touching the core:
   Python exception.
 
 There are 238 deterministic cases (90 formatter, 80 IR, 24 namespaced,
-32 limit, 12 unsupported).  A confirmed formatter limitation (a block opened
-on the same line as a multi-line string opener loses the indentation of the
-following lines) is pinned with ``expectedFailure`` and reported rather than
-hidden.
+32 limit, 12 unsupported).  The formatter regression found by this round (a
+block opened on the same line as a multi-line string opener lost the
+indentation of the following lines) is pinned as a normal regression test
+below; both the AST formatter and the legacy fallback now keep the depth.
 """
 import os
 import pathlib
@@ -621,18 +621,15 @@ for _label, _src in IRUnsupportedTests._CASES:
             _make_unsupported_case(_src, _label))
 
 
-class KnownFormatterLimitationTests(unittest.TestCase):
-    """Confirmed cosmetic formatter defect found by this round.
+class FormatterDepthRegressionTests(unittest.TestCase):
+    """Regression for the multi-line-string block depth defect.
 
-    ``gama_fmt.format_source`` emits a line that opens a multi-line string
-    verbatim, but also skips tokenizing it, so a block ``{`` that shares that
-    line is not reflected in the depth counter.  Later lines in the block and
-    the closing ``}`` are therefore outdented.  Semantics, comments, strings
-    and parseability are unaffected, so this is pinned as an expected failure
-    instead of being hidden.
+    A block ``{`` sharing a line with a multi-line string opener must still
+    indent later statements and the closing ``}`` correctly.  The AST formatter
+    keeps the first statement on the opener line; the legacy fallback tracks
+    braces outside string/comment text.
     """
 
-    @unittest.expectedFailure
     def test_block_opened_on_multiline_string_line_keeps_indent(self):
         src = ('if (true) { let s = "a\n'
                'b"\n'
@@ -642,6 +639,20 @@ class KnownFormatterLimitationTests(unittest.TestCase):
         lines = out.splitlines()
         self.assertEqual(lines[2], "  print s")
         self.assertEqual(lines[3], "}")
+        self.assertEqual(out, gama_fmt.format_source(out))
+
+    def test_legacy_formatter_tracks_depth_on_string_opener_line(self):
+        src = ('if (true) { let s = "a\n'
+               'b"\n'
+               'print s\n'
+               '}\n')
+        self.assertEqual(
+            gama_fmt._legacy_format_source(src),
+            'if (true) { let s = "a\n'
+            'b"\n'
+            '  print s\n'
+            '}\n',
+        )
 
 
 if __name__ == "__main__":

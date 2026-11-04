@@ -27,14 +27,18 @@ EXAMPLES = V2 / "examples"
 def shape(node):
     """Structural AST shape ignoring source positions and set ordering."""
     if dataclasses.is_dataclass(node):
-        return (
-            type(node).__name__,
-            tuple(
-                (f.name, shape(getattr(node, f.name)))
-                for f in dataclasses.fields(node)
-                if f.name not in ("line", "col")
-            ),
-        )
+        items = []
+        for f in dataclasses.fields(node):
+            if f.name in ("line", "col"):
+                continue
+            value = getattr(node, f.name)
+            # Enum variants carry (name, line, col) tuples in the core AST;
+            # canonical formatting moves them within a line, so positions are
+            # metadata just like dataclass line/col fields.
+            if type(node).__name__ == "EnumDecl" and f.name == "variants":
+                value = [v[0] if isinstance(v, tuple) else v for v in value]
+            items.append((f.name, shape(value)))
+        return (type(node).__name__, tuple(items))
     if isinstance(node, (list, tuple)):
         return tuple(shape(x) for x in node)
     if isinstance(node, dict):
@@ -420,6 +424,19 @@ class StringTests(FormatterBase):
         out = self.assert_equivalent(src)
         self.assertIn(literal, out)
 
+    def test_block_opened_on_multiline_string_line_indents_rest(self):
+        src = ('if (true) { let s = "a\n'
+               'b"\n'
+               'print s\n'
+               '}\n')
+        out = gama_fmt.format_source(src)
+        lines = out.splitlines()
+        self.assertEqual(lines[2], "  print s")
+        self.assertEqual(lines[3], "}")
+        self.assertIn('"a\nb"', out)
+        self.assertEqual(out, gama_fmt.format_source(out))
+        self.assertEqual(shape(G.parse(src)), shape(G.parse(out)))
+
     def test_single_quoted_and_escaped_strings(self):
         src = (
             "let a = 'x } y { z # != <= '\n"
@@ -537,6 +554,82 @@ class RandomishFixtureTests(FormatterBase):
                 src = self._program(random.Random(seed))
                 out = self.assert_equivalent(src)
                 self.assert_comments_preserved(src, out)
+
+
+class RecordEnumFormattingTests(FormatterBase):
+    def test_record_declaration_and_named_literal(self):
+        src = (
+            "record Point {x:Int,y:Int}\n"
+            "let p: Point = Point { y: 2, x: 1 }\n"
+            "print p.x\n"
+        )
+        out = self.assert_equivalent(src)
+        self.assertIn("record Point { x: Int, y: Int }", out)
+        self.assertIn("let p: Point = Point { y: 2, x: 1 }", out)
+
+    def test_enum_declaration_and_use(self):
+        src = (
+            "enum Color {Red,Green}\n"
+            "let c: Color = Color.Green\n"
+            "print c\n"
+        )
+        out = self.assert_equivalent(src)
+        self.assertIn("enum Color { Red, Green }", out)
+        self.assertIn("let c: Color = Color.Green", out)
+
+    def test_multiline_declarations_collapse_idempotently(self):
+        src = (
+            "record Point {\n"
+            "  x: Int,\n"
+            "  y: Int\n"
+            "}\n"
+            "enum Color {\n"
+            "  Red,\n"
+            "  Green\n"
+            "}\n"
+            "print Point(1, 2)\n"
+            "print Color.Red\n"
+        )
+        out = self.assert_equivalent(src)
+        self.assertIn("record Point { x: Int, y: Int }", out)
+        self.assertIn("enum Color { Red, Green }", out)
+        self.assertEqual(out, gama_fmt.format_source(out))
+
+    def test_empty_record_and_enum(self):
+        src = "record Empty { }\nenum None { }\nprint 1\n"
+        out = self.assert_equivalent(src)
+        self.assertIn("record Empty { }", out)
+        self.assertIn("enum None { }", out)
+
+    def test_comments_around_declarations_preserved(self):
+        src = (
+            "# point record\n"
+            "record Point { x: Int, y: Int } # point tail\n"
+            "# color enum\n"
+            "enum Color { Red, Green } # color tail\n"
+            "let p: Point = Point { x: 1, y: 2 }\n"
+            "print p.y\n"
+        )
+        out = self.assert_equivalent(src)
+        self.assert_comments_preserved(src, out)
+        self.assertIn("# point record", out)
+        self.assertIn("# point tail", out)
+        self.assertIn("# color enum", out)
+        self.assertIn("# color tail", out)
+
+    def test_formatting_does_not_change_behavior(self):
+        src = (
+            "record Point { x: Int, y: Int }\n"
+            "enum Color { Red, Green }\n"
+            "let p: Point = Point { y: 2, x: 1 }\n"
+            "let c: Color = Color.Green\n"
+            "print p.x\n"
+            "print p.y\n"
+            "print c\n"
+        )
+        before = G.run(src).out
+        out = self.assert_equivalent(src)
+        self.assertEqual(G.run(out).out, before)
 
 
 class FallbackTests(unittest.TestCase):

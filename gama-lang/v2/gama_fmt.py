@@ -30,11 +30,14 @@ Guarantees of the AST formatter:
     being dropped.
   * String literal contents are never rewritten: the raw source slice from the
     opening quote to the closing quote is emitted verbatim, so escapes and
-    multi-line bodies survive exactly.
+    multi-line bodies survive exactly.  A block that opens on the same source
+    line as a multi-line string opener keeps that first statement on the
+    header line, so the continuation line cannot desynchronise block depth.
+  * Record and enum declarations are canonicalised to one line
+    (``record Name { field: Type, ... }`` / ``enum Name { Variant, ... }``);
+    named record literals (``Point { x: 1, y: 2 }``) keep field order.
 
 Known limitations (documented, not hidden):
-  * Records/enums/namespaces do not exist in this worktree; ``import ... as``
-    and ``use`` are formatted.
   * Comments inside an expression (e.g. between list items) are moved to the
     end of that statement or to the following statement line (safe position).
   * Map keys are re-rendered from their decoded string value: a quoted
@@ -107,6 +110,40 @@ def _scan_string_state(line: str, quote: str | None) -> str | None:
             break
         i += 1
     return quote
+
+
+def _scan_braces(line: str, quote: str | None) -> tuple[int, str | None]:
+    """Return ``(brace_delta, end_quote)`` for code outside strings/comments.
+
+    Continues an already-open ``quote`` (from a multi-line string) so the rest
+    of a line that closes a literal still contributes its ``{``/``}`` to the
+    block depth.  This is what the old line-oriented formatter skipped when it
+    emitted a multi-line string opener verbatim.
+    """
+    delta = 0
+    i, n = 0, len(line)
+    while i < n:
+        c = line[i]
+        if quote is not None:
+            if c == "\\":
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c in "\"'":
+            quote = c
+            i += 1
+            continue
+        if c == "#":
+            break
+        if c == "{":
+            delta += 1
+        elif c == "}":
+            delta -= 1
+        i += 1
+    return delta, quote
 
 
 def _tokenize(line: str) -> list[tuple[str, str]]:
@@ -212,13 +249,17 @@ def _legacy_format_source(src: str) -> str:
     for line in lines:
         if open_quote is not None:
             out.append(line)
-            open_quote = _scan_string_state(line, open_quote)
+            delta, open_quote = _scan_braces(line, open_quote)
+            depth = max(0, depth + delta)
             continue
 
         trailing_state = _scan_string_state(line, None)
         if trailing_state is not None:
+            # A multi-line string opener is emitted verbatim, but braces in the
+            # code before the opening quote still belong to the block depth.
             out.append(line)
-            open_quote = trailing_state
+            delta, open_quote = _scan_braces(line, None)
+            depth = max(0, depth + delta)
             continue
 
         stripped = line.rstrip()
@@ -565,6 +606,12 @@ class _AstFormatter:
         if isinstance(s, G.Prove):
             self._emit(ind + self._prove_text(s), [s.line], suffix=semi)
             return
+        if isinstance(s, G.RecordDecl):
+            self._emit(ind + self._record_text(s), [s.line], suffix=semi)
+            return
+        if isinstance(s, G.EnumDecl):
+            self._emit(ind + self._enum_text(s), [s.line], suffix=semi)
+            return
         if isinstance(s, G.Fn):
             self._render_fn_stmt(s, indent, semi)
             return
@@ -619,6 +666,36 @@ class _AstFormatter:
         return keyword + name + "(" + self._params_text(s.params) + ")" + \
             ret + self._effects_text(s.effects)
 
+    @staticmethod
+    def _record_text(s) -> str:
+        if not s.fields:
+            return "record " + s.name + " { }"
+        fields = [fn + ": " + ft for fn, ft in s.fields]
+        return "record " + s.name + " { " + ", ".join(fields) + " }"
+
+    @staticmethod
+    def _enum_text(s) -> str:
+        names = [v[0] if isinstance(v, tuple) else v for v in s.variants]
+        if not names:
+            return "enum " + s.name + " { }"
+        return "enum " + s.name + " { " + ", ".join(names) + " }"
+
+    def _multiline_lead(self, stmts, brace_line: int):
+        """Inline text for a first statement that shares the opener line.
+
+        Only a statement whose rendered form contains a real newline (i.e. a
+        raw multi-line string) qualifies.  Keeping it on the ``{`` line is what
+        prevents the literal's continuation line from being mistaken for the
+        end of the block by any line-oriented depth counter.
+        """
+        if not stmts or stmts[0].line != brace_line:
+            return None
+        try:
+            text = self._inline_stmt(stmts[0])
+        except _G.GamaError:
+            return None
+        return text if "\n" in text else None
+
     def _render_fn_stmt(self, s, indent: int, semi: str):
         ind = _UNIT * indent
         nxt = self._next_line(s)
@@ -633,9 +710,20 @@ class _AstFormatter:
             self._emit(ind + header + " " + inner + " }",
                        range(s.line, body[1].line + 1), suffix=semi)
             return
-        self._emit(ind + header, range(s.line, header_end))
-        if body:
-            self.render_block(s.body, indent + 1, body[0].line, body[1].line)
+        lead = self._multiline_lead(s.body, body[0].line) if body else None
+        if lead is not None:
+            first = s.body[0]
+            lead_semi = ";" if self._has_semicolon(first) else ""
+            first_end = self._stmt_end_line(first)
+            self._emit(ind + header + " " + lead + lead_semi,
+                       range(s.line, first_end + 1))
+            self.render_block(s.body[1:], indent + 1,
+                              first_end, body[1].line)
+        else:
+            self._emit(ind + header, range(s.line, header_end))
+            if body:
+                self.render_block(s.body, indent + 1,
+                                  body[0].line, body[1].line)
         self._emit(ind + "}", [body[1].line] if body else [s.line],
                    suffix=semi)
 
@@ -650,9 +738,20 @@ class _AstFormatter:
             header = "for " + s.name + " in " + self._expr(s.iterable)
         header += " {"
         header_end = body[0].line + 1 if body else s.line + 1
-        self._emit(ind + header, range(s.line, header_end))
-        if body:
-            self.render_block(s.body, indent + 1, body[0].line, body[1].line)
+        lead = self._multiline_lead(s.body, body[0].line) if body else None
+        if lead is not None:
+            first = s.body[0]
+            lead_semi = ";" if self._has_semicolon(first) else ""
+            first_end = self._stmt_end_line(first)
+            self._emit(ind + header + " " + lead + lead_semi,
+                       range(s.line, first_end + 1))
+            self.render_block(s.body[1:], indent + 1,
+                              first_end, body[1].line)
+        else:
+            self._emit(ind + header, range(s.line, header_end))
+            if body:
+                self.render_block(s.body, indent + 1,
+                                  body[0].line, body[1].line)
         self._emit(ind + "}", [body[1].line] if body else [s.line],
                    suffix=semi)
 
@@ -667,10 +766,22 @@ class _AstFormatter:
         head_lines = list(range(s.line, (then_pair[0].line + 1)
                                 if then_pair else s.line + 1))
         head_lines.extend(extra_lines)
-        self._emit(ind + prefix + header, head_lines)
-        if then_pair:
-            self.render_block(s.then, indent + 1,
-                              then_pair[0].line, then_pair[1].line)
+        lead = self._multiline_lead(s.then, then_pair[0].line) \
+            if then_pair else None
+        if lead is not None:
+            first = s.then[0]
+            lead_semi = ";" if self._has_semicolon(first) else ""
+            first_end = self._stmt_end_line(first)
+            lead_lines = list(range(s.line, first_end + 1)) + list(extra_lines)
+            self._emit(ind + prefix + header + " " + lead + lead_semi,
+                       lead_lines)
+            self.render_block(s.then[1:], indent + 1,
+                              first_end, then_pair[1].line)
+        else:
+            self._emit(ind + prefix + header, head_lines)
+            if then_pair:
+                self.render_block(s.then, indent + 1,
+                                  then_pair[0].line, then_pair[1].line)
         close_line = then_pair[1].line if then_pair else s.line
         other = s.other
         if other is None:
@@ -779,6 +890,14 @@ class _AstFormatter:
             return node.name
         if isinstance(node, G.Attr):
             return self._expr(node.base, _POSTFIX_PREC) + "." + node.name
+        if isinstance(node, G.RecordLit):
+            if not node.fields:
+                return node.name + " { }"
+            parts = []
+            for key, val in node.fields:
+                k = key if _bare_key_ok(key) else _quote(key)
+                parts.append(k + ": " + self._expr(val))
+            return node.name + " { " + ", ".join(parts) + " }"
         if isinstance(node, G.ListExpr):
             return "[" + ", ".join(self._expr(x) for x in node.items) + "]"
         if isinstance(node, G.MapExpr):
@@ -888,6 +1007,10 @@ class _AstFormatter:
         if isinstance(s, G.Import):
             alias = (" as " + s.alias) if s.alias else ""
             return "import " + self._import_path_text(s) + alias
+        if isinstance(s, G.RecordDecl):
+            return self._record_text(s)
+        if isinstance(s, G.EnumDecl):
+            return self._enum_text(s)
         if isinstance(s, G.If):
             then = self._inline_block(s.then)
             text = "if " + self._expr(s.cond) + " { " + then + " }"
