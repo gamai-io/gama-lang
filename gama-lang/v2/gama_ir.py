@@ -10,9 +10,9 @@ use), never silently given a different meaning.
 
 Supported statements
 --------------------
-``let`` / ``:=`` (assign), ``print``, ``if``/``else`` (with ordinary blocks),
-``while``, ``break``, ``continue``, ``fn`` (named function definitions),
-``return`` (inside functions only), and expression statements.
+``let`` / ``:=`` (assign), ``print``, ``if``/``else`` (including ``else if``
+chains), ``while``, ``break``, ``continue``, ``fn`` (named function
+definitions), ``return`` (inside functions only), and expression statements.
 
 Supported expressions
 ---------------------
@@ -41,9 +41,6 @@ Limitations (raise ``IRUnsupported`` / documented runtime errors)
   ``remember``/``recall``, ``wait_user``, ...).
 * Lambdas, first-class function values and expression callees (``f()`` where
   ``f`` is a variable).  Calling such a value fails with a clear runtime error.
-* ``else if`` chains: the reference interpreter itself raises
-  ``TypeError: 'If' object is not iterable`` for them, so the IR rejects them
-  explicitly rather than inventing different behaviour.
 * ``break``/``continue`` outside a loop and ``return`` outside a function are
   rejected at compile time.
 * The safety limits ``GAMA_L_MAX_STEPS`` and ``GAMA_L_LOOP_LIMIT`` are **not**
@@ -307,8 +304,6 @@ class _Compiler:
         _unsupported(stmt)
 
     def compile_if(self, stmt: g2.If) -> None:
-        if isinstance(stmt.other, g2.If):
-            _unsupported(stmt.other, "else-if chains are not supported by this IR prototype")
         self.compile_expr(stmt.cond)
         jump_false = self.emit("JUMP_IF_FALSE", None)
 
@@ -321,9 +316,16 @@ class _Compiler:
 
         self.patch(jump_false, self.here())
         if stmt.other:
+            # ``else if`` is represented as a nested ``If`` in ``If.other``.
+            # The reference interpreter evaluates it inside the else branch's
+            # own frame, so compile the nested ``If`` under this frame too and
+            # let its own branches add their frames recursively.
             self.emit("NEW_FRAME")
             self.frame_depth += 1
-            self.compile_statements(stmt.other)
+            if isinstance(stmt.other, g2.If):
+                self.compile_if(stmt.other)
+            else:
+                self.compile_statements(stmt.other)
             self.frame_depth -= 1
             self.emit("POP_FRAME")
         self.patch(jump_end, self.here())

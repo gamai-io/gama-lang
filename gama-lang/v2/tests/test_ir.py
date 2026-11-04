@@ -52,6 +52,67 @@ class IRMatchesInterpreter(unittest.TestCase):
     def test_assign_updates_enclosing_scope(self):
         self.assert_same('let x = 1\nif true { if true { x := 7 } }\nprint x\n')
 
+    def test_else_if_two_levels(self):
+        self.assert_same(
+            'let x = 1\n'
+            'if x == 1 { print "one" } else if x == 2 { print "two" } else { print "other" }\n'
+            'x := 2\n'
+            'if x == 1 { print "one" } else if x == 2 { print "two" } else { print "other" }\n'
+            'x := 3\n'
+            'if x == 1 { print "one" } else if x == 2 { print "two" } else { print "other" }\n')
+
+    def test_else_if_three_levels(self):
+        self.assert_same(
+            'let x = 0\n'
+            'if x == 1 { print 1 } else if x == 2 { print 2 } else if x == 3 { print 3 } else { print 0 }\n'
+            'x := 2\n'
+            'if x == 1 { print 1 } else if x == 2 { print 2 } else if x == 3 { print 3 } else { print 0 }\n'
+            'x := 3\n'
+            'if x == 1 { print 1 } else if x == 2 { print 2 } else if x == 3 { print 3 } else { print 0 }\n'
+            'x := 4\n'
+            'if x == 1 { print 1 } else if x == 2 { print 2 } else if x == 3 { print 3 } else { print 0 }\n')
+
+    def test_else_if_without_final_else(self):
+        self.assert_same(
+            'let x = 9\n'
+            'if x == 1 { print 1 } else if x == 2 { print 2 }\n'
+            'print "done"\n'
+            'x := 2\n'
+            'if x == 1 { print 1 } else if x == 2 { print 2 }\n'
+            'print "done"\n')
+
+    def test_else_if_nested_blocks(self):
+        self.assert_same(
+            'let x = 2\n'
+            'if x == 1 {\n'
+            ' if true { print "one-inner" }\n'
+            '} else if x == 2 {\n'
+            ' let y = 10\n'
+            ' if y > 5 { print "two-inner" }\n'
+            ' print y\n'
+            '} else {\n'
+            ' if true { print "other-inner" }\n'
+            '}\n'
+            'print x\n')
+
+    def test_else_if_break_continue_unwind_frames(self):
+        # Exercises frame unwinding: break/continue inside an else-if branch
+        # must leave the nested else/if frames behind.
+        self.assert_same(
+            'let i = 0\nlet total = 0\n'
+            'while i < 6 {\n'
+            ' i := i + 1\n'
+            ' if i == 1 {\n'
+            '  continue\n'
+            ' } else if i == 3 {\n'
+            '  continue\n'
+            ' } else if i == 5 {\n'
+            '  break\n'
+            ' } else {\n'
+            '  total := total + i\n'
+            ' }\n'
+            '}\nprint total\n')
+
     def test_while_accumulate(self):
         self.assert_same('let i = 0\nlet s = 0\nwhile i < 4 { i := i + 1\n s := s + i }\nprint s\n')
 
@@ -161,11 +222,6 @@ class IRRejectsUnsupported(unittest.TestCase):
 
     def test_continue_outside_loop(self):
         self.assert_unsupported('continue\n')
-
-    def test_else_if_chain(self):
-        # The reference interpreter raises TypeError for this shape, so the IR
-        # rejects it explicitly instead of inventing a different meaning.
-        self.assert_unsupported('if false { print 1 } else if true { print 2 }\n')
 
 
 class IRProgramAPI(unittest.TestCase):
