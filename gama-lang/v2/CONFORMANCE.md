@@ -27,7 +27,7 @@ clock, and every `GAMA_L_*` environment variable is stripped for each case.
 | **T3** — `effects {}` cannot call `sql.write` or `mail` | **PASS** | `T3EffectDeclarations.test_t3_effects_empty_rejects_sql_write`, `..._rejects_mail`, `..._declared_effect_is_allowed` | Static `GamaEffectError` for `sql.write` and `mail`; an explicitly declared `sql.read` effect is accepted. |
 | **T4** — `wait user` non-interactive returns `Denied`, never proceeds | **PASS** | `T4HumanInTheLoop.test_t4_wait_user_denied_and_never_proceeds` | Returns `Denied` (falsy); the guarded branch is not entered, execution continues after the gate. |
 | **T5** — `prove` receipt verifies; one changed field invalidates it | **PASS** (in-process) | `T5ProofReceipts.test_t5_receipt_verifies`, `...test_t5_single_field_change_invalidates` | Valid receipt → `ok: true`, no errors. Changing one value while keeping `sha256`/`prev` → `ok: false`, `hash_mismatch`. Chains are per-interpreter; see T6. |
-| **T6** — same `prove` idempotency key does not emit a second effect | **PARTIAL** | `T6ProofIdempotency.test_t6_same_key_same_value_single_record`, `...test_t6_same_key_different_value_is_rejected` | Within one run: same key + same value reuses the record, `proof_chain` stays length 1; same key + different value raises `duplicate key`. **No persistent/cross-run ledger or intent/lease binding** (explicitly roadmap in `README.md`). |
+| **T6** — same `prove` idempotency key does not emit a second effect | **PASS** (in-process; optional cross-run via `GAMA_L_PROOF_LEDGER`) | `T6ProofIdempotency.test_t6_same_key_same_value_single_record`, `...test_t6_same_key_different_value_is_rejected`, `test_proof_ledger.ProofLedgerCrossRun.*` | Within one run: same key + same value reuses the record, `proof_chain` stays length 1; same key + different value raises `duplicate key`. With `GAMA_L_PROOF_LEDGER=<file>`, records persist as JSONL and load on startup: repeat runs reuse the record without appending, different values still fail, chain `prev` continues from the last persisted record, and `verify` rejects untrusted `prev`. Intent/lease binding remains roadmap. |
 | **T7** — module import cycle rejected with a clear error | **PASS** | `T7ImportCycles.test_t7_import_cycle_rejected` | Temp project (`a.gm` ↔ `b.gm`) raises `GamaError: import cycle: …` before execution. |
 | **T8** — `ask` records prompt hash and model; offline returns `Unavailable` | **PASS** | `T8AskMetadata.test_t8_offline_ask_unavailable_with_metadata` | Offline: output `Unavailable`, `last_ask.model == "mock"`, `last_ask.prompt_hash == sha256(prompt)`. |
 | **T9** — 10 example programs run from a clean checkout without network | **PASS** | `T9ExamplesOffline.test_t9_examples_run_offline` | All 11 shipped examples run with every `GAMA_L_*` network/env knob removed (contract requires ≥10). |
@@ -35,8 +35,8 @@ clock, and every `GAMA_L_*` environment variable is stripped for each case.
 
 ## Summary
 
-- **PASS: 9** — T1, T2, T3, T4, T5, T7, T8, T9, T10
-- **PARTIAL: 1** — T6 (in-run idempotency only; no persistent proof ledger)
+- **PASS: 10** — T1, T2, T3, T4, T5, T6, T7, T8, T9, T10
+- **PARTIAL: 0**
 - **GAP: 0** among T1–T10 as scoped above
 
 ## Gaps (why 2.0 is not complete)
@@ -44,9 +44,10 @@ clock, and every `GAMA_L_*` environment variable is stripped for each case.
 These are outside the T1–T10 checks or only partially covered; see
 `README.md` → *Not implemented yet*:
 
-1. **Persistent proof chain / idempotency across runs (T6).** Receipts and the
-   idempotency key exist only inside one `Interpreter`. `README.md` lists
-   “persistent proof chain bound to intent/lease” as roadmap.
+1. **Proof chain bound to intent/lease (beyond T6).** The optional
+   `GAMA_L_PROOF_LEDGER=<file>` JSONL ledger provides persistent receipts and
+   cross-run idempotency, but binding a receipt to a specific intent or lease is
+   still roadmap. The ledger is append-only with no compaction or key rotation.
 2. **Real namespaced modules/exports.** `use` is currently a no-op; only
    `import "file.gm"` is implemented.
 3. **Compiler pipeline / IR / bytecode and runtime limits.** The runtime is a

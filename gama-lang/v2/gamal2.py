@@ -1065,11 +1065,75 @@ DEMO_ROWS = [
     {"konto": "2112000", "naziv": "PRIMJER DOO", "mjesto": "Sarajevo", "neto": Decimal("250.00")},
 ]
 
+def _proof_raw(name, value):
+    """Canonical JSON used for proof hashing and idempotency comparison."""
+    return json.dumps({"name": name, "value": value}, sort_keys=True,
+                      ensure_ascii=False, separators=(",", ":"), default=str)
+
 class Interpreter:
     def __init__(self, interactive=False):
         self.env = Env(); self.funcs = {}; self.out = []; self.memory = {}
         self.proofs = {}; self.proof_chain = []; self.prev_proof = "GENESIS"; self.interactive = interactive
         self.last_ask = None
+        self.proof_ledger_path = (os.environ.get("GAMA_L_PROOF_LEDGER") or "").strip() or None
+        if self.proof_ledger_path:
+            self._load_proof_ledger()
+    def _load_proof_ledger(self):
+        """Load persisted proof records so chains and idempotency survive a run."""
+        last_sha = "GENESIS"
+        try:
+            with open(self.proof_ledger_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except (ValueError, TypeError):
+                        continue
+                    if not isinstance(rec, dict):
+                        continue
+                    sha = str(rec.get("sha256", "") or "")
+                    if sha:
+                        self.proof_chain.append(sha)
+                        last_sha = sha
+                    name = rec.get("name")
+                    if isinstance(name, str) and name not in self.proofs:
+                        self.proofs[name] = rec
+        except FileNotFoundError:
+            pass
+        self.prev_proof = last_sha
+    def _append_proof_ledger(self, rec):
+        """Append one JSON line, flush+fsync, and take an fcntl lock if available."""
+        path = self.proof_ledger_path
+        if not path:
+            return
+        line = json.dumps(rec, ensure_ascii=False, separators=(",", ":"), default=str) + "\n"
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        try:
+            import fcntl as _fcntl
+        except ImportError:
+            _fcntl = None
+        with open(path, "a", encoding="utf-8") as fh:
+            locked = False
+            if _fcntl is not None:
+                try:
+                    _fcntl.flock(fh.fileno(), _fcntl.LOCK_EX)
+                    locked = True
+                except OSError:
+                    locked = False
+            try:
+                fh.write(line)
+                fh.flush()
+                os.fsync(fh.fileno())
+            finally:
+                if locked:
+                    try:
+                        _fcntl.flock(fh.fileno(), _fcntl.LOCK_UN)
+                    except OSError:
+                        pass
     def run(self, stmts):
         try:
             for s in stmts: self.stmt(s, self.env)
@@ -1137,13 +1201,12 @@ class Interpreter:
         if isinstance(v, ResultVal): return str(v)
         return str(v)
     def prove(self, name, val):
+        raw = _proof_raw(name, val)
         if name in self.proofs:
             old = self.proofs[name]
-            if old.get("value") == val:
+            if old.get("value") == val or _proof_raw(old.get("name"), old.get("value")) == raw:
                 return old
             raise GamaRuntimeError(f"prove: duplicate key {name!r} with different value")
-        core = {"name": name, "value": val}
-        raw = json.dumps(core, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
         h = hashlib.sha256((self.prev_proof + raw).encode()).hexdigest()
         rec = {"name": name, "value": val, "sha256": h, "prev": self.prev_proof,
                "id": h[:16], "ts": __import__("time").time()}
@@ -1152,11 +1215,12 @@ class Interpreter:
             rec["sig"] = hmac.new(key, (self.prev_proof + raw).encode(), hashlib.sha256).hexdigest()
         self.prev_proof = h
         self.proof_chain.append(h)
+        self.proofs[name] = rec
+        self._append_proof_ledger(rec)
         return rec
     def verify(self, rec):
         if not isinstance(rec, dict) or "sha256" not in rec: return {"ok": False, "errors": ["not_a_proof"]}
-        raw = json.dumps({"name": rec.get("name"), "value": rec.get("value")},
-                         sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
+        raw = _proof_raw(rec.get("name"), rec.get("value"))
         exp = hashlib.sha256((rec.get("prev", "GENESIS") + raw).encode()).hexdigest()
         errs = []
         if not hmac.compare_digest(exp, str(rec.get("sha256"))): errs.append("hash_mismatch")
