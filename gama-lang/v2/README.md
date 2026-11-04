@@ -92,6 +92,7 @@ python3 gamal2.py fmt --write file.gm  # write in place
 - `import "file.gm"` with cycle detection (relative to the importing file)
 - `let` with optional type annotation, `:=` assignment
 - `fn` and SPEC `make` with typed parameters, defaults, return type, `effects { ... }`
+- first-class functions and lambdas: `fn(x: Int) -> Int { ... }`, `let f = ...`, `f(41)`, passing functions as values
 - `if` / `else` blocks, `return`
 - `for x in list/text`, `while cond`, `break`/`continue`, list/text indexing
 - `Ok`/`Err` Result values and `match` arms (`Ok(v)`, `Err(e)`, `_`)
@@ -109,14 +110,14 @@ python3 gamal2.py fmt --write file.gm  # write in place
 - `ask` uses `gama_ai` when `GAMA_L_AI_URL` is set; config via `GAMA_L_AI_KEY`,
   `GAMA_L_AI_MODEL`, `GAMA_L_AI_ALLOW_HTTP=1` for local HTTP; HTTPS by default,
   retries 429/5xx, 1 MiB response cap; redirects are refused
-- `prove` (hash-chained receipt, optional HMAC via `GAMA_L_PROOF_KEY`) and `verify` (tamper detection)
+- `prove` (hash-chained receipt, optional HMAC via `GAMA_L_PROOF_KEY`, optional persistent JSONL ledger via `GAMA_L_PROOF_LEDGER`) and `verify` (tamper detection)
 - static type errors and static effect violations
 - CLI `run`, `check`, `fmt`, `test`, `pkg`, `lsp`
 
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 274/274
+python3 -m unittest discover -s tests -v   # 290/290
 python3 gamal2.py doctor --json                # 8/8 checks
 ```
 
@@ -131,14 +132,13 @@ HTTP/local registry, AI connector, guarded SQL writes and SMTP mail, offline
 `ask` = `Unavailable`, 11 examples, canonical `fmt` check/write, doctor, and
 reproducible release metadata.
 
-Conformance: see `CONFORMANCE.md` (SPEC 2.0 T1–T10; T6 is PARTIAL — no persistent proof ledger yet).
+Conformance: see `CONFORMANCE.md` (SPEC 2.0 T1–T10: **PASS 10/10**, including optional cross-run proof ledger).
 
 ## Not implemented yet
 
 - deployed/public package registry (the HTTP server is implemented and testable)
 - real namespace/export modules (`use` is currently a no-op)
-- lambdas/first-class functions
-- persistent proof chain bound to intent/lease; IR/bytecode and runtime limits
+- proof chain bound to intent/lease; IR/bytecode and runtime limits
 - full type inference, records/enums/generics
 - full AST formatter (current `fmt` is token-based, preserves comments and
   strings, but does not reformat multi-line strings)
