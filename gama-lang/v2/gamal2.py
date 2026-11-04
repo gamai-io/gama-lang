@@ -600,8 +600,6 @@ class Parser:
                     raise GamaError(
                         f"{kind} match patterns require a binding: {kind}(x)",
                         arm.line, arm.col)
-                elif "." in kind and kind.count(".") != 1:
-                    raise GamaError("enum match pattern must be Enum.Variant", arm.line, arm.col)
             if self.at("OP", "=>"):
                 self.take(); self.skip_nl()
             self.skip_nl(); body = self.block(); arms.append((kind, bindings, body))
@@ -791,12 +789,14 @@ def find_enum_variant(enums, name):
     ``enums`` maps ``Enum -> {Variant: payload_spec}`` where ``payload_spec``
     is ``None`` (nullary), one type name, or a tuple of type names. Accepts
     ``Enum.Variant`` and a bare ``Variant`` that must be unique across all
-    declared enums. Returns ``(enum, variant, payload_type)`` or ``None`` when
-    the reference is not a declared variant. Raises ``_AmbiguousVariantError``
-    for a bare name defined by several enums.
+    declared enums. The enum part may itself be namespaced by an import alias
+    (``geo.Color.Red``), so the split is on the last dot.
+    Returns ``(enum, variant, payload_type)`` or ``None`` when the reference
+    is not a declared variant. Raises ``_AmbiguousVariantError`` for a bare
+    name defined by several enums.
     """
     if "." in name:
-        base, _, variant = name.partition(".")
+        base, _, variant = name.rpartition(".")
         pm = enums.get(base)
         if pm is not None and variant in pm:
             return base, variant, pm[variant]
@@ -1610,7 +1610,7 @@ class Checker:
             # A named function used as a value has type Function.
             if e.name in self.funcs: return "Function"
             if "." in e.name:
-                base, _, variant = e.name.partition(".")
+                base, _, variant = e.name.rpartition(".")
                 if base in self.enums:
                     if variant not in self.enums[base]:
                         raise GamaTypeError(
@@ -1618,7 +1618,7 @@ class Checker:
                     if self.enums[base][variant] is not None:
                         raise GamaTypeError(
                             f"enum variant {e.name} requires a payload argument; "
-                            f"write {variant}(...)", e.line, e.col)
+                            f"write {base}.{variant}(...)", e.line, e.col)
                     return base
             if "." in e.name:
                 parts = e.name.split(".")
@@ -1812,15 +1812,16 @@ def _project_root(entry: pathlib.Path) -> pathlib.Path:
 
 _ALIAS_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-# Aliased modules expose `fn` definitions and top-level `let` constants.
-# Plain imports (flattened inside the module) and `use` are allowed as
-# declaration/no-op statements. Everything else at the top level is a side
-# effect (print/prove/verify/loops/assignments/expression statements) and is
-# rejected up front instead of being silently dropped by the bounded
+# Aliased modules expose `fn` definitions, top-level `let` constants, records
+# and enum declarations. Plain imports (flattened inside the module) and `use`
+# are allowed as declaration/no-op statements. Everything else at the top level
+# is a side effect (print/prove/verify/loops/assignments/expression statements)
+# and is rejected up front instead of being silently dropped by the bounded
 # namespace MVP. Top-level `let` values are evaluated at import time and
 # exposed as `alias.name`; module functions keep seeing them through the same
-# renamed binding.
-_ALIAS_ALLOWED_TOPLEVEL = (Fn, Let, Import, Use, RecordDecl)
+# renamed binding. Enums are namespaced as `alias.Enum` and remain visible
+# regardless of explicit exports (legacy-global enum surface).
+_ALIAS_ALLOWED_TOPLEVEL = (Fn, Let, Import, Use, RecordDecl, EnumDecl)
 _STMT_KIND = {Let: "let", Assign: "assignment", Print: "print",
               Prove: "prove", Verify: "verify",
               ExprStmt: "expression statement"}
@@ -1829,8 +1830,8 @@ def _alias_toplevel_error(stmt, alias: str) -> GamaError:
     kind = _STMT_KIND.get(type(stmt), type(stmt).__name__.lower())
     return GamaError(
         "aliased import %r: unsupported top-level statement %r "
-        "(only fn definitions, top-level let constants, plain imports, "
-        "and use are allowed)"
+        "(only fn definitions, top-level let constants, enum declarations, "
+        "plain imports, and use are allowed)"
         % (alias, kind),
         getattr(stmt, "line", 0), getattr(stmt, "col", 0))
 
@@ -1839,13 +1840,36 @@ def _check_alias_toplevel(stmts, alias: str) -> None:
         if not isinstance(st, _ALIAS_ALLOWED_TOPLEVEL):
             raise _alias_toplevel_error(st, alias)
 
+def _rename_qualified(name, mapping):
+    """Rename an exact name or the longest mapped dotted prefix.
+
+    Enum declarations are renamed to ``alias.Name``; references such as
+    ``Color.Red`` and ``Color.Red(...)`` must follow the same prefix. A module
+    may itself import another aliased module, so a declaration name can contain
+    dots (``sub.Color``) and a reference can be ``sub.Color.Red``: matching the
+    longest mapped prefix (not just the first segment) keeps those nested
+    references correct. Plain local names are left untouched unless they are an
+    exact mapping key.
+    """
+    if name in mapping:
+        return mapping[name]
+    parts = name.split(".")
+    for i in range(len(parts) - 1, 0, -1):
+        prefix = ".".join(parts[:i])
+        if prefix in mapping:
+            return mapping[prefix] + "." + ".".join(parts[i:])
+    return name
+
+
 def _rename_refs(node, mapping):
     """Rename module-local function uses (calls and value refs) in the AST.
 
     Only names present in ``mapping`` are rewritten; every other node is kept.
     This also renames the ``Fn`` declaration itself when the whole node is
     passed, so sibling and recursive calls keep pointing at the namespaced
-    function.
+    function. Enum declarations and their qualified references
+    (``Color.Red``, ``Color.Red(...)``, ``Color``) are namespaced the same way;
+    bare variant names are left alone and are resolved globally as before.
     """
     if isinstance(node, list):
         return [_rename_refs(x, mapping) for x in node]
@@ -1854,10 +1878,27 @@ def _rename_refs(node, mapping):
     if isinstance(node, dict):
         return {k: _rename_refs(v, mapping) for k, v in node.items()}
     if isinstance(node, Call):
-        return replace(node, name=mapping.get(node.name, node.name),
+        return replace(node, name=_rename_qualified(node.name, mapping),
                        args=[_rename_refs(a, mapping) for a in node.args])
     if isinstance(node, Var):
-        return replace(node, name=mapping.get(node.name, node.name))
+        return replace(node, name=_rename_qualified(node.name, mapping))
+    if isinstance(node, Match):
+        return replace(
+            node, expr=_rename_refs(node.expr, mapping),
+            arms=[(_rename_qualified(kind, mapping), bindings,
+                   _rename_refs(body, mapping))
+                  for kind, bindings, body in node.arms])
+    if isinstance(node, EnumDecl):
+        def _payload(p):
+            if p is None:
+                return None
+            if isinstance(p, tuple):
+                return tuple(mapping.get(x, x) for x in p)
+            return mapping.get(p, p)
+        return replace(
+            node, name=mapping.get(node.name, node.name),
+            variants=[(vn, _payload(vp), vl, vc)
+                      for vn, vp, vl, vc in node.variants])
     if isinstance(node, RecordDecl):
         return replace(
             node, name=mapping.get(node.name, node.name),
@@ -1945,7 +1986,7 @@ def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
     # generated `alias.fn` names must not clash with them.
     declared = set()
     for s in ast:
-        if isinstance(s, (Fn, Let, Assign, Use, RecordDecl)):
+        if isinstance(s, (Fn, Let, Assign, Use, RecordDecl, EnumDecl)):
             declared.add(s.name)
     out = []
     aliases = set()
@@ -1986,7 +2027,9 @@ def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
                 raise
             # Explicit exports filter the alias surface. Modules without any
             # `export` keep the legacy behaviour: every top-level fn/let/record
-            # is visible through the alias (backward compatibility).
+            # is visible through the alias (backward compatibility). Enums stay
+            # module-global even with explicit exports: they are always exposed
+            # as `alias.Enum` (and `export enum` remains unsupported).
             exported = {st.name for st in sub
                         if getattr(st, "exported", False)
                         and isinstance(st, (Fn, Let, RecordDecl))}
@@ -2000,10 +2043,13 @@ def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
                                 "duplicate export %r in imported module %r"
                                 % (st.name, s.path), st.line, st.col)
                         names[st.name] = st
-            sub_decls = [st for st in sub if isinstance(st, (Fn, Let, RecordDecl))]
+            sub_decls = [st for st in sub
+                         if isinstance(st, (Fn, Let, RecordDecl, EnumDecl))]
             mapping = {}
             for st in sub_decls:
-                if exported and st.name not in exported:
+                if isinstance(st, EnumDecl):
+                    mapping[st.name] = s.alias + "." + st.name
+                elif exported and st.name not in exported:
                     # Private declaration: keep it callable inside the module
                     # but unreachable as `alias.name`. A separate character
                     # (`:`) cannot be spelled in a source identifier, so this
@@ -2013,7 +2059,8 @@ def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
                     mapping[st.name] = s.alias + "." + st.name
             for st in sub_decls:
                 new_name = mapping[st.name]
-                public = not exported or st.name in exported
+                public = (isinstance(st, EnumDecl)
+                          or not exported or st.name in exported)
                 if public:
                     if new_name in declared:
                         raise GamaError(
@@ -2810,7 +2857,7 @@ class Interpreter:
                     fn, closure = self.funcs[e.name]
                     return FunctionVal(fn.params, fn.ret, fn.effects, fn.body, closure, fn.name)
                 if "." in e.name:
-                    base, _, variant = e.name.partition(".")
+                    base, _, variant = e.name.rpartition(".")
                     if base in self.enums:
                         if variant not in self.enums[base]:
                             raise GamaRuntimeError(
@@ -2818,7 +2865,7 @@ class Interpreter:
                         if self.enums[base][variant] is not None:
                             raise GamaRuntimeError(
                                 f"enum variant {e.name} requires a payload "
-                                f"argument; write {variant}(...)", e.line, e.col)
+                                f"argument; write {base}.{variant}(...)", e.line, e.col)
                         return EnumVal(base, variant)
                 if "." not in e.name: raise
                 parts = e.name.split(".")

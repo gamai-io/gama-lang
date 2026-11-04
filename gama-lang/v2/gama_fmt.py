@@ -531,6 +531,40 @@ class _AstFormatter:
                     cur = None
         return pairs
 
+    def _child_pairs(self, outer):
+        """Direct ``{...}`` child pairs of a top-level pair, regardless of lines.
+
+        ``_pairs`` works on line ranges, so it cannot see arms that share a
+        line with the match opener (or the whole match written on one line).
+        Walking tokens between the outer braces at depth 1 keeps the match
+        renderer correct for compact sources without changing line-based
+        block discovery elsewhere.
+        """
+        start = end = None
+        for i, t in enumerate(self.sig):
+            if t is outer[0]:
+                start = i
+            elif t is outer[1]:
+                end = i
+                break
+        if start is None or end is None:
+            return []
+        pairs = []
+        depth = 0
+        cur = None
+        for t in self.sig[start + 1:end]:
+            if t.kind == "OP" and t.val == "{":
+                if depth == 0:
+                    cur = t
+                depth += 1
+            elif t.kind == "OP" and t.val == "}":
+                if depth > 0:
+                    depth -= 1
+                if depth == 0 and cur is not None:
+                    pairs.append((cur, t))
+                    cur = None
+        return pairs
+
     @staticmethod
     def _pick_body_pair(pairs, stmts, fallback_last=True):
         if not pairs:
@@ -1719,7 +1753,7 @@ class _AstFormatter:
         header_end = outer[0].line + 1 if outer else s.line + 1
         self._emit(ind + header, range(s.line, header_end))
         if outer is not None:
-            arm_pairs = self._pairs(outer[0].line + 1, outer[1].line)
+            arm_pairs = self._child_pairs(outer)
             prev_end = outer[0].line
             for i, (name, bindings, body) in enumerate(s.arms):
                 pair = arm_pairs[i] if i < len(arm_pairs) else None

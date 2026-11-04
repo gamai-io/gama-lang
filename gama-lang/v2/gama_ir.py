@@ -60,16 +60,17 @@ Limitations (raise ``IRUnsupported`` / documented runtime errors)
   exposes module declarations as dotted names (``math.add``, ``math.pi``,
   ``geo.Point``) and this backend resolves them against the same function,
   global and nominal-type tables it uses for local names.
-* Namespaced *enum variants* (``geo.Color.Red``) are not reachable through
-  ``compile_file``: the core loader rejects an aliased ``enum`` declaration up
-  front, and both backends surface that identical ``GamaError``.  Nullary
-  variants of plainly imported enums (``Color.Red``) work.  Named record
-  construction with a dotted type name (``geo.Point { ... }``) is likewise not
-  accepted by the parser; positional construction ``geo.Point(1, 2)`` works.
-* Record copy/`with` updates (``p with { x = 3 }``) are interpreter-only; the
-  compiler rejects them with :class:`IRUnsupported` instead of silently
-  dropping the field updates.  In-place field assignment is rejected the same
-  way.
+* Record copy/`with` updates (``p with { x = 3 }``) and in-place field
+  assignment are interpreter-only; the compiler rejects them with
+  :class:`IRUnsupported` instead of silently dropping updates.
+* Enum *payload* variants are rejected instead of being miscompiled: a
+  declaration such as ``enum Option { Some(Int), None }`` raises
+  ``IRUnsupported`` ("enum payload variants"), local or imported. Nullary
+  enums work, including aliased imports: the core loader namespaces
+  declarations and references (``geo.Color`` / ``geo.Color.Red``) and this
+  backend resolves the longest dotted enum prefix. Named record construction
+  with a dotted type name (``geo.Point { ... }``) is not accepted by the
+  parser; positional construction ``geo.Point(1, 2)`` works.
 * Pipes, ``try``/``expr?`` and first-class function values (including reading a
   namespaced function as a value).
 * Builtins other than ``len``, ``text``, ``number``, ``round``, ``Ok``/``Err``
@@ -440,6 +441,8 @@ class _Compiler:
             self.emit("DEF_RECORD", (stmt.name, fields))
             return
         if isinstance(stmt, g2.EnumDecl):
+            if any(v[1] is not None for v in stmt.variants):
+                _unsupported(stmt, "enum payload variants")
             variants = tuple(v[0] for v in stmt.variants)
             self.enums[stmt.name] = frozenset(variants)
             self.emit("DEF_ENUM", (stmt.name, variants))
@@ -1131,10 +1134,11 @@ def compile_file(path: Any) -> Program:
 
     Plain ``import "lib.gm"`` therefore works in the IR backend.  Aliased
     imports (``import "lib.gm" as m``) also flatten: the loader exposes module
-    functions, constants and records as dotted names (``m.fn``, ``m.pi``,
-    ``geo.Point``), and this backend resolves them through the same tables it
-    uses for local declarations.  Aliased ``enum`` declarations are still
-    rejected by the loader itself, before either backend runs.
+    functions, constants, records and enums as dotted names (``m.fn``,
+    ``m.pi``, ``geo.Point``, ``geo.Color``), and this backend resolves them
+    through the same tables it uses for local declarations.  Nullary aliased
+    enums compile; enum *payload* declarations are rejected explicitly by the
+    compiler instead of being silently miscompiled.
     """
     return compile_program(g2.check_file(str(path)))
 

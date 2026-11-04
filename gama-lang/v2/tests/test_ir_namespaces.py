@@ -194,17 +194,14 @@ class IrNamespacedImports(unittest.TestCase):
             IR.run_program(G.parse(src))
         self.assertEqual(str(got.exception), str(ref.exception))
 
-    # -- namespaced enums: blocked by the front end, supported by the VM -----
-    def test_aliased_enum_declaration_is_rejected_identically(self):
+    # -- namespaced enums: front end and VM agree ----------------------------
+    def test_aliased_enum_declaration_runs_identically(self):
         self.write("lib.gm", "enum Color { Red, Green }\n")
         main = self.write("main.gm", 'import "lib.gm" as geo\nprint geo.Color.Red\n')
-        with self.assertRaises(G.GamaError) as ref:
-            G.run_file(str(main))
-        with self.assertRaises(G.GamaError) as got:
-            IR.run_file(str(main))
-        self.assertIs(type(got.exception), type(ref.exception))
-        self.assertEqual(str(got.exception), str(ref.exception))
-        self.assertIn("enumdecl", str(got.exception))
+        expected = G.run_file(str(main)).out
+        got = IR.run_file(str(main)).out
+        self.assertEqual(got, expected)
+        self.assertEqual(got, ["geo.Color.Red"])
 
     def test_vm_resolves_dotted_enum_if_the_front_end_provides_one(self):
         # The core loader does not namespace enums yet.  Feed the VM the AST it
