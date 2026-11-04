@@ -28,7 +28,7 @@ class BenchmarkTests(unittest.TestCase):
     def test_json_schema_and_ir_reporting(self):
         data = bench.run_benchmark(
             runs=1, warmup=0, seed=0,
-            only=["arithmetic_loop", "records"], include_startup=False,
+            only=["arithmetic_loop", "records", "proof"], include_startup=False,
         )
         self.assertEqual(data["schema"], bench.SCHEMA_VERSION)
         self.assertEqual(data["tool"], "gama-l-bench")
@@ -36,8 +36,8 @@ class BenchmarkTests(unittest.TestCase):
             "schema", "tool", "python", "platform", "runs", "warmup",
             "seed", "programs", "notes",
         })
-        self.assertEqual([p["name"] for p in data["programs"]],
-                         ["arithmetic_loop", "records"])
+        self.assertEqual({p["name"] for p in data["programs"]},
+                         {"arithmetic_loop", "records", "proof"})
         for p in data["programs"]:
             self.assertEqual(set(p), {
                 "name", "category", "lines", "parse_ms", "check_ms", "run_ms",
@@ -58,10 +58,14 @@ class BenchmarkTests(unittest.TestCase):
         self.assertIsInstance(arith["ir"]["speedup"], float)
 
         records = next(p for p in data["programs"] if p["name"] == "records")
-        self.assertFalse(records["ir"]["supported"])
-        self.assertTrue(records["ir"]["reason"].startswith("IRUnsupported:"))
-        self.assertNotIn("run_ms", records["ir"])
-        self.assertNotIn("compile_ms", records["ir"])
+        self.assertTrue(records["ir"]["supported"])
+        self.assertTrue(records["ir"]["outputs_match"])
+
+        proof = next(p for p in data["programs"] if p["name"] == "proof")
+        self.assertFalse(proof["ir"]["supported"])
+        self.assertTrue(proof["ir"]["reason"].startswith("IRUnsupported:"))
+        self.assertNotIn("run_ms", proof["ir"])
+        self.assertNotIn("compile_ms", proof["ir"])
 
     def test_deterministic_structure(self):
         kwargs = dict(runs=1, warmup=0, seed=3,
@@ -107,7 +111,7 @@ class BenchmarkTests(unittest.TestCase):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             rc = bench.main([
-                "--runs", "1", "--warmup", "0", "--only", "records",
+                "--runs", "1", "--warmup", "0", "--only", "proof",
                 "--no-startup",
             ])
         self.assertEqual(rc, 0)
@@ -115,7 +119,7 @@ class BenchmarkTests(unittest.TestCase):
         self.assertIn("GAMA-L benchmark", text)
         self.assertIn("IR unsupported", text)
         self.assertIn("IRUnsupported:", text)
-        self.assertIn("records", text)
+        self.assertIn("proof", text)
 
 
 if __name__ == "__main__":

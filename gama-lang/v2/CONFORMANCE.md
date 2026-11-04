@@ -69,7 +69,7 @@ These are outside the T1–T10 checks or only partially covered; see
    (`tests/test_enums.py`, `tests/test_payload_enums.py`). Generics,
    multi-payload/generic enum variants, record methods,
    field update/copy syntax, and structural subtyping are missing; the IR
-   prototype does not compile record/enum declarations or literals.
+   prototype supports records and nullary enums for its documented subset.
 5. **Formatter edges.** `fmt` is AST-based; it preserves comments and strings
    and is idempotent, but comments inside expressions may move to a safe
    position and long expressions are not line-wrapped (T10 still passes).

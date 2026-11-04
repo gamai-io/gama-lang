@@ -950,7 +950,8 @@ def _member_type_items(text, line, character, parts):
         decl = enums.get(name)
         if decl is None:
             return []
-        for variant, _line, _col in decl.variants:
+        for variant_info in decl.variants:
+            variant = variant_info[0]
             if variant in seen:
                 continue
             seen.add(variant)
