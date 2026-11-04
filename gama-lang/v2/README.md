@@ -93,6 +93,29 @@ and restarts with bounded backoff.
 The CLI wrapper is `gama_cli.py`. `release.py build` writes deterministic
 wheel/tar, `SHA256SUMS`, and `RELEASE.json`; `release.py verify` checks them.
 
+### Reproducible release verification
+
+`scripts/verify_release.sh` runs the whole release smoke test from a clean
+temporary directory (no artifacts are written into the repo):
+
+1. `release.py build` twice and compares the SHA256 of the wheel and sdist to
+   prove the build is byte-reproducible;
+2. `release.py verify` plus `sha256sum -c SHA256SUMS`, and checks the
+   `RELEASE.json` manifest;
+3. installs the wheel into a fresh virtualenv and runs `gama-l --help`,
+   `gama-l run examples/hello.gm`, and `gama-l doctor --json` (8/8);
+4. validates `vscode/package.json` and every referenced extension asset, and
+   packages the extension when `vsce` is available offline (otherwise it
+   reports the missing tool and never publishes).
+
+```bash
+bash scripts/verify_release.sh
+```
+
+The wheel ships code only; `gama-l doctor` needs a tree with `examples/`, so
+run it from the source checkout or pass `--root` to a directory that exposes
+`examples/`. Publishing (PyPI, VS Code Marketplace) stays manual.
+
 ## Doctor
 
 ```bash
