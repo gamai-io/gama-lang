@@ -96,6 +96,7 @@ python3 gamal2.py fmt --write file.gm  # write in place
 - `for x in list/text`, `while cond`, `break`/`continue`, list/text indexing
 - `Ok`/`Err` Result values and `match` arms (`Ok(v)`, `Err(e)`, `_`)
 - `expr?` Result propagation: unwraps `Ok`, returns `Err` from the enclosing function; the function must return `Result`
+- core builtins: `unwrap`, `unwrap_or`, `is_ok`, `is_err`; `split`, `join`, `contains`, `trim`, `upper`, `lower`, `replace`, `starts_with`, `ends_with`; `keys`, `values`, `has`
 - literals: text, int, decimal, bool, null, list, map
 - arithmetic/comparison/boolean operators
 - pipes: `filter`, `select`, `sum`, `limit`, `count`, `map`
@@ -115,7 +116,8 @@ python3 gamal2.py fmt --write file.gm  # write in place
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 221/221
+python3 -m unittest discover -s tests -v   # 274/274
+python3 gamal2.py doctor --json                # 8/8 checks
 ```
 
 Conformance coverage: arithmetic/pipes (20 cases), type errors, effect
@@ -128,6 +130,8 @@ Result/match, VS Code LSP client,
 HTTP/local registry, AI connector, guarded SQL writes and SMTP mail, offline
 `ask` = `Unavailable`, 11 examples, canonical `fmt` check/write, doctor, and
 reproducible release metadata.
+
+Conformance: see `CONFORMANCE.md` (SPEC 2.0 T1–T10; T6 is PARTIAL — no persistent proof ledger yet).
 
 ## Not implemented yet
 
