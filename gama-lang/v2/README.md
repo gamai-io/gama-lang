@@ -98,7 +98,7 @@ python3 gamal2.py fmt --write file.gm  # write in place
 - `for x in list/text`, `while cond`, `break`/`continue`, list/text indexing
 - `Ok`/`Err` Result values and `match` arms (`Ok(v)`, `Err(e)`, `_`)
 - `expr?` Result propagation: unwraps `Ok`, returns `Err` from the enclosing function; the function must return `Result`
-- core builtins: `unwrap`, `unwrap_or`, `is_ok`, `is_err`; `split`, `join`, `contains`, `trim`, `upper`, `lower`, `replace`, `starts_with`, `ends_with`; `keys`, `values`, `has`
+- core builtins: `unwrap`, `unwrap_or`, `is_ok`, `is_err`; `split`, `join`, `contains`, `trim`, `upper`, `lower`, `replace`, `starts_with`, `ends_with`; `keys`, `values`, `has`; numeric `abs`, `min`, `max`, `floor`, `ceil`; text/list `reverse`, `slice`, `index_of`, `sort`; conversion `to_int` (`to_text` is already covered by `text`)
 - literals: text, int, decimal, bool, null, list, map
 - arithmetic/comparison/boolean operators
 - pipes: `filter`, `select`, `sum`, `limit`, `count`, `map`
@@ -108,6 +108,7 @@ python3 gamal2.py fmt --write file.gm  # write in place
 - guarded SMTP `mail` (needs `GAMA_L_MAIL_ENABLED=1`; config via `GAMA_L_SMTP_*`)
 - SPEC syntax aliases: `make`, `ask "..." with context`, `remember a.b = v`, `recall a.b`, `wait user "..."`, `use sql`
 - `round(value, digits)`
+- stdlib semantics: `abs` preserves Int/Decimal; `min`/`max` take one or more numbers; `floor`/`ceil` return Int; `reverse`/`slice` work on Text and List (`slice(seq, start, end)` is half-open with explicit `0 <= start <= end <= len`, no negative indices); `index_of` returns the first index or `-1`; `sort` returns a new ascending list and requires all numbers or all Text (stable, as Python's sort); `to_int` accepts Int, an integral Decimal, or Text of an optional sign plus digits (surrounding whitespace is trimmed)
 - `ask` uses `gama_ai` when `GAMA_L_AI_URL` is set; config via `GAMA_L_AI_KEY`,
   `GAMA_L_AI_MODEL`, `GAMA_L_AI_ALLOW_HTTP=1` for local HTTP; HTTPS by default,
   retries 429/5xx, 1 MiB response cap; redirects are refused
@@ -121,7 +122,7 @@ python3 gamal2.py fmt --write file.gm  # write in place
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 351/351
+python3 -m unittest discover -s tests -v   # 379/379
 python3 gamal2.py doctor --json                # 8/8 checks
 ```
 

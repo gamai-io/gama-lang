@@ -14,6 +14,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import math
 import os
 import pathlib
 import re
@@ -521,6 +522,19 @@ BUILTINS = {
     "keys": (set(), "List"),
     "values": (set(), "List"),
     "has": (set(), "Bool"),
+    # Numeric helpers
+    "abs": (set(), "Any"),
+    "min": (set(), "Any"),
+    "max": (set(), "Any"),
+    "floor": (set(), "Int"),
+    "ceil": (set(), "Int"),
+    # Text/List helpers
+    "reverse": (set(), "Any"),
+    "slice": (set(), "Any"),
+    "index_of": (set(), "Int"),
+    "sort": (set(), "List"),
+    # Conversion helpers
+    "to_int": (set(), "Int"),
 }
 
 # Static signatures for the pure core builtins: (min_args, max_args, wants).
@@ -543,6 +557,41 @@ _CORE_SIGS: dict[str, tuple[int, int, list]] = {
     "keys": (1, 1, [{"Json"}]),
     "values": (1, 1, [{"Json"}]),
     "has": (2, 2, [{"Json"}, {"Text"}]),
+    # Numeric helpers (min/max accept one or more numbers)
+    "abs": (1, 1, [{"Int", "Decimal"}]),
+    "min": (1, 64, [{"Int", "Decimal"}]),
+    "max": (1, 64, [{"Int", "Decimal"}]),
+    "floor": (1, 1, [{"Int", "Decimal"}]),
+    "ceil": (1, 1, [{"Int", "Decimal"}]),
+    # Text/List helpers
+    "reverse": (1, 1, [{"Text", "List"}]),
+    "slice": (3, 3, [{"Text", "List"}, {"Int"}, {"Int"}]),
+    "index_of": (2, 2, [{"Text", "List"}, None]),
+    "sort": (1, 1, [{"List"}]),
+    # Conversion helpers
+    "to_int": (1, 1, [{"Int", "Decimal", "Text"}]),
+}
+
+def _dyn_numeric(types: list) -> str:
+    """Numeric builtins preserve Decimal when present, otherwise Int."""
+    if any(t == "Any" for t in types):
+        return "Any"
+    return "Decimal" if "Decimal" in types else "Int"
+
+def _dyn_first(types: list) -> str:
+    """Builtins that preserve the Text/List type of their first argument."""
+    t = types[0] if types else "Any"
+    return t if t in ("Text", "List") else "Any"
+
+_DYN_RET = {
+    "abs": _dyn_numeric,
+    "min": _dyn_numeric,
+    "max": _dyn_numeric,
+    "reverse": _dyn_first,
+    "slice": _dyn_first,
+    "index_of": lambda types: "Int",
+    "sort": lambda types: "List",
+    "to_int": lambda types: "Int",
 }
 
 def check_core_sig(name: str, types: list, call: Call) -> None:
@@ -571,6 +620,13 @@ def _as_text(v, name: str, line: int = 0, col: int = 0) -> str:
     if isinstance(v, Decimal):
         return format(v, "f")
     raise GamaRuntimeError(f"{name} expects Text, got {tname(v)}", line, col)
+
+def _as_number(v, name: str, line: int = 0, col: int = 0):
+    """Return a GAMA numeric value (Int or Decimal), rejecting Bool."""
+    if isinstance(v, bool) or not isinstance(v, (int, Decimal)):
+        raise GamaRuntimeError(
+            f"{name} expects a number, got {tname(v)}", line, col)
+    return v
 
 def _join_item(v) -> str:
     if isinstance(v, str):
@@ -672,6 +728,98 @@ def eval_core_builtin(name: str, args: list, line: int = 0, col: int = 0):
         if not isinstance(m, dict):
             raise GamaRuntimeError("has expects Json", line, col)
         return _as_text(key, name, line, col) in m
+    if name == "abs":
+        _need_args(name, args, 1, line, col)
+        v = _as_number(args[0], name, line, col)
+        return -v if v < 0 else v
+    if name in ("min", "max"):
+        if not args:
+            raise GamaRuntimeError(f"{name} expects at least 1 arg", line, col)
+        vals = [_as_number(a, name, line, col) for a in args]
+        return min(vals) if name == "min" else max(vals)
+    if name in ("floor", "ceil"):
+        _need_args(name, args, 1, line, col)
+        v = _as_number(args[0], name, line, col)
+        if isinstance(v, int):
+            return v
+        return math.floor(v) if name == "floor" else math.ceil(v)
+    if name == "reverse":
+        _need_args(name, args, 1, line, col)
+        v = args[0]
+        if isinstance(v, str):
+            return v[::-1]
+        if isinstance(v, list):
+            return list(reversed(v))
+        raise GamaRuntimeError(
+            f"reverse expects Text or List, got {tname(v)}", line, col)
+    if name == "slice":
+        _need_args(name, args, 3, line, col)
+        seq, start, end = args
+        if not isinstance(seq, (str, list)):
+            raise GamaRuntimeError(
+                f"slice expects Text or List, got {tname(seq)}", line, col)
+        for label, v in (("start", start), ("end", end)):
+            if isinstance(v, bool) or not isinstance(v, int):
+                raise GamaRuntimeError(
+                    f"slice {label} must be Int, got {tname(v)}", line, col)
+        n = len(seq)
+        if start < 0 or end < 0:
+            raise GamaRuntimeError("slice bounds must be >= 0", line, col)
+        if start > end:
+            raise GamaRuntimeError("slice start must be <= end", line, col)
+        if end > n:
+            raise GamaRuntimeError(
+                f"slice end {end} out of range for length {n}", line, col)
+        return seq[start:end]
+    if name == "index_of":
+        _need_args(name, args, 2, line, col)
+        hay, needle = args
+        if isinstance(hay, str):
+            if not isinstance(needle, str):
+                raise GamaRuntimeError(
+                    f"index_of on Text needs Text, got {tname(needle)}", line, col)
+            return hay.find(needle)
+        if isinstance(hay, list):
+            for i, item in enumerate(hay):
+                if item == needle:
+                    return i
+            return -1
+        raise GamaRuntimeError(
+            f"index_of expects Text or List, got {tname(hay)}", line, col)
+    if name == "sort":
+        _need_args(name, args, 1, line, col)
+        seq = args[0]
+        if not isinstance(seq, list):
+            raise GamaRuntimeError(
+                f"sort expects List, got {tname(seq)}", line, col)
+        if not seq:
+            return []
+        kinds = {tname(x) for x in seq}
+        if kinds <= {"Int", "Decimal"} or kinds == {"Text"}:
+            return sorted(seq)
+        raise GamaRuntimeError(
+            "sort expects a list of all numbers or all Text", line, col)
+    if name == "to_int":
+        _need_args(name, args, 1, line, col)
+        v = args[0]
+        if isinstance(v, bool):
+            raise GamaRuntimeError("to_int expects a number or Text", line, col)
+        if isinstance(v, int):
+            return v
+        if isinstance(v, Decimal):
+            if v != v.to_integral_value():
+                raise GamaRuntimeError(
+                    f"to_int: {v} is not an integral Decimal", line, col)
+            return int(v)
+        if isinstance(v, str):
+            s = v.strip()
+            if not re.fullmatch(r"[+-]?\d+", s):
+                raise GamaRuntimeError(
+                    f"to_int: cannot parse {v!r} as an integer", line, col)
+            return int(s)
+        raise GamaRuntimeError(
+            f"to_int expects Int, integral Decimal, or Text, got {tname(v)}",
+            line, col)
     raise GamaRuntimeError(f"unknown builtin {name}", line, col)
 
 def sqlite_schema() -> dict[str, set[str]] | None:
@@ -917,6 +1065,8 @@ class Checker:
                 types = [self.expr(a, row) for a in e.args]
                 if e.name in _CORE_SIGS:
                     check_core_sig(e.name, types, e)
+                if e.name in _DYN_RET:
+                    return _DYN_RET[e.name](types)
                 if e.name == "sql":
                     q = e.args[0].value if e.args and isinstance(e.args[0], Literal) else ""
                     fields = sql_fields(q)
