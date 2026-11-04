@@ -57,6 +57,56 @@
     ],
     "description": "Bind a value to a name."
   },
+  "Record declaration": {
+    "prefix": [
+      "record",
+      "recorddecl"
+    ],
+    "body": [
+      "record ${1:Name} { ${2:field}: ${3:Type} }"
+    ],
+    "description": "Declare a nominal record with typed fields."
+  },
+  "Enum declaration": {
+    "prefix": [
+      "enum",
+      "enumdecl"
+    ],
+    "body": [
+      "enum ${1:Name} { ${2:First}, ${3:Second} }"
+    ],
+    "description": "Declare a nullary enum with variants."
+  },
+  "Record literal": {
+    "prefix": [
+      "recordlit",
+      "newrecord"
+    ],
+    "body": [
+      "${1:Name} { ${2:field}: ${3:value} }"
+    ],
+    "description": "Construct a named record literal with named fields."
+  },
+  "Record member access": {
+    "prefix": [
+      "recordfield",
+      "field"
+    ],
+    "body": [
+      "${1:value}.${2:field}"
+    ],
+    "description": "Read a field from a record value (e.g. p.x)."
+  },
+  "Enum variant value": {
+    "prefix": [
+      "variant",
+      "enummember"
+    ],
+    "body": [
+      "${1:Enum}.${2:Variant}"
+    ],
+    "description": "Reference an enum variant (e.g. Color.Red)."
+  },
   "If / else": {
     "prefix": "if",
     "body": [

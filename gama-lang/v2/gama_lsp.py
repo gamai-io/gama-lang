@@ -306,6 +306,10 @@ KIND_FUNCTION = 3
 KIND_VARIABLE = 6
 KIND_CONSTANT = 21
 KIND_TYPE = 25
+KIND_FIELD = 5
+KIND_CLASS = 7
+KIND_ENUM = 13
+KIND_ENUM_MEMBER = 20
 
 NAME_RE = re.compile(r"\b(let|fn)\s+([A-Za-z_]\w*)")
 WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -316,6 +320,20 @@ IMPORT_ALIAS_CTX_RE = re.compile(
     r'^\s*import\s+"([^"]*)"\s+as\s+([A-Za-z_][A-Za-z0-9_]*)?$')
 MEMBER_CTX_RE = re.compile(
     r"([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)?$")
+# Dotted chain immediately before the cursor: `p.`, `p.x`, `l.a.`.
+MEMBER_CHAIN_RE = re.compile(
+    r"([A-Za-z_][A-Za-z0-9_]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)*)"
+    r"\s*\.\s*$")
+# Tail of a line that is an incomplete member expression (`print p.x`).
+LINE_CHAIN_TAIL_RE = re.compile(
+    r"([A-Za-z_][A-Za-z0-9_]*)(?:\s*\.\s*[A-Za-z0-9_]*)*"
+    r"\s*\.\s*[A-Za-z0-9_]*$")
+RECORD_DECL_RE = re.compile(
+    r"\brecord\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{([^}]*)\}")
+ENUM_DECL_RE = re.compile(
+    r"\benum\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{([^}]*)\}")
+RECORD_FIELD_RE = re.compile(
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([A-Za-z_][A-Za-z0-9_.]*)")
 
 # short human descriptions for builtins and keyword-like builtins
 DESCRIPTIONS = {
@@ -512,13 +530,14 @@ def _resolve_module(uri: str, path: str):
 
 
 def _module_declarations(uri: str, path: str):
-    """Exported ``fn``/``let`` declarations of an aliased module, or ``None``.
+    """Exported ``fn``/``let``/``record`` declarations of an aliased module.
 
     Mirrors the core alias-import rules: the module (including plain imports
-    it inlines) may only contain ``fn``/``let`` declarations, plain imports and
-    ``use`` at the top level. Malformed, missing or side-effect modules are
-    treated as unavailable so completion and hover stay quiet instead of
-    advertising members the runtime would reject.
+    it inlines) may only contain ``fn``/``let``/``record`` declarations, plain
+    imports and ``use`` at the top level. Malformed, missing or side-effect
+    modules are treated as unavailable so completion and hover stay quiet
+    instead of advertising members the runtime would reject. ``None`` means
+    unavailable, while an empty list means nothing exportable.
     """
     target = _resolve_module(uri, path)
     root = _doc_root(uri)
@@ -536,7 +555,8 @@ def _module_declarations(uri: str, path: str):
             return None
     except Exception:
         return None
-    return [st for st in stmts if isinstance(st, (G.Fn, G.Let))]
+    return [st for st in stmts
+            if isinstance(st, (G.Fn, G.Let, G.RecordDecl))]
 
 
 def _module_functions(uri: str, path: str):
@@ -629,6 +649,336 @@ def _alias_suggestion(path: str, taken) -> str | None:
     return candidate
 
 
+# ------------------------------------------------------- records and enums
+def _parse_or_none(text):
+    """Parsed program, or ``None`` when the document does not parse."""
+    try:
+        return G.parse(text or "")
+    except Exception:
+        return None
+
+
+def _record_decls(text):
+    """Map record name -> ``RecordDecl`` for the document.
+
+    Prefers the parsed AST; when parsing fails (common while the cursor line
+    is still incomplete) a conservative regex fallback recovers declarations
+    whose braces are closed. Missing or malformed declarations are simply
+    absent, never fatal.
+    """
+    program = _parse_or_none(text)
+    if program is not None:
+        out = {}
+        for node in _walk(program):
+            if isinstance(node, G.RecordDecl) and node.name not in out:
+                out[node.name] = node
+        return out
+    out = {}
+    for match in RECORD_DECL_RE.finditer(text or ""):
+        name, body = match.group(1), match.group(2)
+        fields = [(fm.group(1), fm.group(2))
+                  for fm in RECORD_FIELD_RE.finditer(body)]
+        if name not in out:
+            out[name] = G.RecordDecl(name, fields, 0, 0)
+    return out
+
+
+def _enum_decls(text):
+    """Map enum name -> ``EnumDecl`` for the document (parsed or fallback)."""
+    program = _parse_or_none(text)
+    if program is not None:
+        out = {}
+        for node in _walk(program):
+            if isinstance(node, G.EnumDecl) and node.name not in out:
+                out[node.name] = node
+        return out
+    out = {}
+    for match in ENUM_DECL_RE.finditer(text or ""):
+        name = match.group(1)
+        body = re.sub(r"#[^\n]*", "", match.group(2))
+        variants = [(token, 0, 0) for token in re.split(r"[,\s]+", body)
+                    if ALIAS_RE.match(token)]
+        if name not in out:
+            out[name] = G.EnumDecl(name, variants, 0, 0)
+    return out
+
+
+def _record_name_for(type_name, records, aliases):
+    """Resolve a type annotation to a locally declared record name.
+
+    Dotted types that start with an import alias belong to another module and
+    are left unresolved instead of being mapped onto an unrelated local record
+    with the same tail name.
+    """
+    if not type_name:
+        return None
+    if type_name in records:
+        return type_name
+    if "." in type_name:
+        head, _sep, tail = type_name.partition(".")
+        if head in aliases:
+            return None
+        if tail in records:
+            return tail
+    return None
+
+
+def _expr_record_type(expr, records):
+    """Record type produced by a literal or record-style constructor call."""
+    if isinstance(expr, G.RecordLit):
+        return expr.name
+    if isinstance(expr, G.Call) and expr.name in records:
+        return expr.name
+    return None
+
+
+def _regex_binding_type(text, name, records, aliases):
+    """Best-effort binding type from raw text when the AST is unavailable."""
+    escaped = re.escape(name)
+    patterns = (
+        r"\blet\s+%s\s*:\s*([A-Za-z_][A-Za-z0-9_.]*)" % escaped,
+        r"\blet\s+%s\s*=\s*([A-Za-z_][A-Za-z0-9_.]*)\s*[\{\(]" % escaped,
+        r"\b%s\s*:\s*([A-Za-z_][A-Za-z0-9_.]*)" % escaped,
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text or "")
+        if match is None:
+            continue
+        candidate = match.group(1)
+        if _record_name_for(candidate, records, aliases) is not None:
+            return candidate
+    return None
+
+
+def _var_type_name(text, name, line, records, aliases):
+    """Best-effort annotated/constructed type of a local variable.
+
+    Bindings are collected document-wide (like the existing parameter helper);
+    the nearest declaration at or before the cursor line wins, otherwise the
+    earliest known binding is used. The nearest binding is authoritative even
+    when its type is unknown, so a later ``let p = 5`` does not resurrect an
+    earlier ``let p: Point``. Nothing is evaluated.
+    """
+    program = _parse_or_none(text)
+    if program is None:
+        return _regex_binding_type(text, name, records, aliases)
+    candidates = []
+    for node in _walk(program):
+        if isinstance(node, G.Let) and node.name == name:
+            type_name = getattr(node, "type_name", None)
+            if not type_name:
+                type_name = _expr_record_type(node.expr, records)
+            candidates.append((int(node.line or 0), type_name))
+        elif isinstance(node, G.Assign) and node.name == name:
+            candidates.append(
+                (int(node.line or 0), _expr_record_type(node.expr, records)))
+        elif isinstance(node, (G.Fn, G.Lambda)):
+            for param in node.params:
+                if param.name == name:
+                    candidates.append(
+                        (int(node.line or 0), param.type_name))
+    if not candidates:
+        return None
+    limit = max(1, int(line) + 1)
+    before = [c for c in candidates if 0 < c[0] <= limit]
+    chosen = max(before, key=lambda c: c[0]) if before else min(
+        candidates, key=lambda c: c[0])
+    return chosen[1]
+
+
+def _chain_target_type(text, parts, records, enums, aliases, line):
+    """Resolve a dotted prefix before the cursor to a record or enum type."""
+    if not parts:
+        return None
+    base = parts[0]
+    if len(parts) == 1:
+        if base in enums:
+            return ("enum", base)
+        type_name = _var_type_name(text, base, line, records, aliases)
+        record = _record_name_for(type_name, records, aliases)
+        return ("record", record) if record else None
+    type_name = _var_type_name(text, base, line, records, aliases)
+    record = _record_name_for(type_name, records, aliases)
+    for part in parts[1:]:
+        if record is None:
+            return None
+        fields = dict(records[record].fields)
+        if part not in fields:
+            return None
+        record = _record_name_for(fields[part], records, aliases)
+    return ("record", record) if record else None
+
+
+def _context_text(text, line, character):
+    """Document with the incomplete member chain at the cursor repaired.
+
+    Completion and hover commonly run on a line such as ``print p.``; the
+    strict parser would reject it, hiding the declarations needed to resolve
+    ``p``. Collapsing the trailing chain to its first identifier keeps the
+    surrounding document parseable. Malformed documents still fall back to the
+    regex scanners above.
+    """
+    rows = (text or "").split("\n")
+    if line < 0 or line >= len(rows):
+        return text or ""
+    row = rows[line]
+    index = utf16_to_index(row, max(0, character))
+    prefix, suffix = row[:index], row[index:]
+    match = LINE_CHAIN_TAIL_RE.search(prefix)
+    if match:
+        prefix = prefix[:match.start()] + match.group(1)
+    if prefix and suffix and (prefix[-1].isalnum() or prefix[-1] == "_") \
+            and (suffix[0].isalnum() or suffix[0] == "_"):
+        prefix += " "
+    rows[line] = prefix + suffix
+    return "\n".join(rows)
+
+
+def _record_signature_text(decl, qualifier=None):
+    fields = ", ".join("%s: %s" % (name, type_name)
+                       for name, type_name in decl.fields)
+    if qualifier:
+        head = "%s.%s" % (qualifier, decl.name)
+        return head + (" { %s }" % fields if fields else " { }")
+    head = "record %s" % decl.name
+    return head + (" { %s }" % fields if fields else " { }")
+
+
+def _record_hover_text(decl, qualifier=None):
+    fields = ", ".join("`%s: %s`" % pair for pair in decl.fields)
+    if fields:
+        return ("`%s`\n\nGAMA-L record `%s` with fields %s."
+                % (_record_signature_text(decl, qualifier), decl.name, fields))
+    return ("`%s`\n\nGAMA-L record `%s` (no fields)."
+            % (_record_signature_text(decl, qualifier), decl.name))
+
+
+def _enum_signature_text(decl):
+    variants = ", ".join(variant[0] for variant in decl.variants)
+    head = "enum %s" % decl.name
+    return head + (" { %s }" % variants if variants else " { }")
+
+
+def _enum_hover_text(decl):
+    variants = ", ".join("`%s`" % variant[0] for variant in decl.variants)
+    if variants:
+        return ("`%s`\n\nGAMA-L enum `%s` with variants %s."
+                % (_enum_signature_text(decl), decl.name, variants))
+    return ("`%s`\n\nGAMA-L enum `%s` (no variants)."
+            % (_enum_signature_text(decl), decl.name))
+
+
+def _structural_hover(text, name):
+    """Hover for a record/enum declaration name, or ``None``."""
+    records = _record_decls(text)
+    if name in records:
+        return _record_hover_text(records[name])
+    enums = _enum_decls(text)
+    if name in enums:
+        return _enum_hover_text(enums[name])
+    return None
+
+
+def _dotted_member_at(text, line, character):
+    """Return ``(chain_parts, member)`` when the cursor is on ``a.b[.c]``."""
+    row = _line_text(text, line)
+    if not row:
+        return None
+    pos = utf16_to_index(row, max(0, character))
+    for match in WORD_RE.finditer(row):
+        if match.start() <= pos <= match.end():
+            before = row[:match.start()]
+            chain = re.search(
+                r"([A-Za-z_][A-Za-z0-9_]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)*)"
+                r"\s*\.\s*$", before)
+            if chain is None:
+                return None
+            parts = [part.strip() for part in chain.group(1).split(".")
+                     if part.strip()]
+            return parts, match.group(0)
+    return None
+
+
+def _local_member_hover(text, line, character):
+    """Hover for a record field or enum variant in a member expression."""
+    found = _dotted_member_at(text, line, character)
+    if found is None:
+        return None
+    parts, member = found
+    context = _context_text(text, line, character)
+    records = _record_decls(context)
+    enums = _enum_decls(context)
+    aliases = _alias_map(text)
+    if len(parts) == 1:
+        enum = enums.get(parts[0])
+        if enum is not None:
+            if member not in {variant[0] for variant in enum.variants}:
+                return None
+            return ("`%s.%s`\n\nGAMA-L enum variant `%s` of enum `%s`."
+                    % (parts[0], member, member, parts[0]))
+    type_name = _var_type_name(context, parts[0], line, records, aliases)
+    record = _record_name_for(type_name, records, aliases)
+    for part in parts[1:]:
+        if record is None:
+            return None
+        fields = dict(records[record].fields)
+        if part not in fields:
+            return None
+        record = _record_name_for(fields[part], records, aliases)
+    if record is None:
+        return None
+    fields = dict(records[record].fields)
+    if member not in fields:
+        return None
+    return ("`%s.%s`\n\nGAMA-L field `%s: %s` of record `%s`."
+            % (".".join(parts), member, member, fields[member], record))
+
+
+def _member_type_items(text, line, character, parts):
+    """Completion items for fields/variants after a dotted prefix."""
+    context = _context_text(text, line, character)
+    records = _record_decls(context)
+    enums = _enum_decls(context)
+    aliases = _alias_map(text)
+    target = _chain_target_type(context, parts, records, enums, aliases, line)
+    if target is None:
+        return []
+    kind, name = target
+    items = []
+    seen = set()
+    if kind == "enum":
+        decl = enums.get(name)
+        if decl is None:
+            return []
+        for variant, _line, _col in decl.variants:
+            if variant in seen:
+                continue
+            seen.add(variant)
+            items.append({
+                "label": variant,
+                "kind": KIND_ENUM_MEMBER,
+                "detail": "%s.%s" % (name, variant),
+                "documentation": "Variant `%s` of enum `%s`."
+                                 % (variant, name),
+            })
+        return items
+    decl = records.get(name)
+    if decl is None:
+        return []
+    for field, type_name in decl.fields:
+        if field in seen:
+            continue
+        seen.add(field)
+        items.append({
+            "label": field,
+            "kind": KIND_FIELD,
+            "detail": "field %s: %s" % (field, type_name),
+            "documentation": "Field `%s` of record `%s`."
+                             % (field, name),
+        })
+    return items
+
+
 def completion(uri: str, text: str, line: int = 0, character: int = 0):
     prefix = _line_prefix(text, line, character)
 
@@ -651,47 +1001,66 @@ def completion(uri: str, text: str, line: int = 0, character: int = 0):
         return {"isIncomplete": False, "items": items}
 
     # Member position: ``alias.<cursor>``. Offer the module's exported
-    # functions and top-level `let` constants, mirroring the core namespace.
+    # functions, records and top-level `let` constants, mirroring the core
+    # namespace. When the head is not an import alias, fall through to local
+    # record/enum member completion below.
     mm = MEMBER_CTX_RE.search(prefix)
     if mm:
         alias = mm.group(1)
         imp = _alias_map(text).get(alias)
-        if imp is None:
-            return {"isIncomplete": False, "items": []}
-        declarations = _module_declarations(uri, imp["path"])
-        if declarations is None:
-            return {"isIncomplete": False, "items": []}
-        items = []
-        seen_members = set()
-        for node in sorted(declarations, key=lambda n: n.name):
-            if node.name in seen_members:
-                continue
-            seen_members.add(node.name)
-            if isinstance(node, G.Fn):
-                items.append({
-                    "label": node.name,
-                    "kind": KIND_FUNCTION,
-                    "detail": fn_signature(node),
-                    "documentation": "From `%s` (imported as `%s`)."
-                                     % (imp["path"], alias),
-                })
-            else:
-                type_name = _const_type(node)
-                detail = ("let %s: %s" % (node.name, type_name)
-                          if type_name else "let %s" % node.name)
-                items.append({
-                    "label": node.name,
-                    "kind": KIND_CONSTANT,
-                    "detail": detail,
-                    "documentation": "Constant from `%s` (imported as `%s`)."
-                                     % (imp["path"], alias),
-                })
-        return {"isIncomplete": False, "items": items}
+        if imp is not None:
+            declarations = _module_declarations(uri, imp["path"])
+            if declarations is None:
+                return {"isIncomplete": False, "items": []}
+            items = []
+            seen_members = set()
+            for node in sorted(declarations, key=lambda n: n.name):
+                if node.name in seen_members:
+                    continue
+                seen_members.add(node.name)
+                if isinstance(node, G.Fn):
+                    items.append({
+                        "label": node.name,
+                        "kind": KIND_FUNCTION,
+                        "detail": fn_signature(node),
+                        "documentation": "From `%s` (imported as `%s`)."
+                                         % (imp["path"], alias),
+                    })
+                elif isinstance(node, G.RecordDecl):
+                    items.append({
+                        "label": node.name,
+                        "kind": KIND_CLASS,
+                        "detail": "record %s" % node.name,
+                        "documentation": "Record from `%s` (imported as "
+                                         "`%s`)." % (imp["path"], alias),
+                    })
+                else:
+                    type_name = _const_type(node)
+                    detail = ("let %s: %s" % (node.name, type_name)
+                              if type_name else "let %s" % node.name)
+                    items.append({
+                        "label": node.name,
+                        "kind": KIND_CONSTANT,
+                        "detail": detail,
+                        "documentation": "Constant from `%s` (imported as "
+                                         "`%s`)." % (imp["path"], alias),
+                    })
+            return {"isIncomplete": False, "items": items}
+
+    # Record fields (``p.<cursor>``) and enum variants (``Color.<cursor>``).
+    # The chain form also covers nested records such as ``line.a.``.
+    chain = MEMBER_CHAIN_RE.search(prefix)
+    if chain is not None:
+        parts = [part.strip() for part in chain.group(1).split(".")
+                 if part.strip()]
+        return {"isIncomplete": False,
+                "items": _member_type_items(text, line, character, parts)}
 
     items = []
     seen = set()
-    # ``as`` is an import keyword lexed as an identifier by the core parser.
-    for kw in sorted(set(G.KEYWORDS) | {"as"}):
+    # ``as`` is an import keyword lexed as an identifier by the core parser;
+    # ``record`` is contextual and also lexed as an identifier.
+    for kw in sorted(set(G.KEYWORDS) | {"as", "record"}):
         if kw in seen:
             continue
         seen.add(kw)
@@ -701,6 +1070,20 @@ def completion(uri: str, text: str, line: int = 0, character: int = 0):
             continue
         seen.add(name)
         items.append({"label": name, "kind": KIND_TYPE})
+    for name in sorted(_record_decls(text)):
+        if name in seen:
+            continue
+        seen.add(name)
+        items.append({"label": name, "kind": KIND_CLASS,
+                      "detail": "record %s" % name,
+                      "documentation": "GAMA-L record `%s`." % name})
+    for name in sorted(_enum_decls(text)):
+        if name in seen:
+            continue
+        seen.add(name)
+        items.append({"label": name, "kind": KIND_ENUM,
+                      "detail": "enum %s" % name,
+                      "documentation": "GAMA-L enum `%s`." % name})
     for name in sorted(G.BUILTINS):
         if name in seen:
             continue
@@ -1015,6 +1398,10 @@ def _member_hover(uri: str, text: str, line: int, character: int):
         if isinstance(node, G.Fn):
             return ("`%s.%s`\n\nGAMA-L function from `%s`."
                     % (alias, fn_signature(node), imp["path"]))
+        if isinstance(node, G.RecordDecl):
+            return ("`%s`\n\nGAMA-L record from `%s` (imported as `%s`)."
+                    % (_record_signature_text(node, alias),
+                       imp["path"], alias))
         type_name = _const_type(node)
         value = _const_value(node)
         facts = []
@@ -1033,6 +1420,10 @@ def hover(uri: str, text: str, line: int, character: int):
     if not name:
         return None
     value = _member_hover(uri, text, line, character)
+    if value is None:
+        value = _local_member_hover(text, line, character)
+    if value is None:
+        value = _structural_hover(text, name)
     if value is None and name in TYPE_HOVERS:
         value = TYPE_HOVERS[name]
     elif value is None and name in TYPE_NAMES:
@@ -1061,6 +1452,8 @@ def hover(uri: str, text: str, line: int, character: int):
                  "`%s.fn(...)`." % (name, imp["path"], name))
     if value is None and name in G.KEYWORDS:
         value = "GAMA-L keyword `%s`" % name
+    if value is None and name == "record":
+        value = "GAMA-L keyword `record`"
     if value is None:
         return None
     return {"contents": {"kind": "markdown", "value": value}}

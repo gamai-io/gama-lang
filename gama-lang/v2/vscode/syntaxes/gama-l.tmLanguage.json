@@ -11,6 +11,70 @@
       "match": "#.*$"
     },
     {
+      "name": "meta.record.declaration.gama-l",
+      "begin": "\\b(record)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(\\{)",
+      "beginCaptures": {
+        "1": {
+          "name": "keyword.control.type.gama-l"
+        },
+        "2": {
+          "name": "entity.name.type.gama-l"
+        },
+        "3": {
+          "name": "punctuation.definition.block.begin.gama-l"
+        }
+      },
+      "end": "(\\})",
+      "endCaptures": {
+        "1": {
+          "name": "punctuation.definition.block.end.gama-l"
+        }
+      },
+      "patterns": [
+        {
+          "match": "([A-Za-z_][A-Za-z0-9_]*)\\s*(:)\\s*([A-Za-z_][A-Za-z0-9_.]*)",
+          "captures": {
+            "1": {
+              "name": "variable.other.member.gama-l"
+            },
+            "2": {
+              "name": "punctuation.separator.gama-l"
+            },
+            "3": {
+              "name": "support.type.gama-l"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "meta.enum.declaration.gama-l",
+      "begin": "\\b(enum)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(\\{)",
+      "beginCaptures": {
+        "1": {
+          "name": "keyword.control.type.gama-l"
+        },
+        "2": {
+          "name": "entity.name.type.gama-l"
+        },
+        "3": {
+          "name": "punctuation.definition.block.begin.gama-l"
+        }
+      },
+      "end": "(\\})",
+      "endCaptures": {
+        "1": {
+          "name": "punctuation.definition.block.end.gama-l"
+        }
+      },
+      "patterns": [
+        {
+          "name": "variable.other.enummember.gama-l",
+          "match": "[A-Za-z_][A-Za-z0-9_]*"
+        }
+      ]
+    },
+    {
       "name": "meta.import.alias.gama-l",
       "match": "(\\bimport)\\s+(\"[^\"]*\")\\s+(as)\\s+([A-Za-z_][A-Za-z0-9_]*)",
       "captures": {
@@ -178,7 +242,7 @@
     },
     {
       "name": "keyword.control.gama-l",
-      "match": "\\b(let|fn|make|if|else|return|match|prove|verify|print|effects|filter|select|sum|limit|count|map|in|import|as|use|wait|for|while|break|continue)\\b"
+      "match": "\\b(let|fn|make|if|else|return|match|prove|verify|print|effects|filter|select|sum|limit|count|map|in|import|as|use|wait|for|while|break|continue|record|enum)\\b"
     },
     {
       "name": "keyword.operator.try.gama-l",
@@ -197,6 +261,18 @@
         },
         "2": {
           "name": "entity.name.function.call.gama-l"
+        }
+      }
+    },
+    {
+      "name": "meta.member.access.gama-l",
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\.([A-Za-z_][A-Za-z0-9_]*)\\b",
+      "captures": {
+        "1": {
+          "name": "variable.other.object.gama-l"
+        },
+        "2": {
+          "name": "variable.other.property.gama-l"
         }
       }
     },
