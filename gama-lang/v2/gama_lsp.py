@@ -1179,7 +1179,555 @@ def _decl_start(uri: str, text: str, node, name: str):
     }}
 
 
+# ------------------------------------- record/enum navigation (definition+refs)
+def _offset_at(text: str, line0: int, idx: int) -> int:
+    rows = (text or "").split("\n")
+    if line0 < 0 or line0 >= len(rows) or idx < 0:
+        return -1
+    return sum(len(row) + 1 for row in rows[:line0]) + idx
+
+
+def _linecol_at(text: str, offset: int):
+    if offset < 0:
+        return -1, -1
+    prefix = (text or "")[:offset]
+    line0 = prefix.count("\n")
+    idx = offset - (prefix.rfind("\n") + 1)
+    return line0, idx
+
+
+def _brace_body_range(text: str, start: int):
+    """``(body_start, body_end)`` for the first brace block at/after start."""
+    i = (text or "").find("{", max(0, start))
+    if i < 0:
+        return None
+    depth = 0
+    quote = None
+    j = i
+    n = len(text or "")
+    while j < n:
+        ch = text[j]
+        if quote:
+            if ch == "\\":
+                j += 2
+                continue
+            if ch == quote:
+                quote = None
+            j += 1
+            continue
+        if ch == '"':
+            quote = ch
+            j += 1
+            continue
+        if ch == "#":
+            nl = text.find("\n", j)
+            j = n if nl < 0 else nl
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1, j
+        j += 1
+    return None
+
+
+def _decl_body_range(text: str, node, keyword: str):
+    line0 = max(0, int(getattr(node, "line", 1)) - 1)
+    col0 = max(0, int(getattr(node, "col", 1)) - 1)
+    start = _offset_at(text, line0, col0)
+    if start < 0:
+        return None
+    key = (text or "").find(keyword, start)
+    if key < 0:
+        return None
+    return _brace_body_range(text, key + len(keyword))
+
+
+def _top_level_tokens(text: str, start: int, end: int):
+    """Identifier tokens at bracket depth 0 (strings/comments ignored)."""
+    out = []
+    depth = 0
+    quote = None
+    i = start
+    n = min(end, len(text or ""))
+    while i < n:
+        ch = text[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch == '"':
+            quote = ch
+            i += 1
+            continue
+        if ch == "#":
+            nl = text.find("\n", i)
+            i = n if nl < 0 or nl > n else nl
+            continue
+        if ch in "([{":
+            depth += 1
+            i += 1
+            continue
+        if ch in ")]}":
+            depth = max(0, depth - 1)
+            i += 1
+            continue
+        if ch.isalpha() or ch == "_":
+            j = i + 1
+            while j < n and (text[j].isalnum() or text[j] == "_"):
+                j += 1
+            if depth == 0:
+                out.append((text[i:j], i))
+            i = j
+            continue
+        i += 1
+    return out
+
+
+def _record_field_spans(text: str, decl):
+    """Map field name -> source offset of its declaration (top-level only)."""
+    body = _decl_body_range(text, decl, "record")
+    if body is None:
+        return {}
+    out = {}
+    start, end = body
+    for word, off in _top_level_tokens(text, start, end):
+        j = off + len(word)
+        while j < end and text[j] in " \t":
+            j += 1
+        if j < end and text[j] == ":":
+            out.setdefault(word, off)
+    return out
+
+
+def _enum_variant_spans(text: str, decl):
+    """Ordered ``[(variant, offset)]`` for top-level enum variants."""
+    body = _decl_body_range(text, decl, "enum")
+    if body is None:
+        return []
+    start, end = body
+    return _top_level_tokens(text, start, end)
+
+
+def _node_offset(text: str, node) -> int:
+    line0 = max(0, int(getattr(node, "line", 1)) - 1)
+    col0 = max(0, int(getattr(node, "col", 1)) - 1)
+    return _offset_at(text, line0, col0)
+
+
+def _record_lit_key_spans(text: str, node):
+    """``[(key, offset)]`` for the top-level keys of a record literal."""
+    body = _brace_body_range(text, _node_offset(text, node))
+    if body is None:
+        return []
+    start, end = body
+    out = []
+    for word, off in _top_level_tokens(text, start, end):
+        j = off + len(word)
+        while j < end and text[j] in " \t":
+            j += 1
+        if j < end and text[j] == ":":
+            out.append((word, off))
+    return out
+
+
+def _decl_name_span(text: str, node, keyword: str, name: str):
+    """``(line, idx)`` of a record/enum declaration name, or None."""
+    rows = (text or "").split("\n")
+    line0 = max(0, int(getattr(node, "line", 1)) - 1)
+    if line0 < len(rows):
+        idx = _name_pos(rows[line0], max(0, int(getattr(node, "col", 1)) - 1),
+                        name)
+        if idx is not None:
+            return line0, idx
+    for line0 in range(len(rows)):
+        idx = _name_pos(rows[line0], 0, name)
+        if idx is not None:
+            return line0, idx
+    return None
+
+
+def _word_span_at(text: str, line: int, character: int):
+    row = _line_text(text, line)
+    if not row:
+        return None
+    pos = utf16_to_index(row, max(0, character))
+    for match in WORD_RE.finditer(row):
+        if match.start() <= pos <= match.end():
+            return match.start(), match.group(0)
+    return None
+
+
+def _masked_text(text: str) -> str:
+    """Same-length text with string/comment contents blanked out."""
+    chars = list(text or "")
+    i = 0
+    quote = None
+    n = len(chars)
+    while i < n:
+        ch = chars[i]
+        if quote:
+            if ch == "\\":
+                chars[i] = " "
+                if i + 1 < n and chars[i + 1] != "\n":
+                    chars[i + 1] = " "
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            chars[i] = " "
+            i += 1
+            continue
+        if ch == '"':
+            quote = ch
+            chars[i] = " "
+        elif ch == "#":
+            while i < n and chars[i] != "\n":
+                chars[i] = " "
+                i += 1
+            continue
+        i += 1
+    return "".join(chars)
+
+
+def _type_reference_spans(text: str, name: str):
+    """All source offsets where a record/enum name is used as a type."""
+    masked = _masked_text(text)
+    out = []
+    seen = set()
+    pattern = re.compile(r"(?<![\w.])%s(?!\w)" % re.escape(name))
+    for line0, row in enumerate(masked.split("\n")):
+        for match in pattern.finditer(row):
+            idx = match.start()
+            before = row[:idx].rstrip()
+            after = row[match.end():].lstrip()
+            last = re.search(r"([A-Za-z_]\w*)$", before)
+            word = last.group(1) if last else ""
+            prev1 = before[-1:] if before else ""
+            prev2 = before[-2:] if len(before) >= 2 else ""
+            nxt = after[:1]
+            used = False
+            if word in ("record", "enum", "use"):
+                used = True
+            elif prev2 == "->" or prev1 == ":":
+                used = True
+            elif nxt in ("(", "{", "."):
+                used = word not in ("fn", "let")
+            if not used:
+                continue
+            key = (line0, idx)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+def _resolve_record_chain(text: str, parts, line: int, records, aliases):
+    """Record owning the final chain segment (parts includes the member)."""
+    if not parts or len(parts) < 2:
+        return None
+    type_name = _var_type_name(text, parts[0], line, records, aliases)
+    record = _record_name_for(type_name, records, aliases)
+    for part in parts[1:-1]:
+        if record is None:
+            return None
+        fields = dict(records[record].fields)
+        if part not in fields:
+            return None
+        record = _record_name_for(fields[part], records, aliases)
+    return record
+
+
+def _member_offset(text: str, node, part_index: int):
+    line0 = max(0, int(getattr(node, "line", 1)) - 1)
+    rows = (text or "").split("\n")
+    if line0 >= len(rows):
+        return None
+    row = rows[line0]
+    base = max(0, int(getattr(node, "col", 1)) - 1)
+    offsets = [match.start() for match in WORD_RE.finditer(row, base)]
+    if part_index < len(offsets):
+        return offsets[part_index]
+    return None
+
+
+def _field_reference_spans(text: str, owner: str, field: str):
+    records = _record_decls(text)
+    if owner not in records:
+        return []
+    aliases = _alias_map(text)
+    found = set()
+    span = _record_field_spans(text, records[owner]).get(field)
+    if span is not None:
+        found.add(_linecol_at(text, span))
+    program = _parse_or_none(text)
+    if program is None:
+        return sorted(found)
+    for node in _walk(program):
+        name = getattr(node, "name", None)
+        if isinstance(node, (G.Var, G.Call)) and isinstance(name, str) \
+                and "." in name:
+            parts = [part for part in name.split(".") if part]
+            resolved = _resolve_record_chain(
+                text, parts, max(0, int(node.line) - 1), records, aliases)
+            if resolved == owner and parts and parts[-1] == field:
+                off = _member_offset(text, node, len(parts) - 1)
+                if off is not None:
+                    found.add((max(0, int(node.line) - 1), off))
+        elif isinstance(node, G.RecordLit) and node.name == owner:
+            for key, off in _record_lit_key_spans(text, node):
+                if key == field:
+                    found.add(_linecol_at(text, off))
+    return sorted(found)
+
+
+def _variant_reference_spans(text: str, owner: str, variant: str):
+    masked = _masked_text(text)
+    out = set()
+    decls = _enum_decls(text)
+    if owner in decls:
+        for name, off in _enum_variant_spans(text, decls[owner]):
+            if name == variant:
+                out.add(_linecol_at(text, off))
+    pattern = re.compile(
+        r"\b%s\s*\.\s*%s\b" % (re.escape(owner), re.escape(variant)))
+    for match in pattern.finditer(masked):
+        sub = re.search(r"\b%s\b" % re.escape(variant), match.group(0))
+        if sub is not None:
+            out.add(_linecol_at(text, match.start() + sub.start()))
+    return sorted(out)
+
+
+def _symbol_at(uri: str, text: str, line: int, character: int):
+    """Resolve the record/enum symbol under the cursor, or None."""
+    aliases = _alias_map(text)
+    found = _dotted_member_at(text, line, character)
+    if found is not None:
+        parts, member = found
+        context = _context_text(text, line, character)
+        records = _record_decls(context)
+        enums = _enum_decls(context)
+        if len(parts) == 1 and parts[0] in aliases:
+            imp = aliases[parts[0]]
+            node = _module_record(uri, imp.get("path"), member)
+            if node is not None:
+                target = _resolve_module(uri, imp.get("path") or "")
+                return {"kind": "record_external", "name": member,
+                        "decl": node, "path": target, "import": imp}
+            return None
+        if len(parts) == 1 and parts[0] in enums:
+            enum = enums[parts[0]]
+            if member in {entry[0] for entry in enum.variants}:
+                return {"kind": "variant", "name": member,
+                        "owner": parts[0], "decl": enum}
+            return None
+        record = _resolve_record_chain(
+            context, parts + [member], line, records, aliases)
+        if record is not None and member in dict(records[record].fields):
+            return {"kind": "field", "name": member,
+                    "owner": record, "decl": records[record]}
+        return None
+
+    span = _word_span_at(text, line, character)
+    if span is None:
+        return None
+    idx, name = span
+
+    member = _namespaced_member(text, line, character)
+    if member is not None:
+        alias, member_name = member
+        imp = aliases.get(alias)
+        if imp is not None:
+            node = _module_record(uri, imp.get("path"), member_name)
+            if node is not None:
+                target = _resolve_module(uri, imp.get("path") or "")
+                return {"kind": "record_external", "name": member_name,
+                        "decl": node, "path": target, "import": imp}
+            return None
+
+    records = _record_decls(text)
+    enums = _enum_decls(text)
+    if name in records:
+        return {"kind": "record", "name": name, "decl": records[name]}
+    if name in enums:
+        return {"kind": "enum", "name": name, "decl": enums[name]}
+
+    for owner, decl in records.items():
+        for field, off in _record_field_spans(text, decl).items():
+            if _linecol_at(text, off) == (line, idx) and field == name:
+                return {"kind": "field", "name": name,
+                        "owner": owner, "decl": decl}
+    for owner, decl in enums.items():
+        for variant, off in _enum_variant_spans(text, decl):
+            if _linecol_at(text, off) == (line, idx) and variant == name:
+                return {"kind": "variant", "name": name,
+                        "owner": owner, "decl": decl}
+
+    program = _parse_or_none(text)
+    if program is not None:
+        for node in _walk(program):
+            if isinstance(node, G.RecordLit) and node.name in records:
+                for key, off in _record_lit_key_spans(text, node):
+                    if _linecol_at(text, off) == (line, idx) and key == name:
+                        return {"kind": "field", "name": name,
+                                "owner": node.name,
+                                "decl": records[node.name]}
+    return None
+
+
+def _module_record(uri: str, path, name: str):
+    if not path:
+        return None
+    for node in _module_declarations(uri, path) or []:
+        if isinstance(node, G.RecordDecl) and node.name == name:
+            return node
+    return None
+
+
+def _location(uri: str, text: str, line0: int, idx: int, width: int):
+    rows = (text or "").split("\n")
+    if line0 < 0 or line0 >= len(rows) or idx < 0:
+        return None
+    col = _utf16_pos(rows[line0], idx)
+    return {"uri": uri, "range": {
+        "start": {"line": line0, "character": col},
+        "end": {"line": line0, "character": col + utf16_len(width * "x")},
+    }}
+
+
+def _structural_definition(uri: str, text: str, line: int, character: int):
+    sym = _symbol_at(uri, text, line, character)
+    if sym is None:
+        return None
+    kind = sym["kind"]
+    if kind == "record_external":
+        target = sym.get("path")
+        if target is None:
+            return None
+        try:
+            target_text = target.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        span = _decl_name_span(target_text, sym["decl"], "record",
+                               sym["name"])
+        if span is None:
+            return None
+        return _location(target.as_uri(), target_text, span[0], span[1],
+                         len(sym["name"]))
+    if kind == "record":
+        span = _decl_name_span(text, sym["decl"], "record", sym["name"])
+    elif kind == "enum":
+        span = _decl_name_span(text, sym["decl"], "enum", sym["name"])
+    elif kind == "field":
+        off = _record_field_spans(text, sym["decl"]).get(sym["name"])
+        span = _linecol_at(text, off) if off is not None else None
+    elif kind == "variant":
+        span = None
+        for name, off in _enum_variant_spans(text, sym["decl"]):
+            if name == sym["name"]:
+                span = _linecol_at(text, off)
+                break
+    else:
+        return None
+    if span is None:
+        return None
+    return _location(uri, text, span[0], span[1], len(sym["name"]))
+
+
+def _structural_references(uri: str, text: str, line: int, character: int):
+    sym = _symbol_at(uri, text, line, character)
+    if sym is None:
+        return None
+    kind = sym["kind"]
+    if kind == "record_external":
+        return []
+    if kind in ("record", "enum"):
+        spans = _type_reference_spans(text, sym["name"])
+    elif kind == "field":
+        spans = _field_reference_spans(text, sym["owner"], sym["name"])
+    elif kind == "variant":
+        spans = _variant_reference_spans(text, sym["owner"], sym["name"])
+    else:
+        return None
+    out = []
+    for line0, idx in spans:
+        loc = _location(uri, text, line0, idx, len(sym["name"]))
+        if loc is not None:
+            out.append(loc)
+    return out
+
+
+def _structural_rename(uri: str, text: str, line: int, character: int,
+                       new_name: str):
+    if not ALIAS_RE.match(new_name or "") or new_name in G.KEYWORDS:
+        return None
+    sym = _symbol_at(uri, text, line, character)
+    if sym is None or sym["kind"] == "record_external":
+        return None
+    kind = sym["kind"]
+    records = _record_decls(text)
+    enums = _enum_decls(text)
+    if kind in ("record", "enum"):
+        taken = set(records) | set(enums) | set(doc_names(text))
+        if new_name in taken or new_name in TYPE_HOVERS \
+                or new_name in G.BUILTINS:
+            return None
+        spans = _type_reference_spans(text, sym["name"])
+    elif kind == "field":
+        declared = {name for name, _type in records[sym["owner"]].fields}
+        if new_name in declared:
+            return None
+        spans = _field_reference_spans(text, sym["owner"], sym["name"])
+    elif kind == "variant":
+        declared = {entry[0] for entry in enums[sym["owner"]].variants}
+        if new_name in declared:
+            return None
+        spans = _variant_reference_spans(text, sym["owner"], sym["name"])
+    else:
+        return None
+    if not spans:
+        return None
+    width = len(sym["name"])
+    edits = []
+    for line0, idx in spans:
+        loc = _location(uri, text, line0, idx, width)
+        if loc is None:
+            continue
+        edits.append({"range": loc["range"], "newText": new_name})
+    if not edits:
+        return None
+    return {"changes": {uri: edits}}
+
+
+def prepare_rename(uri: str, text: str, line: int, character: int):
+    """Range and placeholder for a safe record/enum symbol rename, or None."""
+    sym = _symbol_at(uri, text, line, character)
+    if sym is None or sym["kind"] == "record_external":
+        return None
+    span = _word_span_at(text, line, character)
+    if span is None:
+        return None
+    idx, name = span
+    loc = _location(uri, text, line, idx, len(name))
+    if loc is None:
+        return None
+    return {"range": loc["range"], "placeholder": sym["name"]}
+
+
 def definition(uri: str, text: str, line: int, character: int):
+    structural = _structural_definition(uri, text, line, character)
+    if structural is not None:
+        return structural
+    if _dotted_member_at(text, line, character) is not None \
+            or _namespaced_member(text, line, character) is not None:
+        return None
     name = word_at(text, line, character)
     if not name:
         return None
@@ -1192,6 +1740,12 @@ def definition(uri: str, text: str, line: int, character: int):
 
 
 def references(uri: str, text: str, line: int, character: int):
+    structural = _structural_references(uri, text, line, character)
+    if structural is not None:
+        return structural
+    if _dotted_member_at(text, line, character) is not None \
+            or _namespaced_member(text, line, character) is not None:
+        return []
     name = word_at(text, line, character)
     if not name:
         return []
@@ -1309,6 +1863,13 @@ def formatting(uri: str, text: str):
 
 def rename(uri: str, text: str, line: int, character: int, new_name: str):
     """Rename a let/fn declaration and all Var/Call references to it."""
+    structural = _structural_rename(uri, text, line, character, new_name)
+    if structural is not None:
+        return structural
+    if _symbol_at(uri, text, line, character) is not None \
+            or _dotted_member_at(text, line, character) is not None \
+            or _namespaced_member(text, line, character) is not None:
+        return None
     if not RENAME_RE.match(new_name or ""):
         return None
     name = word_at(text, line, character)
@@ -1745,7 +2306,7 @@ def main():
                     },
                     "definitionProvider": True,
                     "referencesProvider": True,
-                    "renameProvider": True,
+                    "renameProvider": {"prepareProvider": True},
                     "documentFormattingProvider": True,
                     "documentSymbolProvider": True,
                     "codeActionProvider": {"codeActionKinds": ["quickfix"]},
@@ -1824,6 +2385,15 @@ def main():
             text = docs.get(uri, td.get("text") or "")
             send({"jsonrpc": "2.0", "id": mid,
                   "result": formatting(uri, text)})
+        elif method == "textDocument/prepareRename":
+            td = _obj(params.get("textDocument"))
+            uri = td.get("uri") or ""
+            text = docs.get(uri, td.get("text") or "")
+            pos = _obj(params.get("position"))
+            line = int(pos.get("line") or 0)
+            ch = int(pos.get("character") or 0)
+            send({"jsonrpc": "2.0", "id": mid,
+                  "result": prepare_rename(uri, text, line, ch)})
         elif method == "textDocument/rename":
             td = _obj(params.get("textDocument"))
             uri = td.get("uri") or ""
