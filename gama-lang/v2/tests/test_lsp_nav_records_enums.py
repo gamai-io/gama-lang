@@ -2,8 +2,9 @@
 
 Covers record type names, record field accesses, enum type names, enum
 variants, precise rename edits, prepareRename rejection on unsupported or
-ambiguous positions, namespaced record definition, and malformed documents
-staying quiet instead of crashing.
+ambiguous positions, cross-file navigation for aliased imported records and
+enums, bare variant match/constructor renames, missing modules, and malformed
+documents staying quiet instead of crashing.
 """
 import pathlib
 import sys
@@ -73,6 +74,13 @@ class LspRecordEnumNavigationTests(unittest.TestCase):
 
     def spans(self, locations):
         return sorted((loc["range"]["start"]["line"],
+                       loc["range"]["start"]["character"],
+                       loc["range"]["end"]["character"])
+                      for loc in locations)
+
+    def spans_uri(self, locations):
+        return sorted((loc["uri"],
+                       loc["range"]["start"]["line"],
                        loc["range"]["start"]["character"],
                        loc["range"]["end"]["character"])
                       for loc in locations)
@@ -198,25 +206,146 @@ class LspRecordEnumNavigationTests(unittest.TestCase):
             self.assertIsNone(self.prepare(0, 8))
             self.assertIsNone(self.rename(0, 8, "Renamed"))
 
-    def test_namespaced_record_definition_and_document_limitation(self):
+    def test_namespaced_record_and_enum_cross_file_navigation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             module = root / "geo.gm"
-            module.write_text("record Point { x: Int, y: Int }\n",
-                              encoding="utf-8")
+            module_text = (
+                "record Point { x: Int, y: Int }\n"
+                "enum Color { Red, Green }\n")
+            module.write_text(module_text, encoding="utf-8")
             main = root / "main.gm"
-            doc = 'import "geo.gm" as geo\nprint geo.Point\n'
+            doc = ('import "geo.gm" as geo\n'
+                   'let p: geo.Point = geo.Point(1, 2)\n'
+                   'let c: geo.Color = geo.Color.Red\n')
+            main.write_text(doc, encoding="utf-8")
             self.open(doc, uri=main.as_uri())
+            lines = doc.split("\n")
 
-            loc = self.definition(1, doc.split("\n")[1].index("Point"))
+            # imported record definition, references and rename
+            point_positions = [
+                idx for idx in range(len(lines[1]))
+                if lines[1].startswith("Point", idx)]
+            self.assertEqual(len(point_positions), 2)
+            loc = self.definition(1, point_positions[0])
             self.assertEqual(loc["uri"], module.as_uri())
             self.assertEqual(loc["range"]["start"],
                              {"line": 0, "character": 7})
+            refs = self.references(1, point_positions[0])
+            self.assertEqual(self.spans_uri(refs), sorted([
+                (main.as_uri(), 1, point_positions[0], point_positions[0] + 5),
+                (main.as_uri(), 1, point_positions[1], point_positions[1] + 5),
+                (module.as_uri(), 0, 7, 12),
+            ]))
+            self.assertEqual(self.prepare(1, point_positions[0])["placeholder"],
+                             "Point")
+            renamed = self.rename(1, point_positions[0], "Point2")
+            self.assertEqual(sorted(renamed["changes"]),
+                             sorted([main.as_uri(), module.as_uri()]))
+            self.assertEqual(
+                self.spans_uri([{"uri": uri, "range": edit["range"]}
+                                for uri, edits in renamed["changes"].items()
+                                for edit in edits]),
+                sorted([(main.as_uri(), 1, point_positions[0], point_positions[0] + 5),
+                        (main.as_uri(), 1, point_positions[1], point_positions[1] + 5),
+                        (module.as_uri(), 0, 7, 12)]))
 
-            # Cross-file references/rename are intentionally not advertised.
-            self.assertEqual(self.references(1, 11), [])
-            self.assertIsNone(self.prepare(1, 11))
-            self.assertIsNone(self.rename(1, 11, "Point2"))
+            # imported enum definition, references and rename
+            color_positions = [
+                idx for idx in range(len(lines[2]))
+                if lines[2].startswith("Color", idx)]
+            self.assertEqual(len(color_positions), 2)
+            loc = self.definition(2, color_positions[0])
+            self.assertEqual(loc["uri"], module.as_uri())
+            self.assertEqual(loc["range"]["start"],
+                             {"line": 1, "character": 5})
+            refs = self.references(2, color_positions[0])
+            self.assertEqual(self.spans_uri(refs), sorted([
+                (main.as_uri(), 2, color_positions[0], color_positions[0] + 5),
+                (main.as_uri(), 2, color_positions[1], color_positions[1] + 5),
+                (module.as_uri(), 1, 5, 10),
+            ]))
+            renamed = self.rename(2, color_positions[0], "Palette")
+            self.assertEqual(sorted(renamed["changes"]),
+                             sorted([main.as_uri(), module.as_uri()]))
+            self.assertTrue(all(edit["newText"] == "Palette"
+                                for edits in renamed["changes"].values()
+                                for edit in edits))
+
+            # A collision with another declaration in the module is refused.
+            self.assertIsNone(self.rename(1, point_positions[0], "Color"))
+
+            # Starting from the declaration also reaches importing siblings.
+            self.open(module_text, uri=module.as_uri())
+            refs = self.references(0, module_text.split("\n")[0].index("Point"))
+            self.assertEqual(self.spans_uri(refs), sorted([
+                (main.as_uri(), 1, point_positions[0], point_positions[0] + 5),
+                (main.as_uri(), 1, point_positions[1], point_positions[1] + 5),
+                (module.as_uri(), 0, 7, 12),
+            ]))
+
+    def test_bare_enum_variant_uses(self):
+        doc = (
+            "enum Color { Red(Int), Green }\n"          # 0
+            "let c: Color = Color.Green\n"              # 1
+            "match c { Red(v) { print v } Green { print 2 } }\n"  # 2
+            "let d: Color = Red(3)\n"                   # 3
+        )
+        self.open(doc)
+        lines = doc.split("\n")
+        arm = lines[2].index("Red")
+        ctor = lines[3].index("Red")
+
+        prepared = self.prepare(2, arm)
+        self.assertEqual(prepared["placeholder"], "Red")
+        self.assertEqual(prepared["range"]["start"],
+                         {"line": 2, "character": arm})
+        self.assertEqual(self.definition(2, arm)["range"]["start"],
+                         {"line": 0, "character": 13})
+        self.assertEqual(self.definition(3, ctor)["range"]["start"],
+                         {"line": 0, "character": 13})
+
+        refs = self.references(0, lines[0].index("Red"))
+        self.assertEqual(self.spans(refs), [
+            (0, 13, 16), (2, arm, arm + 3), (3, ctor, ctor + 3)])
+
+        renamed = self.rename(3, ctor, "Crimson")
+        self.assertEqual(self.spans(renamed["changes"][URI]), [
+            (0, 13, 16), (2, arm, arm + 3), (3, ctor, ctor + 3)])
+        self.assertTrue(all(edit["newText"] == "Crimson"
+                            for edit in renamed["changes"][URI]))
+
+        # Renaming the declaration also updates the bare uses.
+        renamed = self.rename(0, lines[0].index("Red"), "Crimson")
+        self.assertEqual(self.spans(renamed["changes"][URI]), [
+            (0, 13, 16), (2, arm, arm + 3), (3, ctor, ctor + 3)])
+
+    def test_ambiguous_bare_variant_is_refused(self):
+        doc = (
+            "enum A { Red(Int) }\n"
+            "enum B { Red(Text) }\n"
+            "let c = 1\n"
+            "match c { Red(v) { print v } }\n"
+        )
+        self.open(doc)
+        arm = doc.split("\n")[3].index("Red")
+        self.assertIsNone(self.prepare(3, arm))
+        self.assertIsNone(self.rename(3, arm, "Crimson"))
+        self.assertIsNone(self.definition(3, arm))
+
+    def test_missing_module_does_not_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            main = pathlib.Path(tmp) / "main.gm"
+            doc = ('import "missing.gm" as geo\n'
+                   'print geo.Point\n'
+                   'print geo.Color\n')
+            self.open(doc, uri=main.as_uri())
+            for line in (1, 2):
+                idx = doc.split("\n")[line].index("geo.") + 4
+                self.assertIsNone(self.definition(line, idx))
+                self.assertEqual(self.references(line, idx), [])
+                self.assertIsNone(self.prepare(line, idx))
+                self.assertIsNone(self.rename(line, idx, "Renamed"))
 
 
 if __name__ == "__main__":

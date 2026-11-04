@@ -530,14 +530,16 @@ def _resolve_module(uri: str, path: str):
 
 
 def _module_declarations(uri: str, path: str):
-    """Exported ``fn``/``let``/``record`` declarations of an aliased module.
+    """Exported ``fn``/``let``/``record``/``enum`` declarations of a module.
 
     Mirrors the core alias-import rules: the module (including plain imports
-    it inlines) may only contain ``fn``/``let``/``record`` declarations, plain
-    imports and ``use`` at the top level. Malformed, missing or side-effect
-    modules are treated as unavailable so completion and hover stay quiet
-    instead of advertising members the runtime would reject. ``None`` means
-    unavailable, while an empty list means nothing exportable.
+    it inlines) may only contain declarations, plain imports and ``use`` at
+    the top level. Enums are accepted as an LSP navigation extension even
+    though core alias imports still reject their evaluation. Malformed,
+    missing or side-effect modules are treated as unavailable so completion
+    and hover stay quiet instead of advertising members the runtime would
+    reject. ``None`` means unavailable, while an empty list means nothing
+    exportable.
     """
     target = _resolve_module(uri, path)
     root = _doc_root(uri)
@@ -549,14 +551,15 @@ def _module_declarations(uri: str, path: str):
             stmts = flat_fn(target, root)
         else:  # pragma: no cover - older cores without namespace flattening
             stmts = G.parse(target.read_text(encoding="utf-8"))
-        allowed = getattr(G, "_ALIAS_ALLOWED_TOPLEVEL",
-                          (G.Fn, G.Let, G.Import, G.Use))
+        allowed = tuple(getattr(G, "_ALIAS_ALLOWED_TOPLEVEL",
+                               (G.Fn, G.Let, G.Import, G.Use))) + (
+                                   G.EnumDecl,)
         if not all(isinstance(st, allowed) for st in stmts):
             return None
     except Exception:
         return None
     return [st for st in stmts
-            if isinstance(st, (G.Fn, G.Let, G.RecordDecl))]
+            if isinstance(st, (G.Fn, G.Let, G.RecordDecl, G.EnumDecl))]
 
 
 def _module_functions(uri: str, path: str):
@@ -1315,6 +1318,77 @@ def _enum_variant_spans(text: str, decl):
     return _top_level_tokens(text, start, end)
 
 
+def _enum_variant_owners(enums, variant: str):
+    """Local enum names declaring ``variant``."""
+    owners = []
+    for owner, decl in enums.items():
+        if any(entry[0] == variant for entry in decl.variants):
+            owners.append(owner)
+    return owners
+
+
+def _adjacent_dot(text: str, offset: int, width: int) -> bool:
+    """True when the token at ``offset`` is part of a dotted name."""
+    n = len(text or "")
+    i = offset + width
+    while i < n and text[i] in " \t":
+        i += 1
+    if i < n and text[i] == ".":
+        return True
+    j = offset - 1
+    while j >= 0 and text[j] in " \t":
+        j -= 1
+    return j >= 0 and text[j] == "."
+
+
+def _bare_variant_offsets(text: str, variant: str):
+    """Offsets of bare variant uses in match patterns and constructors."""
+    program = _parse_or_none(text)
+    if program is None:
+        return []
+    shadowed = set()
+    for node in _walk(program):
+        if isinstance(node, (G.Fn, G.Let, G.Assign, G.Param,
+                             G.RecordDecl, G.EnumDecl)):
+            name = getattr(node, "name", None)
+            if name:
+                shadowed.add(name)
+    call_ok = variant not in shadowed and variant not in G.BUILTINS
+    out = set()
+    for node in _walk(program):
+        if isinstance(node, G.Match):
+            body = _brace_body_range(text, _node_offset(text, node))
+            if body is not None:
+                for word, off in _top_level_tokens(text, body[0], body[1]):
+                    if word != variant:
+                        continue
+                    if _adjacent_dot(text, off, len(word)):
+                        continue
+                    out.add(off)
+        elif isinstance(node, G.Call) and node.name == variant and call_ok:
+            off = _node_offset(text, node)
+            if off >= 0:
+                out.add(off)
+    return sorted(out)
+
+
+def _bare_variant_at(text: str, line: int, character: int, enums):
+    """Unambiguous bare enum variant under the cursor, or None."""
+    span = _word_span_at(text, line, character)
+    if span is None:
+        return None
+    idx, name = span
+    owners = _enum_variant_owners(enums, name)
+    if len(owners) != 1:
+        return None
+    if not any(_linecol_at(text, off) == (line, idx)
+               for off in _bare_variant_offsets(text, name)):
+        return None
+    owner = owners[0]
+    return {"kind": "variant", "name": name, "owner": owner,
+            "decl": enums[owner]}
+
+
 def _node_offset(text: str, node) -> int:
     line0 = max(0, int(getattr(node, "line", 1)) - 1)
     col0 = max(0, int(getattr(node, "col", 1)) - 1)
@@ -1502,6 +1576,11 @@ def _variant_reference_spans(text: str, owner: str, variant: str):
         sub = re.search(r"\b%s\b" % re.escape(variant), match.group(0))
         if sub is not None:
             out.add(_linecol_at(text, match.start() + sub.start()))
+    # Bare variant uses are only safe to include when this variant has a
+    # single local owner; otherwise the bare form is inherently ambiguous.
+    if _enum_variant_owners(decls, variant) == [owner]:
+        for off in _bare_variant_offsets(text, variant):
+            out.add(_linecol_at(text, off))
     return sorted(out)
 
 
@@ -1521,6 +1600,11 @@ def _symbol_at(uri: str, text: str, line: int, character: int):
                 target = _resolve_module(uri, imp.get("path") or "")
                 return {"kind": "record_external", "name": member,
                         "decl": node, "path": target, "import": imp}
+            enum = _module_enum(uri, imp.get("path"), member)
+            if enum is not None:
+                target = _resolve_module(uri, imp.get("path") or "")
+                return {"kind": "enum_external", "name": member,
+                        "decl": enum, "path": target, "import": imp}
             return None
         if len(parts) == 1 and parts[0] in enums:
             enum = enums[parts[0]]
@@ -1550,6 +1634,11 @@ def _symbol_at(uri: str, text: str, line: int, character: int):
                 target = _resolve_module(uri, imp.get("path") or "")
                 return {"kind": "record_external", "name": member_name,
                         "decl": node, "path": target, "import": imp}
+            enum = _module_enum(uri, imp.get("path"), member_name)
+            if enum is not None:
+                target = _resolve_module(uri, imp.get("path") or "")
+                return {"kind": "enum_external", "name": member_name,
+                        "decl": enum, "path": target, "import": imp}
             return None
 
     records = _record_decls(text)
@@ -1569,6 +1658,10 @@ def _symbol_at(uri: str, text: str, line: int, character: int):
             if _linecol_at(text, off) == (line, idx) and variant == name:
                 return {"kind": "variant", "name": name,
                         "owner": owner, "decl": decl}
+
+    bare = _bare_variant_at(text, line, character, enums)
+    if bare is not None:
+        return bare
 
     program = _parse_or_none(text)
     if program is not None:
@@ -1591,6 +1684,155 @@ def _module_record(uri: str, path, name: str):
     return None
 
 
+def _module_enum(uri: str, path, name: str):
+    if not path:
+        return None
+    for node in _module_declarations(uri, path) or []:
+        if isinstance(node, G.EnumDecl) and node.name == name:
+            return node
+    return None
+
+
+_RELATED_MAX_FILES = 200
+
+
+def _related_documents(uri: str, text: str):
+    """Current document plus every file reachable through its imports.
+
+    Returns ``{resolved_path: (text, uri)}``. Only files that resolve through
+    the same confined module loader as the core are included, and the
+    in-memory document text always wins over what is on disk.
+    """
+    docs = {}
+    root = _doc_root(uri)
+    if root is None:
+        return docs
+    current = uri_path(uri)
+    if current:
+        try:
+            docs[Path(current).resolve()] = (text or "", uri)
+        except (OSError, ValueError):
+            pass
+    queue = [(uri, text or "")]
+    seen_uris = {uri}
+    while queue and len(docs) < _RELATED_MAX_FILES:
+        file_uri, body = queue.pop(0)
+        for imp in _imports(body):
+            target = _resolve_module(file_uri, imp.get("path") or "")
+            if target is None:
+                continue
+            try:
+                key = target.resolve()
+                target_uri = key.as_uri()
+            except (OSError, ValueError):
+                continue
+            if key in docs or target_uri in seen_uris:
+                continue
+            try:
+                if key.stat().st_size > 4 * 1024 * 1024:
+                    continue
+                target_text = key.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                continue
+            docs[key] = (target_text, target_uri)
+            seen_uris.add(target_uri)
+            queue.append((target_uri, target_text))
+    # Direct siblings let navigation started on a declaration find importing
+    # documents in the same document root. Deeper trees are not walked.
+    try:
+        siblings = sorted(root.glob("*.gm"))
+    except (OSError, ValueError):
+        siblings = []
+    for candidate in siblings:
+        if len(docs) >= _RELATED_MAX_FILES:
+            break
+        try:
+            key = candidate.resolve()
+            sibling_uri = key.as_uri()
+        except (OSError, ValueError):
+            continue
+        if key in docs or sibling_uri in seen_uris:
+            continue
+        try:
+            if not key.is_file() or key.stat().st_size > 4 * 1024 * 1024:
+                continue
+            body = key.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        docs[key] = (body, sibling_uri)
+        seen_uris.add(sibling_uri)
+    return docs
+
+
+def _aliases_for_target(body: str, file_uri: str, target):
+    """Aliases in ``body`` whose import resolves to ``target``."""
+    out = []
+    for imp in _imports(body):
+        alias = imp.get("alias")
+        if not alias:
+            continue
+        resolved = _resolve_module(file_uri, imp.get("path") or "")
+        if resolved is None:
+            continue
+        try:
+            if resolved.resolve() != target:
+                continue
+        except (OSError, ValueError):
+            continue
+        if alias not in out:
+            out.append(alias)
+    return out
+
+
+def _qualified_symbol_spans(text: str, alias: str, name: str):
+    """Source offsets of the ``name`` part of ``alias.name`` references."""
+    masked = _masked_text(text)
+    pattern = re.compile(
+        r"\b%s\s*\.\s*%s\b" % (re.escape(alias), re.escape(name)))
+    out = set()
+    for match in pattern.finditer(masked):
+        sub = re.search(r"\b%s\b" % re.escape(name), match.group(0))
+        if sub is not None:
+            out.add(_linecol_at(text, match.start() + sub.start()))
+    return sorted(out)
+
+
+def _type_locations_across_files(uri: str, text: str, target, name: str):
+    """``[(uri, text, line0, idx)]`` for a record/enum across related files."""
+    docs = _related_documents(uri, text)
+    if target not in docs:
+        try:
+            body = target.read_text(encoding="utf-8")
+            docs[target] = (body, target.as_uri())
+        except (OSError, UnicodeError):
+            return []
+    out = []
+    seen = set()
+    for path, (body, file_uri) in docs.items():
+        if path == target:
+            spans = _type_reference_spans(body, name)
+        else:
+            spans = []
+            for alias in _aliases_for_target(body, file_uri, target):
+                spans.extend(_qualified_symbol_spans(body, alias, name))
+        for line0, idx in spans:
+            key = (file_uri, line0, idx)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((file_uri, body, line0, idx))
+    return out
+
+
+def _declared_names_in_text(text: str):
+    """Top-level declaration names in a module, best effort."""
+    names = set(_record_decls(text)) | set(_enum_decls(text))
+    for node in _declarations(text):
+        if getattr(node, "name", None):
+            names.add(node.name)
+    return names
+
+
 def _location(uri: str, text: str, line0: int, idx: int, width: int):
     rows = (text or "").split("\n")
     if line0 < 0 or line0 >= len(rows) or idx < 0:
@@ -1607,7 +1849,7 @@ def _structural_definition(uri: str, text: str, line: int, character: int):
     if sym is None:
         return None
     kind = sym["kind"]
-    if kind == "record_external":
+    if kind in ("record_external", "enum_external"):
         target = sym.get("path")
         if target is None:
             return None
@@ -1615,7 +1857,8 @@ def _structural_definition(uri: str, text: str, line: int, character: int):
             target_text = target.read_text(encoding="utf-8")
         except OSError:
             return None
-        span = _decl_name_span(target_text, sym["decl"], "record",
+        keyword = "record" if kind == "record_external" else "enum"
+        span = _decl_name_span(target_text, sym["decl"], keyword,
                                sym["name"])
         if span is None:
             return None
@@ -1646,11 +1889,25 @@ def _structural_references(uri: str, text: str, line: int, character: int):
     if sym is None:
         return None
     kind = sym["kind"]
-    if kind == "record_external":
-        return []
-    if kind in ("record", "enum"):
-        spans = _type_reference_spans(text, sym["name"])
-    elif kind == "field":
+    if kind in ("record", "enum", "record_external", "enum_external"):
+        if kind in ("record_external", "enum_external"):
+            target = sym.get("path")
+            if target is None:
+                return []
+        else:
+            current = uri_path(uri)
+            if not current:
+                return []
+            target = Path(current).resolve()
+        locations = _type_locations_across_files(
+            uri, text, target, sym["name"])
+        out = []
+        for file_uri, body, line0, idx in locations:
+            loc = _location(file_uri, body, line0, idx, len(sym["name"]))
+            if loc is not None:
+                out.append(loc)
+        return out
+    if kind == "field":
         spans = _field_reference_spans(text, sym["owner"], sym["name"])
     elif kind == "variant":
         spans = _variant_reference_spans(text, sym["owner"], sym["name"])
@@ -1669,18 +1926,45 @@ def _structural_rename(uri: str, text: str, line: int, character: int,
     if not ALIAS_RE.match(new_name or "") or new_name in G.KEYWORDS:
         return None
     sym = _symbol_at(uri, text, line, character)
-    if sym is None or sym["kind"] == "record_external":
+    if sym is None:
         return None
     kind = sym["kind"]
     records = _record_decls(text)
     enums = _enum_decls(text)
-    if kind in ("record", "enum"):
-        taken = set(records) | set(enums) | set(doc_names(text))
+    if kind in ("record", "enum", "record_external", "enum_external"):
+        if kind in ("record_external", "enum_external"):
+            target = sym.get("path")
+            if target is None:
+                return None
+            try:
+                target_text = target.read_text(encoding="utf-8")
+            except OSError:
+                return None
+            taken = _declared_names_in_text(target_text)
+        else:
+            current = uri_path(uri)
+            if not current:
+                return None
+            target = Path(current).resolve()
+            taken = set(records) | set(enums) | set(doc_names(text))
         if new_name in taken or new_name in TYPE_HOVERS \
                 or new_name in G.BUILTINS:
             return None
-        spans = _type_reference_spans(text, sym["name"])
-    elif kind == "field":
+        locations = _type_locations_across_files(
+            uri, text, target, sym["name"])
+        if not locations:
+            return None
+        changes = {}
+        for file_uri, body, line0, idx in locations:
+            loc = _location(file_uri, body, line0, idx, len(sym["name"]))
+            if loc is None:
+                continue
+            changes.setdefault(file_uri, []).append(
+                {"range": loc["range"], "newText": new_name})
+        if not changes:
+            return None
+        return {"changes": changes}
+    if kind == "field":
         declared = {name for name, _type in records[sym["owner"]].fields}
         if new_name in declared:
             return None
@@ -1709,7 +1993,7 @@ def _structural_rename(uri: str, text: str, line: int, character: int,
 def prepare_rename(uri: str, text: str, line: int, character: int):
     """Range and placeholder for a safe record/enum symbol rename, or None."""
     sym = _symbol_at(uri, text, line, character)
-    if sym is None or sym["kind"] == "record_external":
+    if sym is None:
         return None
     span = _word_span_at(text, line, character)
     if span is None:
