@@ -1239,6 +1239,7 @@ class Interpreter:
         self.last_ask = None
         self.call_depth = 0
         self.out_chars = 0
+        self.steps = 0
         self.proof_ledger_path = (os.environ.get("GAMA_L_PROOF_LEDGER") or "").strip() or None
         if self.proof_ledger_path:
             self._load_proof_ledger()
@@ -1307,6 +1308,27 @@ class Interpreter:
             return int(raw)
         except ValueError:
             return default
+    @staticmethod
+    def _env_optional_int(name):
+        """Return int from env, or None when unset/blank/malformed/negative."""
+        raw = os.environ.get(name)
+        if raw is None or not raw.strip():
+            return None
+        try:
+            val = int(raw)
+        except ValueError:
+            return None
+        return val if val >= 0 else None
+    def _step_limit(self):
+        return self._env_optional_int("GAMA_L_MAX_STEPS")
+    def _tick(self, line=0, col=0):
+        """Count one executed statement or loop iteration and enforce the optional cap."""
+        self.steps += 1
+        limit = self._step_limit()
+        if limit is not None and self.steps > limit:
+            raise GamaRuntimeError(
+                f"step limit exceeded: {self.steps} > GAMA_L_MAX_STEPS={limit}",
+                line, col)
     def _emit(self, text):
         """Append one rendered output line, enforcing the output char cap."""
         text = str(text)
@@ -1324,6 +1346,7 @@ class Interpreter:
             raise GamaRuntimeError("? outside function") from None
         return self
     def stmt(self, s, env):
+        self._tick(s.line, s.col)
         if isinstance(s, Let): env.set(s.name, self.expr(s.expr, env))
         elif isinstance(s, Assign): env.assign(s.name, self.expr(s.expr, env))
         elif isinstance(s, Use): pass
@@ -1332,6 +1355,7 @@ class Interpreter:
             if isinstance(seq, str): seq = list(seq)
             if not isinstance(seq, (list, tuple)): raise GamaRuntimeError("for needs list/text", s.line, s.col)
             for item in seq:
+                self._tick(s.line, s.col)
                 local = Env(env); local.set(s.name, item)
                 try:
                     for x in s.body: self.stmt(x, local)
@@ -1341,6 +1365,7 @@ class Interpreter:
             n = 0
             while self.truth(self.expr(s.cond, env)):
                 n += 1
+                self._tick(s.line, s.col)
                 if n > int(os.environ.get("GAMA_L_LOOP_LIMIT", "1000000")):
                     raise GamaRuntimeError("loop limit exceeded", s.line, s.col)
                 try:
