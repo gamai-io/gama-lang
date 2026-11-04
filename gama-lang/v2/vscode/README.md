@@ -108,26 +108,58 @@ directory, or package it with `vsce` (not included here).
 - Keywords, including `match`, `make`, `use`, `wait`, `for`, `while`,
   `break`, and `continue`
 - Type names (`Int`, `Decimal`, `Text`, `Bool`, `List`, `Table`, `Result`,
-  `Json`, `Null`, `Any`)
+  `Json`, `Null`, `Any`, `Function`)
 - Result constructors `Ok` / `Err` and the match wildcard `_`
 - Builtin functions from the v2 core: `sql`, `ask`, `wait_user`, `remember`,
-  `recall`, `sql_write`, `mail`, `len`, `text`, `number`, `round`
+  `recall`, `sql_write`, `mail`, `len`, `text`, `number`, `round`, and the pure
+  helpers `unwrap`, `unwrap_or`, `is_ok`, `is_err`, `split`, `join`, `contains`,
+  `trim`, `upper`, `lower`, `replace`, `starts_with`, `ends_with`, `keys`,
+  `values`, `has`
 - The postfix Result propagation operator `?`
 - Pipe stages (`filter`, `select`, `sum`, `limit`, `count`, `map`)
 - Operators and punctuation
 - Function names after `fn` / `make`, bindings after `let`, and `prove` targets
+- Lambda expressions in expression position: `fn(x: Int) -> Int { ... }`
+  (keyword, typed parameters, arrow, return type)
+- The `Function` type in parameters and annotations
+- Function values: a lambda bound to `let` and calls through that name
+  (`let inc = fn(...)`, `f(41)`); the call name gets function-name scope
 - `wait user "..."` as a unit (keyword + `user`)
 
 The grammar is syntax-only and intentionally tracks only names that exist in
-the v2 core (`gamal2.py`). It does **not** highlight `unwrap`, `unwrap_or`,
-`split`, or `join`, because those are not part of the v2 core yet.
+the v2 core (`gamal2.py`). Result helpers (`unwrap`, `unwrap_or`, `is_ok`,
+`is_err`), text helpers (`split`, `join`, `contains`, `trim`, `upper`, `lower`,
+`replace`, `starts_with`, `ends_with`) and collection helpers (`keys`,
+`values`, `has`) are part of the v2 core, so they are highlighted.
+
+## Language-core limitations (kept truthful in the grammar)
+
+- **IIFE is not supported.** `(fn(x: Int) -> Int { ... })(41)` fails in
+  `gamal2.py` with `GamaError: expected end of statement`, because a call is
+  only parsed for a plain identifier followed by `(`. The grammar therefore
+  does not claim IIFE support. Pass the lambda as an argument to a `Function`
+  parameter, or bind it with `let` and call the binding.
+- **Named `fn` declarations are not first-class values.** After
+  `fn add(a: Int, b: Int) -> Int { ... }`, `let f = add` fails with
+  `GamaTypeError: unknown variable add`. Only a lambda is a function value:
+  `let add = fn(a: Int, b: Int) -> Int { ... }`, `let f = add`, `f(2, 3)`
+  works.
+- **`Function` is a valid parameter/annotation type.** Higher-order calls and
+  passing a lambda directly both work:
+  `fn apply(f: Function, x: Int) -> Int { return f(x) }`,
+  `apply(fn(x: Int) -> Int { return x + 1 }, 41)`, and
+  `let f: Function = fn(x: Int) -> Int { return x + 1 }`.
+- Lambda effects must be declared when the body calls an effectful builtin
+  (`effects { mail }`), matching named functions.
 
 ## Snippets
 
 Besides `fn`, `let`, `if`, `prove`, pipe, and `import`, the snippet set covers
-the Result flow (`fnres`, `match`, `try`, `ok`, `err`) and the core builtins
+the Result flow (`fnres`, `match`, `try`, `ok`, `err`), the core builtins
 (`ask`, `askwith`, `sql`, `sqlwrite`, `remember`, `wait`, `mail`, `round`,
-`len`, `text`, `number`).
+`len`, `text`, `number`), and functions/lambdas: `lambda`/`fnx` (anonymous
+expression), `fnlet` (lambda bound to `let`), `fntype`/`higher` (higher-order
+`Function` parameter), and `fnvalue` (lambda alias called through a new name).
 
 ## License
 

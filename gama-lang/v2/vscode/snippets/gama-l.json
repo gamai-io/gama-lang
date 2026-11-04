@@ -8,6 +8,48 @@
     ],
     "description": "Declare a typed function with an effects block."
   },
+  "Lambda expression": {
+    "prefix": [
+      "lambda",
+      "fnx"
+    ],
+    "body": [
+      "fn(${1:x}: ${2:Int}) -> ${3:Int} {",
+      "\t${4:return }${0}",
+      "}"
+    ],
+    "description": "Anonymous lambda in expression position (e.g. as an argument to a Function parameter)."
+  },
+  "Lambda bound to let": {
+    "prefix": "fnlet",
+    "body": [
+      "let ${1:f} = fn(${2:x}: ${3:Int}) -> ${4:Int} {",
+      "\treturn ${5:x + 1}",
+      "}"
+    ],
+    "description": "Bind a lambda to a name; call it as ${1:f}(...)."
+  },
+  "Function type parameter": {
+    "prefix": [
+      "fntype",
+      "higher"
+    ],
+    "body": [
+      "fn ${1:apply}(${2:f}: Function, ${3:x}: ${4:Int}) -> ${5:Int} {",
+      "\treturn ${2:f}(${3:x})",
+      "}"
+    ],
+    "description": "Higher-order function taking a Function value; pass a lambda or a lambda alias."
+  },
+  "Function value alias": {
+    "prefix": "fnvalue",
+    "body": [
+      "let ${1:add} = fn(${2:a}: ${3:Int}, ${4:b}: ${5:Int}) -> ${6:Int} { return ${2:a} + ${4:b} }",
+      "let ${7:f} = ${1:add}",
+      "print ${7:f}(2, 3)"
+    ],
+    "description": "Alias a lambda value and call it through the new name (supported; named fn declarations are not values)."
+  },
   "Let binding": {
     "prefix": "let",
     "body": [

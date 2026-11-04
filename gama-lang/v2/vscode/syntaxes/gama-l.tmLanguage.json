@@ -49,6 +49,52 @@
       }
     },
     {
+      "name": "meta.function.lambda.gama-l",
+      "begin": "\\b(fn)\\s*(\\()",
+      "beginCaptures": {
+        "1": {
+          "name": "keyword.control.fn.gama-l"
+        },
+        "2": {
+          "name": "punctuation.definition.parameters.begin.gama-l"
+        }
+      },
+      "end": "(\\))",
+      "endCaptures": {
+        "1": {
+          "name": "punctuation.definition.parameters.end.gama-l"
+        }
+      },
+      "patterns": [
+        {
+          "match": "([A-Za-z_][A-Za-z0-9_]*)\\s*(:)\\s*([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "variable.parameter.gama-l"
+            },
+            "2": {
+              "name": "punctuation.separator.gama-l"
+            },
+            "3": {
+              "name": "support.type.gama-l"
+            }
+          }
+        },
+        {
+          "name": "keyword.operator.assignment.gama-l",
+          "match": "="
+        },
+        {
+          "name": "constant.numeric.gama-l",
+          "match": "\\b\\d+(\\.\\d+)?\\b"
+        },
+        {
+          "name": "punctuation.separator.gama-l",
+          "match": ","
+        }
+      ]
+    },
+    {
       "match": "(\\bfn|\\bmake)\\s+([A-Za-z_][A-Za-z0-9_]*)",
       "captures": {
         "1": {
@@ -106,11 +152,11 @@
     },
     {
       "name": "support.type.gama-l",
-      "match": "\\b(Int|Decimal|Text|Bool|List|Table|Result|Json|Null|Any)\\b"
+      "match": "\\b(Int|Decimal|Text|Bool|List|Table|Result|Json|Null|Any|Function)\\b"
     },
     {
       "name": "support.function.builtin.gama-l",
-      "match": "\\b(sql|ask|wait_user|sql_write|mail|len|text|number|remember|recall|round)\\b"
+      "match": "\\b(sql|ask|wait_user|sql_write|mail|len|text|number|remember|recall|round|unwrap|unwrap_or|is_ok|is_err|split|join|contains|trim|upper|lower|replace|starts_with|ends_with|keys|values|has)\\b"
     },
     {
       "name": "keyword.control.gama-l",
