@@ -29,7 +29,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 _NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect())
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 from decimal import Decimal
 from typing import Any
 
@@ -155,7 +155,7 @@ class CallExpr: callee: Any; args: list; line: int; col: int
 @dataclass
 class Pipe: base: Any; stages: list; line: int; col: int
 @dataclass
-class Import: path: str; line: int; col: int
+class Import: path: str; line: int; col: int; alias: str | None = None
 @dataclass
 class Use: name: str; line: int; col: int
 @dataclass
@@ -242,7 +242,11 @@ class Parser:
         x = self.peek()
         if x.kind == "KW" and x.val == "import":
             self.take(); path = self.expect("STRING").val
-            return Import(path, x.line, x.col)
+            alias = None
+            if self.at("IDENT", "as"):
+                self.take()
+                alias = self.expect("IDENT").val
+            return Import(path, x.line, x.col, alias)
         if x.kind == "KW" and x.val == "use":
             self.take(); return Use(self.expect("IDENT").val, x.line, x.col)
         if x.kind == "KW" and x.val == "for":
@@ -1006,6 +1010,39 @@ def _project_root(entry: pathlib.Path) -> pathlib.Path:
             return p
     return entry.parent
 
+_ALIAS_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+def _rename_refs(node, mapping):
+    """Rename module-local function uses (calls and value refs) in the AST.
+
+    Only names present in ``mapping`` are rewritten; every other node is kept.
+    This also renames the ``Fn`` declaration itself when the whole node is
+    passed, so sibling and recursive calls keep pointing at the namespaced
+    function.
+    """
+    if isinstance(node, list):
+        return [_rename_refs(x, mapping) for x in node]
+    if isinstance(node, tuple):
+        return tuple(_rename_refs(x, mapping) for x in node)
+    if isinstance(node, dict):
+        return {k: _rename_refs(v, mapping) for k, v in node.items()}
+    if isinstance(node, Call):
+        return replace(node, name=mapping.get(node.name, node.name),
+                       args=[_rename_refs(a, mapping) for a in node.args])
+    if isinstance(node, Var):
+        return replace(node, name=mapping.get(node.name, node.name))
+    if is_dataclass(node):
+        changes = {}
+        for f in fields(node):
+            v = getattr(node, f.name)
+            if isinstance(v, (list, tuple, dict, Call, Var)) or is_dataclass(v):
+                nv = _rename_refs(v, mapping)
+                if nv is not v:
+                    changes[f.name] = nv
+        if changes:
+            return replace(node, **changes)
+    return node
+
 def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
              seen: set | None = None, loaded: set | None = None) -> list:
     path = path.resolve(); root = (root or _project_root(path)).resolve()
@@ -1028,7 +1065,14 @@ def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
         ast = parse(path.read_text(encoding="utf-8"))
     except OSError as ex:
         raise GamaError("cannot import %s: %s" % (path, ex)) from None
+    # Top-level names declared in this file. Aliases must not shadow them and
+    # generated `alias.fn` names must not clash with them.
+    declared = set()
+    for s in ast:
+        if isinstance(s, (Fn, Let, Assign, Use)):
+            declared.add(s.name)
     out = []
+    aliases = set()
     for s in ast:
         if isinstance(s, Import):
             candidates = [path.parent / s.path,
@@ -1037,7 +1081,37 @@ def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
             target = next((c for c in candidates if c.exists()), None)
             if target is None:
                 raise GamaError("cannot import %s" % s.path, s.line, s.col)
-            out.extend(_flatten(target, root, seen, loaded))
+            if s.alias is None:
+                sub = _flatten(target, root, seen, loaded)
+                for st in sub:
+                    out.append(st)
+                    if isinstance(st, Fn):
+                        declared.add(st.name)
+                continue
+            # Namespaced import: bounded MVP exposes only fn definitions.
+            if not _ALIAS_IDENT.match(s.alias):
+                raise GamaError("invalid import alias %r" % s.alias, s.line, s.col)
+            if s.alias in aliases:
+                raise GamaError("duplicate import alias %r" % s.alias, s.line, s.col)
+            if s.alias in declared:
+                raise GamaError(
+                    "import alias %r collides with existing top-level name" % s.alias,
+                    s.line, s.col)
+            aliases.add(s.alias)
+            # Expand the module with a fresh `loaded` set: the same module may
+            # be imported under two different aliases. `seen` is shared so
+            # cycles are still detected.
+            sub = _flatten(target, root, seen, set())
+            sub_fns = [st for st in sub if isinstance(st, Fn)]
+            mapping = {st.name: s.alias + "." + st.name for st in sub_fns}
+            for st in sub_fns:
+                new_name = mapping[st.name]
+                if new_name in declared:
+                    raise GamaError(
+                        "import alias %r produces duplicate name %r"
+                        % (s.alias, new_name), s.line, s.col)
+                declared.add(new_name)
+                out.append(replace(_rename_refs(st, mapping), name=new_name))
         else:
             out.append(s)
     seen.discard(path); loaded.add(path)
