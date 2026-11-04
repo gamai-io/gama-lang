@@ -66,6 +66,10 @@ Limitations (raise ``IRUnsupported`` / documented runtime errors)
   variants of plainly imported enums (``Color.Red``) work.  Named record
   construction with a dotted type name (``geo.Point { ... }``) is likewise not
   accepted by the parser; positional construction ``geo.Point(1, 2)`` works.
+* Record copy/`with` updates (``p with { x = 3 }``) are interpreter-only; the
+  compiler rejects them with :class:`IRUnsupported` instead of silently
+  dropping the field updates.  In-place field assignment is rejected the same
+  way.
 * Pipes, ``try``/``expr?`` and first-class function values (including reading a
   namespaced function as a value).
 * Builtins other than ``len``, ``text``, ``number``, ``round``, ``Ok``/``Err``
@@ -670,6 +674,11 @@ class _Compiler:
             for _k, value in expr.fields:
                 self.compile_expr(value)
             self.emit("BUILD_RECORD", (expr.name, names, expr.line, expr.col))
+            return
+        if isinstance(expr, g2.RecordUpdate):
+            # No IR opcode exists for copy-with; reject loudly instead of
+            # compiling the base and silently dropping the field updates.
+            _unsupported(expr, "record copy/with")
             return
         if isinstance(expr, g2.ListExpr):
             for item in expr.items:

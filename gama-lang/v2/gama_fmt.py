@@ -40,8 +40,9 @@ Guarantees of the AST formatter:
 
 Line wrapping (added in this revision):
   * Expressions longer than ``width`` (default 88) are wrapped deterministically
-    with two-space continuation indentation: list/map/record literals and call
-    argument lists go one entry per line with the closing delimiter lined up
+    with two-space continuation indentation: list/map/record literals, record
+    copy/`with` updates and call argument lists go one entry per line with the
+    closing delimiter lined up
     with the opening expression, binary chains break after the operator, and
     pipes put each ``| stage`` on its own line.  Short constructs are emitted
     exactly as before (one line).
@@ -603,6 +604,10 @@ class _AstFormatter:
             return self._delim_span("[", node.line, node.col)
         if isinstance(node, (G.MapExpr, G.RecordLit)):
             return self._delim_span("{", node.line, node.col)
+        if isinstance(node, G.RecordUpdate):
+            # ``node.line/col`` points at the ``with`` token, so the first
+            # following ``{`` is the update's own brace (not a base literal).
+            return self._delim_span("{", node.line, node.col)
         if isinstance(node, (G.Call, G.CallExpr)):
             return self._delim_span("(", node.line, node.col)
         return None
@@ -646,6 +651,8 @@ class _AstFormatter:
         if isinstance(node, G.Unary):
             return (node.line, node.col)
         if isinstance(node, G.Attr):
+            return self._expr_start_pos(node.base)
+        if isinstance(node, G.RecordUpdate):
             return self._expr_start_pos(node.base)
         if isinstance(node, G.Index):
             return self._expr_start_pos(node.base)
@@ -825,7 +832,7 @@ class _AstFormatter:
         if self._fits(text, base_col) and not self._force_expand(node):
             return text
         if isinstance(node, (G.ListExpr, G.MapExpr, G.RecordLit,
-                             G.Call, G.CallExpr)):
+                             G.RecordUpdate, G.Call, G.CallExpr)):
             return self._wrap_container(node, close_indent)
         if isinstance(node, G.Binary):
             return self._wrap_binary(node, close_indent, base_col, minp)
@@ -845,6 +852,11 @@ class _AstFormatter:
             return lambda ii, bc: (
                 k + ": " + self._wrap(val, ii, ii + len(k) + 2, 0))
 
+        def update_renderer(key, val):
+            k = key if _bare_key_ok(key) else _quote(key)
+            return lambda ii, bc: (
+                k + " = " + self._wrap(val, ii, ii + len(k) + 3, 0))
+
         if isinstance(node, G.ListExpr):
             open_text, close_text = "[", "]"
             entries = [(self._expr_start_pos(it), self._expr_end_pos(it),
@@ -857,6 +869,11 @@ class _AstFormatter:
             open_text, close_text = node.name + " {", "}"
             entries = [(self._expr_start_pos(v), self._expr_end_pos(v),
                         map_renderer(k, v)) for k, v in node.fields]
+        elif isinstance(node, G.RecordUpdate):
+            open_text = self._expr(node.base, _POSTFIX_PREC) + " with {"
+            close_text = "}"
+            entries = [(self._expr_start_pos(v), self._expr_end_pos(v),
+                        update_renderer(k, v)) for k, v in node.fields]
         elif isinstance(node, G.Call):
             open_text, close_text = node.name + "(", ")"
             entries = [(self._expr_start_pos(a), self._expr_end_pos(a),
@@ -1781,6 +1798,14 @@ class _AstFormatter:
                 k = key if _bare_key_ok(key) else _quote(key)
                 parts.append(k + ": " + self._expr(val))
             return node.name + " { " + ", ".join(parts) + " }"
+        if isinstance(node, G.RecordUpdate):
+            base = self._expr(node.base, _POSTFIX_PREC)
+            inner = ", ".join(
+                (k if _bare_key_ok(k) else _quote(k)) + " = " + self._expr(v)
+                for k, v in node.fields)
+            text = base + (" with { }" if not node.fields
+                           else " with { " + inner + " }")
+            return "(" + text + ")" if _POSTFIX_PREC < minp else text
         if isinstance(node, G.ListExpr):
             return "[" + ", ".join(self._expr(x) for x in node.items) + "]"
         if isinstance(node, G.MapExpr):

@@ -67,14 +67,18 @@ These are outside the T1–T10 checks or only partially covered; see
    Runtime limits are enforced (call depth, output, statement/expression steps,
    loop limit); there is no production resource budget or cost model.
 4. **Full type system.** No full inference. Nominal records with typed fields,
-   positional/named construction, dotted field access and in-place field
-   assignment are implemented (`tests/test_records.py`,
-   `tests/test_record_update.py`); nullary and multi-payload (non-generic) enums are implemented
-   (`tests/test_enums.py`, `tests/test_payload_enums.py`). Generics,
-   generic enum variants, record methods,
-   copy/`with` syntax, and structural subtyping are missing; the IR
+   positional/named construction, dotted field access, in-place field
+   assignment and copy/`with` updates are implemented (`tests/test_records.py`,
+   `tests/test_record_update.py`, `tests/test_record_with.py`); nullary and
+   multi-payload (non-generic) enums are implemented
+   (`tests/test_enums.py`, `tests/test_payload_enums.py`). `p with { x = 3 }`
+   returns a new record and leaves the receiver and its aliases untouched;
+   unchanged nested record values are shallow-copied (shared) and updating a
+   replaced field does not affect the receiver. Generics, generic enum
+   variants, record methods, and structural subtyping are missing; the IR
    prototype supports records and nullary enums for its documented subset
-   (field assignment is interpreter-only).
+   (field assignment and copy/`with` are interpreter-only and rejected by the
+   IR with `IRUnsupported`).
 5. **Formatter edges.** `fmt` is AST-based; it preserves comments and strings,
    is idempotent, and wraps at a configurable width (default 88,
    `fmt --width`): expressions (list/map/record literals, calls, binary chains,

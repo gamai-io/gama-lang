@@ -1,10 +1,10 @@
 """Record field assignment (`p.x := v`) — in-place update semantics.
 
 Records are nominal runtime values; assigning to a dotted target mutates the
-receiver `RecordVal` in place. There is no copy/`with` syntax and no cloning:
-aliases observe the update. Field paths resolve against the longest dotted
-variable prefix, so namespaced constants (`geo.origin.x := ...`) and nested
-records (`l.a.x := ...`) work too.
+receiver `RecordVal` in place, unlike copy/`with` (`tests/test_record_with.py`)
+which returns a fresh record. Aliases observe this in-place update. Field paths
+resolve against the longest dotted variable prefix, so namespaced constants
+(`geo.origin.x := ...`) and nested records (`l.a.x := ...`) work too.
 """
 
 import pathlib

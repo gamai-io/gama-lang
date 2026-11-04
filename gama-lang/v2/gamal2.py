@@ -302,6 +302,8 @@ class Try: expr: Any; line: int; col: int
 class RecordDecl: name: str; fields: list; line: int; col: int; exported: bool = False
 @dataclass
 class RecordLit: name: str; fields: list; line: int; col: int
+@dataclass
+class RecordUpdate: base: Any; fields: list; line: int; col: int
 
 @dataclass
 class Print: expr: Any; line: int; col: int
@@ -667,6 +669,24 @@ class Parser:
                 e = Index(e, idx, x.line, x.col)
             elif self.at("OP", "?"):
                 x = self.take(); e = Try(e, x.line, x.col)
+            elif self.at("IDENT", "with") and self.peek(1).kind == "OP" and self.peek(1).val == "{":
+                # Record copy/update: ``receiver with { field = expr, ... }``.
+                # Requiring the explicit ``with {`` keeps statement blocks and
+                # named record literals (``Point { ... }``) unambiguous; the
+                # receiver itself is an ordinary expression.
+                x = self.take()  # `with`
+                self.take(); self.skip_nl(); pairs = []
+                if not self.at("OP", "}"):
+                    while True:
+                        k = self.take()
+                        if k.kind not in ("IDENT", "STRING", "KW"):
+                            raise GamaError("with field name expected", k.line, k.col)
+                        self.expect("OP", "="); self.skip_nl()
+                        pairs.append((str(k.val), self.expr())); self.skip_nl()
+                        if not self.at("OP", ","): break
+                        self.take(); self.skip_nl()
+                self.expect("OP", "}")
+                e = RecordUpdate(e, pairs, x.line, x.col)
             else:
                 break
         return e
@@ -1558,6 +1578,28 @@ class Checker:
                     f"{e.name}: missing field{'s' if len(missing) > 1 else ''} "
                     + ", ".join(missing), e.line, e.col)
             return e.name
+        if isinstance(e, RecordUpdate):
+            bt = self.expr(e.base, row)
+            if bt not in self.records:
+                raise GamaTypeError(
+                    f"with expects a record receiver, got {bt}",
+                    e.line, e.col)
+            decl = dict(self.records[bt].fields)
+            seen = set()
+            for k, val in e.fields:
+                if k in seen:
+                    raise GamaTypeError(
+                        f"{bt}: duplicate field {k} in with", e.line, e.col)
+                seen.add(k)
+                if k not in decl:
+                    raise GamaTypeError(
+                        f"{bt}: unknown field {k} in with", e.line, e.col)
+                at = self.expr(val, row)
+                if not self.compat(at, decl[k]):
+                    raise GamaTypeError(
+                        f"{bt}.{k}: {at} != {decl[k]} in with",
+                        e.line, e.col)
+            return bt
         if isinstance(e, Attr):
             t = self.expr(e.base)
             if t not in ("Json", "Any", "Table"): raise GamaTypeError("field access needs Json/Table", e.line, e.col)
@@ -2712,6 +2754,32 @@ class Interpreter:
                     f"{e.name}: missing field{'s' if len(missing) > 1 else ''} "
                     + ", ".join(missing), e.line, e.col)
             return RecordVal(e.name, {fn: values[fn] for fn, _ft in rec.fields})
+        if isinstance(e, RecordUpdate):
+            base = self.expr(e.base, env, row)
+            if not isinstance(base, RecordVal):
+                raise GamaRuntimeError(
+                    "with expects a record value", e.line, e.col)
+            rec = self.records.get(base.type_name)
+            if rec is None:
+                raise GamaRuntimeError(
+                    f"unknown record {base.type_name}", e.line, e.col)
+            # Shallow copy: the field dict is new, but unchanged nested record
+            # and container values are shared with the receiver (documented).
+            values = dict(base.fields)
+            seen = set()
+            for k, val in e.fields:
+                if k in seen:
+                    raise GamaRuntimeError(
+                        f"{base.type_name}: duplicate field {k} in with",
+                        e.line, e.col)
+                seen.add(k)
+                if k not in dict(rec.fields):
+                    raise GamaRuntimeError(
+                        f"{base.type_name}: unknown field {k} in with",
+                        e.line, e.col)
+                values[k] = self.expr(val, env, row)
+            return RecordVal(
+                base.type_name, {fn: values[fn] for fn, _ft in rec.fields})
         if isinstance(e, Lambda):
             return FunctionVal(e.params, e.ret, e.effects, e.body, env)
         if isinstance(e, ListExpr): return [self.expr(x, env, row) for x in e.items]
