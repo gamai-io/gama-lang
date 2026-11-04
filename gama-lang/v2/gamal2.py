@@ -112,6 +112,18 @@ def _record_value_str(v) -> str:
         return json.dumps(v, ensure_ascii=False, default=str)
     return str(v)
 
+class EnumVal:
+    """Runtime nullary enum value: Enum.Variant (no payload)."""
+    __slots__ = ("enum", "variant")
+    def __init__(self, enum: str, variant: str):
+        self.enum, self.variant = enum, variant
+    def __eq__(self, other):
+        if isinstance(other, EnumVal):
+            return self.enum == other.enum and self.variant == other.variant
+        return NotImplemented
+    def __hash__(self): return hash((self.enum, self.variant))
+    def __str__(self): return f"{self.enum}.{self.variant}"
+    __repr__ = __str__
 class FunctionVal:
     """Runtime callable value: a lambda bound to its defining environment."""
     def __init__(self, params, ret, effects, body, closure, name="<lambda>"):
@@ -130,7 +142,7 @@ class TableType(str):
 KEYWORDS = {"let", "fn", "if", "else", "return", "true", "false", "null",
             "prove", "verify", "print", "effects", "filter", "select", "sum",
             "limit", "count", "map", "in", "import", "make", "use", "wait",
-            "for", "while", "break", "continue", "match"}
+            "for", "while", "break", "continue", "match", "enum"}
 
 @dataclass
 class Tok:
@@ -184,7 +196,7 @@ def lex(src: str) -> list[Tok]:
             out.append(Tok("KW" if txt in KEYWORDS else "IDENT", txt, start[0], start[1]))
             col += len(txt); continue
         two = src[i:i+2]
-        if two in ("==","!=","<=",">=","&&","||",":=","->"):
+        if two in ("==","!=","<=",">=","&&","||",":=","->","=>"):
             out.append(Tok("OP", two, line, col)); i += 2; col += 2; continue
         if c in "+-*/%<>!|(){}[],:;=?":
             out.append(Tok("OP", c, line, col)); i += 1; col += 1; continue
@@ -240,6 +252,8 @@ class Lambda: params: list; ret: str | None; effects: set | None; body: list; li
 @dataclass
 class Match: expr: Any; arms: list; line: int; col: int
 @dataclass
+class EnumDecl: name: str; variants: list; line: int; col: int
+@dataclass
 class If: cond: Any; then: list; other: list | None; line: int; col: int
 @dataclass
 class Return: expr: Any; line: int; col: int
@@ -261,7 +275,7 @@ class ExprStmt: expr: Any; line: int; col: int
 
 # Statements that end with a closing brace; a following statement may start
 # on the same line without an explicit separator.
-_BLOCK_STMT = (If, While, For, Match, Fn, RecordDecl)
+_BLOCK_STMT = (If, While, For, Match, Fn, RecordDecl, EnumDecl)
 
 # ------------------------------------------------------------------ parser
 class Parser:
@@ -336,6 +350,8 @@ class Parser:
             self.take(); return Break(x.line, x.col)
         if x.kind == "KW" and x.val == "continue":
             self.take(); return Continue(x.line, x.col)
+        if x.kind == "KW" and x.val == "enum":
+            return self.enum_decl()
         if x.kind == "KW" and x.val == "let":
             self.take(); name = self.expect("IDENT").val; tn = None
             if self.at("OP", ":"): self.take(); tn = self.expect("IDENT").val
@@ -436,6 +452,27 @@ class Parser:
         else:
             self.i = save
         return If(cond, then, other, x.line, x.col)
+    def enum_decl(self):
+        x = self.take()  # enum
+        name = self.expect("IDENT").val
+        if "." in name:
+            raise GamaError("enum name must be a simple identifier", x.line, x.col)
+        self.expect("OP", "{"); self.skip_seps()
+        variants = []
+        while not self.at("OP", "}"):
+            v = self.expect("IDENT")
+            if "." in v.val:
+                raise GamaError("enum variant must be a simple identifier", v.line, v.col)
+            variants.append((v.val, v.line, v.col))
+            if self.at("OP", ","):
+                self.take(); self.skip_seps()
+            elif self.at("NL"):
+                self.skip_seps()
+            elif not self.at("OP", "}"):
+                y = self.peek()
+                raise GamaError("expected ',' or '}' in enum", y.line, y.col)
+        self.expect("OP", "}")
+        return EnumDecl(name, variants, x.line, x.col)
     def match_stmt(self):
         x = self.take(); subject = self.expr(); self.skip_nl(); self.expect("OP", "{")
         arms = []
@@ -443,12 +480,23 @@ class Parser:
             self.skip_seps()
             if self.at("OP", "}"): break
             arm = self.take()
-            if arm.kind != "IDENT" or arm.val not in ("Ok", "Err", "_"):
-                raise GamaError("match arm must be Ok(x), Err(e) or _", arm.line, arm.col)
+            if arm.kind != "IDENT":
+                raise GamaError("match arm must be Ok(x), Err(e), Enum.Variant or _", arm.line, arm.col)
             var = None
-            if arm.val != "_":
+            if arm.val in ("Ok", "Err"):
                 self.expect("OP", "("); var = self.expect("IDENT").val; self.expect("OP", ")")
-            self.skip_nl(); body = self.block(); arms.append((arm.val, var, body)); self.skip_seps()
+            elif arm.val == "_":
+                pass
+            elif "." in arm.val:
+                if arm.val.count(".") != 1:
+                    raise GamaError("enum match pattern must be Enum.Variant", arm.line, arm.col)
+            else:
+                raise GamaError("match arm must be Ok(x), Err(e), Enum.Variant or _", arm.line, arm.col)
+            if self.at("OP", "=>"):
+                self.take(); self.skip_nl()
+            self.skip_nl(); body = self.block(); arms.append((arm.val, var, body))
+            if self.at("OP", ","): self.take()
+            self.skip_seps()
         self.expect("OP", "}")
         return Match(subject, arms, x.line, x.col)
     def expr(self): return self.pipe()
@@ -584,6 +632,7 @@ NUM = {"Int", "Decimal"}
 def tname(v) -> str:
     if isinstance(v, RecordVal): return v.type_name
     if isinstance(v, ResultVal): return "Result"
+    if isinstance(v, EnumVal): return v.enum
     if isinstance(v, FunctionVal): return "Function"
     if v is None: return "Null"
     if isinstance(v, bool): return "Bool"
@@ -1039,6 +1088,7 @@ class Checker:
         self.scope: list[dict[str, str]] = [{}]
         self.funcs: dict[str, Fn] = {}
         self.records: dict[str, RecordDecl] = {}
+        self.enums: dict[str, set[str]] = {}
         self.effects: set[str] = set()
         self.ret_type: str | None = None
         self.loop_depth = 0
@@ -1084,7 +1134,23 @@ class Checker:
                     e.src = getattr(s, "_src", None)
                     raise e
                 self.funcs[s.name] = s
+            elif isinstance(s, EnumDecl):
+                if s.name in self.enums:
+                    e = GamaTypeError(f"duplicate enum {s.name}", s.line, s.col)
+                    e.src = getattr(s, "_src", None)
+                    raise e
+                seen = set()
+                for vn, vl, vc in s.variants:
+                    if vn in seen:
+                        e = GamaTypeError(
+                            f"duplicate enum variant {s.name}.{vn}", vl, vc)
+                        e.src = getattr(s, "_src", None)
+                        raise e
+                    seen.add(vn)
+                self.enums[s.name] = seen
         for s in stmts:
+            if isinstance(s, EnumDecl):
+                continue
             try:
                 self.stmt(s, None)
             except GamaError as e:
@@ -1094,6 +1160,8 @@ class Checker:
     def stmt(self, s, allowed):
         if isinstance(s, Import):
             raise GamaError("import requires check_file/run_file", s.line, s.col)
+        if isinstance(s, EnumDecl):
+            raise GamaError("enum declarations must be top-level", s.line, s.col)
         if isinstance(s, Use):
             return
         if isinstance(s, RecordDecl):
@@ -1113,9 +1181,28 @@ class Checker:
             return
         if isinstance(s, Match):
             t = self.expr(s.expr)
-            if t not in ("Result", "Any"):
-                raise GamaTypeError("match expects Result", s.line, s.col)
+            if t not in ("Result", "Any") and t not in self.enums:
+                raise GamaTypeError("match expects Result or enum", s.line, s.col)
             for kind, var, body in s.arms:
+                if kind == "_":
+                    pass
+                elif kind in ("Ok", "Err"):
+                    if t not in ("Result", "Any"):
+                        raise GamaTypeError(
+                            f"match: {kind} pattern does not match subject type {t}",
+                            s.line, s.col)
+                else:
+                    base, _, variant = kind.partition(".")
+                    if base not in self.enums:
+                        raise GamaTypeError(
+                            f"unknown enum type {base}", s.line, s.col)
+                    if variant not in self.enums[base]:
+                        raise GamaTypeError(
+                            f"unknown enum variant {kind}", s.line, s.col)
+                    if t not in ("Any", base):
+                        raise GamaTypeError(
+                            f"match: {kind} pattern does not match subject type {t}",
+                            s.line, s.col)
                 self.push()
                 if var: self.set(var, "Any")
                 [self.stmt(x, allowed) for x in body]
@@ -1248,6 +1335,13 @@ class Checker:
             if t is not None: return t
             # A named function used as a value has type Function.
             if e.name in self.funcs: return "Function"
+            if "." in e.name:
+                base, _, variant = e.name.partition(".")
+                if base in self.enums:
+                    if variant not in self.enums[base]:
+                        raise GamaTypeError(
+                            f"unknown enum variant {e.name}", e.line, e.col)
+                    return base
             if "." in e.name:
                 parts = e.name.split(".")
                 for i in range(len(parts) - 1, 0, -1):
@@ -1774,7 +1868,7 @@ def _ledger_scan(data):
 
 class Interpreter:
     def __init__(self, interactive=False):
-        self.env = Env(); self.funcs = {}; self.records = {}; self.out = []; self.memory = {}
+        self.env = Env(); self.funcs = {}; self.records = {}; self.enums = {}; self.out = []; self.memory = {}
         self.proofs = {}; self.proof_chain = []; self.prev_proof = "GENESIS"; self.interactive = interactive
         self._ledger_records = []; self._ledger_problems = []
         self.last_ask = None
@@ -1980,6 +2074,11 @@ class Interpreter:
         self.out.append(text)
         self.out_chars = total
     def run(self, stmts):
+        # Register top-level enums up front so functions declared before an
+        # enum can still reference its variants when they are invoked.
+        for s in stmts:
+            if isinstance(s, EnumDecl) and s.name not in self.enums:
+                self.enums[s.name] = {v[0] for v in s.variants}
         try:
             # Record declarations are nominal and may be referenced before the
             # declaration line; register them up front like the checker does.
@@ -1996,6 +2095,8 @@ class Interpreter:
         elif isinstance(s, Assign): env.assign(s.name, self.expr(s.expr, env))
         elif isinstance(s, Use): pass
         elif isinstance(s, RecordDecl): self.records[s.name] = s
+        elif isinstance(s, EnumDecl):
+            self.enums.setdefault(s.name, {v[0] for v in s.variants})
         elif isinstance(s, For):
             seq = self.expr(s.iterable, env)
             if isinstance(seq, str): seq = list(seq)
@@ -2025,11 +2126,26 @@ class Interpreter:
                 except BreakSignal: break
         elif isinstance(s, Match):
             rv = self.expr(s.expr, env)
-            if not isinstance(rv, ResultVal): raise GamaRuntimeError("match expects Result", s.line, s.col)
+            if not isinstance(rv, (ResultVal, EnumVal)):
+                # Keep the historical message for non-Result subjects; the
+                # IR-subset parity tests compare this text byte-for-byte.
+                raise GamaRuntimeError(
+                    "match expects Result", s.line, s.col)
             for kind, var, body in s.arms:
-                if kind == "_" or (kind == "Ok" and rv.ok) or (kind == "Err" and not rv.ok):
+                if kind == "_":
+                    hit = True
+                elif kind in ("Ok", "Err"):
+                    hit = (isinstance(rv, ResultVal)
+                           and (kind == "Ok") == rv.ok)
+                elif isinstance(rv, EnumVal):
+                    base, _, variant = kind.partition(".")
+                    hit = rv.enum == base and rv.variant == variant
+                else:
+                    hit = False
+                if hit:
                     local = Env(env)
-                    if var: local.set(var, rv.value)
+                    if var and isinstance(rv, ResultVal):
+                        local.set(var, rv.value)
                     for x in body: self.stmt(x, local)
                     return
             raise GamaRuntimeError("match: no arm matched", s.line, s.col)
@@ -2262,6 +2378,13 @@ class Interpreter:
                 if e.name in self.funcs:
                     fn, closure = self.funcs[e.name]
                     return FunctionVal(fn.params, fn.ret, fn.effects, fn.body, closure, fn.name)
+                if "." in e.name:
+                    base, _, variant = e.name.partition(".")
+                    if base in self.enums:
+                        if variant not in self.enums[base]:
+                            raise GamaRuntimeError(
+                                f"unknown enum variant {e.name}", e.line, e.col)
+                        return EnumVal(base, variant)
                 if "." not in e.name: raise
                 parts = e.name.split(".")
                 base_n = None
