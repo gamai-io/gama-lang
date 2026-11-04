@@ -79,8 +79,14 @@ disk.
 
 A syntax-only VS Code package is in `vscode/` (TextMate grammar + snippets +
 a dependency-free LSP client). It highlights `import ... as` namespaces,
-`Function`, namespaced calls, and lambdas, and ships snippets for `impas`,
-`callns`, `iife`, and `fnlettype`. The extension requires a trusted workspace
+`Function`, namespaced calls, lambdas, record `with { ... }` updates,
+payload/multi-payload enums, aliased variants (`geo.Color.Red`), `export
+fn/let/record`, and the postfix `?` operator. Snippets cover those features
+(`recordwith`, `payloadenum`, `multipayloadenum`, `payload`, `pair`,
+`aliasvariant`, `matchpayload`, `exportfn`, `exportlet`, `exportrecord`,
+`tryexpr`) plus `impas`, `callns`, `iife`, and `fnlettype`. Grammar limits:
+record-update scopes end at the first `}`, only three-part alias chains are
+scoped, and `export enum` remains unsupported by the core. The extension requires a trusted workspace
 before spawning Python, supports `gama-lsp` from PATH or a configured script,
 and restarts with bounded backoff.
 

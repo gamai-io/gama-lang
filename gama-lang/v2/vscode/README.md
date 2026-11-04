@@ -131,6 +131,19 @@ directory, or package it with `vsce` (not included here).
   `values`, `has`
 - The postfix Result propagation operator `?`
 - Pipe stages (`filter`, `select`, `sum`, `limit`, `count`, `map`)
+- Record declarations (`record Point { x: Int }`) with field names and field
+  types, record literals (`Point { x: 1 }`), and member access (`p.x`)
+- Record copy/update (`p with { x = 3 }`): `with` gets its own keyword scope and
+  the updated field names and `=` are scoped inside the update block
+- Enum declarations, including single-payload (`Some(Int)`) and multi-payload
+  (`Two(Int, Text)`) variants; payload type names are scoped as types
+- Enum variants as values (`Color.Red`) and aliased variants across an import
+  (`geo.Color.Red`: namespace, enum type, variant)
+- Capitalized payload constructors in expressions and patterns
+  (`Some(5)`, `Pair(1, "a")`, `Some(v)`, `Pair(a, b)`)
+- `export fn`, `export let`, and `export record` (the leading `export` gets a
+  keyword scope; `export enum` is rejected by the core and is not highlighted
+  as an export)
 - Operators and punctuation
 - Function names after `fn` / `make`, bindings after `let`, and `prove` targets
 - Lambda expressions in expression position: `fn(x: Int) -> Int { ... }`
@@ -164,14 +177,44 @@ the v2 core (`gamal2.py`). Result helpers (`unwrap`, `unwrap_or`, `is_ok`,
 - Lambda effects must be declared when the body calls an effectful builtin
   (`effects { mail }`), matching named functions.
 
+## Grammar coverage limits
+
+The grammar is a TextMate tokenizer, not a parser, and intentionally stays
+conservative:
+
+- `with` is highlighted as a record-update keyword only when it is immediately
+  followed by `{`; `ask "..." with context` keeps its existing highlighting.
+- The record-update block ends at the first `}`. A field value that itself
+  contains a braced block (for example a nested record literal) can close the
+  update scope early, exactly like the existing record-literal rule.
+- `alias.Enum.Variant` is highlighted for three-part dotted chains. Arbitrary
+  deeper chains or alias type annotations such as `let p: geo.Point` are left to
+  the ordinary member-access/type rules.
+- Payload declarations highlight simple identifier payload types only, because
+  the core rejects qualified payload types (`Some(geo.Point)`).
+- `export` is highlighted only for `export fn`, `export let`, and
+  `export record`; `export enum` is rejected by the core, so it is not given an
+  export scope.
+- `export make` is accepted by the core parser but is outside the documented
+  `export fn/let/record` surface and is not given its own export scope.
+
 ## Snippets
 
 Besides `fn`, `let`, `if`, `prove`, pipe, and `import` (plus namespaced `import ... as`, snippet `impas`), the snippet set covers
-the Result flow (`fnres`, `match`, `try`, `ok`, `err`), the core builtins
-(`ask`, `askwith`, `sql`, `sqlwrite`, `remember`, `wait`, `mail`, `round`,
-`len`, `text`, `number`), and functions/lambdas: `lambda`/`fnx` (anonymous
-expression), `fnlet` (lambda bound to `let`), `fntype`/`higher` (higher-order
-`Function` parameter), and `fnvalue` (lambda alias called through a new name).
+the Result flow (`fnres`, `match`, `try`/`tryexpr`, `ok`, `err`), the core
+builtins (`ask`, `askwith`, `sql`, `sqlwrite`, `remember`, `wait`, `mail`,
+`round`, `len`, `text`, `number`), and functions/lambdas: `lambda`/`fnx`
+(anonymous expression), `fnlet` (lambda bound to `let`), `fntype`/`higher`
+(higher-order `Function` parameter), and `fnvalue` (lambda alias called through
+a new name).
+
+The latest syntax additions have snippets too: `recordwith` (record copy/update
+`value with { field = expr }`), `payloadenum`/`enumpayload` and
+`multipayloadenum`/`enumpair` (payload enum declarations), `payload`/`some` and
+`pair`/`payload2` (payload constructors), `aliasvariant`/`aliasenum`
+(`geo.Color.Red`), `matchpayload`/`matchenum` (payload pattern arms), and
+`exportfn`, `exportlet`, `exportrecord` (explicit exports). `export enum` is not
+offered because the core rejects it.
 
 ## License
 

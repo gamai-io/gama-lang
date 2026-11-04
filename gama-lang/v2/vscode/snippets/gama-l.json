@@ -8,6 +8,15 @@
     ],
     "description": "Declare a typed function with an effects block."
   },
+  "Export function": {
+    "prefix": "exportfn",
+    "body": [
+      "export fn ${1:name}(${2:a}: ${3:Int}) -> ${4:Int} effects {} {",
+      "\t$0",
+      "}"
+    ],
+    "description": "Export a function from an imported module (only exported declarations are visible through `import \"... as alias\"`)."
+  },
   "Lambda expression": {
     "prefix": [
       "lambda",
@@ -57,6 +66,13 @@
     ],
     "description": "Bind a value to a name."
   },
+  "Export let": {
+    "prefix": "exportlet",
+    "body": [
+      "export let ${1:name}: ${2:Type} = ${3:value}"
+    ],
+    "description": "Export a top-level let binding from an imported module."
+  },
   "Record declaration": {
     "prefix": [
       "record",
@@ -66,6 +82,24 @@
       "record ${1:Name} { ${2:field}: ${3:Type} }"
     ],
     "description": "Declare a nominal record with typed fields."
+  },
+  "Record update (copy with)": {
+    "prefix": [
+      "recordwith",
+      "withrec",
+      "copyrecord"
+    ],
+    "body": [
+      "${1:value} with { ${2:field} = ${3:expr} }"
+    ],
+    "description": "Shallow copy of a record with updated fields (`p with { x = 3 }`)."
+  },
+  "Export record": {
+    "prefix": "exportrecord",
+    "body": [
+      "export record ${1:Name} { ${2:field}: ${3:Type} }"
+    ],
+    "description": "Export a record type from an imported module (export enum is not supported)."
   },
   "Enum declaration": {
     "prefix": [
@@ -77,6 +111,26 @@
     ],
     "description": "Declare a nullary enum with variants."
   },
+  "Multi-payload enum declaration": {
+    "prefix": [
+      "multipayloadenum",
+      "enumpair"
+    ],
+    "body": [
+      "enum ${1:Pair} { ${2:Two}(${3:Int}, ${4:Text}), ${5:Zero} }"
+    ],
+    "description": "Declare an enum variant with multiple payload types (`Two(Int, Text)`)."
+  },
+  "Payload enum declaration": {
+    "prefix": [
+      "payloadenum",
+      "enumpayload"
+    ],
+    "body": [
+      "enum ${1:Option} { ${2:Some}(${3:Int}), ${4:None} }"
+    ],
+    "description": "Declare an enum with a single-payload variant (`Some(Int)`) and a nullary variant."
+  },
   "Record literal": {
     "prefix": [
       "recordlit",
@@ -86,6 +140,26 @@
       "${1:Name} { ${2:field}: ${3:value} }"
     ],
     "description": "Construct a named record literal with named fields."
+  },
+  "Multi-payload constructor": {
+    "prefix": [
+      "pair",
+      "payload2"
+    ],
+    "body": [
+      "${1:Pair}(${2:a}, ${3:b})"
+    ],
+    "description": "Construct a multi-payload enum value (one argument per declared payload type)."
+  },
+  "Payload constructor": {
+    "prefix": [
+      "payload",
+      "some"
+    ],
+    "body": [
+      "${1:Some}(${2:value})"
+    ],
+    "description": "Construct an enum payload value; payload type and arity are checked."
   },
   "Record member access": {
     "prefix": [
@@ -106,6 +180,16 @@
       "${1:Enum}.${2:Variant}"
     ],
     "description": "Reference an enum variant (e.g. Color.Red)."
+  },
+  "Aliased enum variant": {
+    "prefix": [
+      "aliasvariant",
+      "aliasenum"
+    ],
+    "body": [
+      "${1:geo}.${2:Color}.${3:Red}"
+    ],
+    "description": "Reference a variant through an imported module alias (`geo.Color.Red`)."
   },
   "If / else": {
     "prefix": "if",
@@ -199,12 +283,39 @@
     ],
     "description": "Match a Result with Ok(v), Err(e) and wildcard arms."
   },
+  "Match payload enum": {
+    "prefix": [
+      "matchpayload",
+      "matchenum"
+    ],
+    "body": [
+      "match ${1:option} {",
+      "\t${2:Some}(${3:value}) {",
+      "\t\t$0",
+      "\t}",
+      "\t${4:None} {",
+      "\t\t",
+      "\t}",
+      "}"
+    ],
+    "description": "Match an enum with a payload binding and a nullary arm."
+  },
   "Result propagation": {
     "prefix": "try",
     "body": [
       "let ${1:value} = ${2:expr}?"
     ],
     "description": "Unwrap Ok or return Err from the enclosing Result function."
+  },
+  "Try expression": {
+    "prefix": [
+      "tryexpr",
+      "trychain"
+    ],
+    "body": [
+      "${1:expr}?"
+    ],
+    "description": "Postfix `?` on any expression inside a Result/Any function (returns Err early)."
   },
   "Ok value": {
     "prefix": "ok",

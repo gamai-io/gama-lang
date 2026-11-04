@@ -11,6 +11,15 @@
       "match": "#.*$"
     },
     {
+      "name": "meta.export.declaration.gama-l",
+      "match": "\\b(export)\\s+(?=(fn|let|record)\\b)",
+      "captures": {
+        "1": {
+          "name": "keyword.control.export.gama-l"
+        }
+      }
+    },
+    {
       "name": "meta.record.declaration.gama-l",
       "begin": "\\b(record)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(\\{)",
       "beginCaptures": {
@@ -48,6 +57,37 @@
       ]
     },
     {
+      "name": "meta.record.update.gama-l",
+      "begin": "\\b(with)\\s*(\\{)",
+      "beginCaptures": {
+        "1": {
+          "name": "keyword.control.with.gama-l"
+        },
+        "2": {
+          "name": "punctuation.definition.block.begin.gama-l"
+        }
+      },
+      "end": "(\\})",
+      "endCaptures": {
+        "1": {
+          "name": "punctuation.definition.block.end.gama-l"
+        }
+      },
+      "patterns": [
+        {
+          "match": "([A-Za-z_][A-Za-z0-9_]*)\\s*(=)",
+          "captures": {
+            "1": {
+              "name": "variable.other.member.gama-l"
+            },
+            "2": {
+              "name": "keyword.operator.assignment.gama-l"
+            }
+          }
+        }
+      ]
+    },
+    {
       "name": "meta.enum.declaration.gama-l",
       "begin": "\\b(enum)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(\\{)",
       "beginCaptures": {
@@ -68,6 +108,34 @@
         }
       },
       "patterns": [
+        {
+          "name": "meta.enum.payload.gama-l",
+          "begin": "([A-Za-z_][A-Za-z0-9_]*)\\s*(\\()",
+          "beginCaptures": {
+            "1": {
+              "name": "variable.other.enummember.gama-l"
+            },
+            "2": {
+              "name": "punctuation.definition.parameters.begin.gama-l"
+            }
+          },
+          "end": "(\\))",
+          "endCaptures": {
+            "1": {
+              "name": "punctuation.definition.parameters.end.gama-l"
+            }
+          },
+          "patterns": [
+            {
+              "name": "support.type.gama-l",
+              "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b"
+            },
+            {
+              "name": "punctuation.separator.gama-l",
+              "match": ","
+            }
+          ]
+        },
         {
           "name": "variable.other.enummember.gama-l",
           "match": "[A-Za-z_][A-Za-z0-9_]*"
@@ -253,6 +321,21 @@
       "match": "==|!=|<=|>=|&&|\\|\\||:=|->|\\||[+*/%!<>=]|-"
     },
     {
+      "name": "meta.member.access.enum-alias.gama-l",
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\.([A-Za-z_][A-Za-z0-9_]*)\\.([A-Za-z_][A-Za-z0-9_]*)\\b",
+      "captures": {
+        "1": {
+          "name": "entity.name.namespace.gama-l"
+        },
+        "2": {
+          "name": "support.type.gama-l"
+        },
+        "3": {
+          "name": "variable.other.enummember.gama-l"
+        }
+      }
+    },
+    {
       "name": "meta.function-call.namespaced.gama-l",
       "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\.([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
       "captures": {
@@ -273,6 +356,15 @@
         },
         "2": {
           "name": "variable.other.property.gama-l"
+        }
+      }
+    },
+    {
+      "name": "meta.constructor.call.gama-l",
+      "match": "\\b([A-Z][A-Za-z0-9_]*)\\s*(?=\\()",
+      "captures": {
+        "1": {
+          "name": "support.class.constructor.gama-l"
         }
       }
     },
