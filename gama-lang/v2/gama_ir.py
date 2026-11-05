@@ -975,6 +975,10 @@ class _Compiler:
         if isinstance(stmt, g2.Use):
             self.emit("NOP")
             return
+        if isinstance(stmt, g2.TypeAlias):
+            # Aliases are compile-time only; erasure leaves no runtime value.
+            self.emit("NOP")
+            return
         if isinstance(stmt, g2.RecordDecl):
             parent = getattr(stmt, "parent", None)
             own_fields = tuple(fn for fn, _ft in stmt.fields)

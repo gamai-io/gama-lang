@@ -340,6 +340,8 @@ class Match: expr: Any; arms: list; line: int; col: int
 @dataclass
 class EnumDecl: name: str; variants: list; line: int; col: int; exported: bool = False; type_params: list = field(default_factory=list); type_param_bounds: dict = field(default_factory=dict); export_name: str | None = None
 @dataclass
+class TypeAlias: name: str; type_name: str; line: int; col: int; exported: bool = False; export_name: str | None = None
+@dataclass
 class If: cond: Any; then: list; other: list | None; line: int; col: int
 @dataclass
 class Return: expr: Any; line: int; col: int
@@ -452,9 +454,10 @@ class Parser:
         declared = {}
         exportable = {}
         for s in stmts:
-            if isinstance(s, (Fn, Let, Assign, Use, RecordDecl, EnumDecl)):
+            if isinstance(s, (Fn, Let, Assign, Use, RecordDecl, EnumDecl,
+                              TypeAlias)):
                 declared.setdefault(s.name, s)
-            if isinstance(s, (Fn, Let, RecordDecl, EnumDecl)):
+            if isinstance(s, (Fn, Let, RecordDecl, EnumDecl, TypeAlias)):
                 exportable.setdefault(s.name, s)
         seen = {}
         exported_sources = set()
@@ -519,11 +522,15 @@ class Parser:
                 (nxt.kind == "KW" and nxt.val in ("fn", "make", "let", "enum"))
                 or (nxt.kind == "IDENT" and nxt.val == "record"
                     and self.peek(2).kind == "IDENT")
+                or (nxt.kind == "IDENT" and nxt.val == "type"
+                    and self.peek(2).kind == "IDENT"
+                    and self.peek(3).kind == "OP"
+                    and self.peek(3).val in ("=", "<"))
             )
             if not is_decl:
                 raise GamaError(
-                    "export must be followed by fn, let, record or enum",
-                    x.line, x.col)
+                    "export must be followed by fn, let, record or enum "
+                    "(or type)", x.line, x.col)
             if not top:
                 raise GamaError("export is only allowed at top level",
                                 x.line, x.col)
@@ -544,6 +551,15 @@ class Parser:
                         alias_tok.line, alias_tok.col)
                 export_name = alias_tok.val
             return replace(inner, exported=True, export_name=export_name)
+        if (x.kind == "IDENT" and x.val == "type"
+                and self.peek(1).kind == "IDENT"
+                and self.peek(2).kind == "OP"
+                and self.peek(2).val in ("=", "<")):
+            if not top:
+                raise GamaError(
+                    "type aliases are only allowed at top level",
+                    x.line, x.col)
+            return self.type_alias_decl()
         if (x.kind == "IDENT" and x.val == "record"
                 and self.peek(1).kind == "IDENT"
                 and ((self.peek(2).kind == "OP"
@@ -602,6 +618,32 @@ class Parser:
         if x.kind == "IDENT" and self.peek(1).kind == "OP" and self.peek(1).val == ":=":
             name = self.take().val; self.take(); return Assign(name, self.expr(), x.line, x.col)
         return ExprStmt(self.expr(), x.line, x.col)
+    def type_alias_decl(self):
+        """Parse a top-level ``type Name = <type-ref>`` declaration.
+
+        Aliases are transparent compile-time names. Optional ``export`` and
+        ``as Alias`` are handled by the ``export`` wrapper, matching other
+        declaration forms. Generic aliases (``type Pair<T> = ...``) and union
+        targets are not modelled yet and are rejected with a clear message.
+        """
+        x = self.take()  # `type`
+        name_tok = self.expect("IDENT")
+        if not _ALIAS_IDENT.match(name_tok.val):
+            raise GamaError(
+                "type alias name must be a simple identifier",
+                name_tok.line, name_tok.col)
+        if self.at("OP", "<"):
+            e = self.peek()
+            raise GamaError(
+                "generic type aliases are not supported", e.line, e.col)
+        self.expect("OP", "="); self.skip_nl()
+        target = self.type_ref()
+        if self.at("OP", "|"):
+            e = self.peek()
+            raise GamaError(
+                "union types are not supported in type aliases",
+                e.line, e.col)
+        return TypeAlias(name_tok.val, target, x.line, x.col)
     def export_list(self):
         """Parse a top-level selective re-export list.
 
@@ -1808,6 +1850,7 @@ class Checker:
         self.enums: dict[str, set[str]] = {}
         self.enum_params: dict[str, list[str]] = {}
         self.enum_bounds: dict[str, dict[str, str]] = {}
+        self.type_aliases: dict[str, TypeAlias] = {}
         self.effects: set[str] = set()
         self.ret_type: str | None = None
         self.loop_depth = 0
@@ -1841,11 +1884,56 @@ class Checker:
         for scope in self.type_params:
             out |= scope
         return out
-    def erase_type(self, t):
-        """Map generic type parameters to ``Any`` and generic refs to their base."""
+    def _resolve_alias_ref_inner(self, t, params, stack):
+        """Expand type aliases recursively, preserving generic arguments.
+
+        Type parameters in ``params`` shadow aliases (a record/function ``T``
+        is a type parameter, not the global alias ``T``). Generic arguments
+        are expanded too, so ``type Ids = List<UserId>`` resolves the nested
+        alias. Cycles are rejected with the alias declaration's position.
+        """
+        base, args = _type_ref_parts(t)
+        if base in params:
+            if not args:
+                return base
+            return _render_type_ref(
+                base, [self._resolve_alias_ref_inner(a, params, stack)
+                       for a in args])
+        alias = self.type_aliases.get(base)
+        if alias is not None:
+            if args:
+                raise GamaTypeError(
+                    f"type alias {base} is not generic", alias.line, alias.col)
+            if base in stack:
+                raise GamaTypeError(
+                    f"type alias {base}: cyclic alias", alias.line, alias.col)
+            return self._resolve_alias_ref_inner(
+                alias.type_name, params, stack + (base,))
+        if args:
+            return _render_type_ref(
+                base, [self._resolve_alias_ref_inner(a, params, stack)
+                       for a in args])
+        return base
+    def resolve_alias(self, t, params=None):
+        """Return ``t`` with every type alias expanded to its target."""
         if t is None:
             return None
-        return _erase_type_ref(t, self._type_param_names())
+        params = self._type_param_names() if params is None else set(params)
+        return self._resolve_alias_ref_inner(t, params, ())
+    def _erase_ann(self, t, params):
+        """Alias-expand then erase one written annotation."""
+        if t is None:
+            return None
+        params = set(params or ())
+        return _erase_type_ref(
+            self._resolve_alias_ref_inner(t, params, ()), params)
+    def erase_type(self, t):
+        """Map generic type parameters to ``Any``, aliases to their target."""
+        if t is None:
+            return None
+        params = self._type_param_names()
+        return _erase_type_ref(
+            self._resolve_alias_ref_inner(t, params, ()), params)
     def record_params(self, name):
         rec = self.records.get(name)
         return set(getattr(rec, "type_params", None) or [])
@@ -1890,6 +1978,7 @@ class Checker:
         rec = self.records.get(rec_name)
         params = set(getattr(rec, "type_params", None) or [])
         t = _subst_type_ref(ft, bindings) if bindings else ft
+        t = self._resolve_alias_ref_inner(t, params, ())
         return _erase_type_ref(t, params)
     def static_target(self, name):
         """Split a dotted static function name into ``(record, method)``.
@@ -1920,7 +2009,7 @@ class Checker:
             bound = bounds.get(tp)
             if not bound:
                 continue
-            base, args = _type_ref_parts(bound)
+            base, args = _type_ref_parts(self.resolve_alias(bound))
             if args:
                 raise GamaTypeError(
                     f"type parameter {tp} bound must be a simple type, "
@@ -1953,6 +2042,7 @@ class Checker:
             bound = bounds.get(tp)
             if not bound:
                 continue
+            arg = self.resolve_alias(arg, params)
             abase, _aargs = _type_ref_parts(arg)
             if abase in params:
                 continue  # unknown concrete type (an in-scope type parameter)
@@ -1990,6 +2080,12 @@ class Checker:
                     f"type parameter {base} cannot take type arguments",
                     line, col)
             return
+        alias = self.type_aliases.get(base)
+        if alias is not None:
+            if args:
+                raise GamaTypeError(
+                    f"type alias {base} is not generic", line, col)
+            return
         rec = self.records.get(base)
         if rec is not None:
             want = len(getattr(rec, "type_params", None) or [])
@@ -2016,16 +2112,89 @@ class Checker:
             return
         if args:
             raise GamaTypeError(f"type {base} is not generic", line, col)
+    def _validate_alias_target(self, t, alias_name, stack):
+        """Validate one alias target: known names, arity, nested aliases."""
+        base, args = _type_ref_parts(t)
+        if base in self.type_aliases:
+            if args:
+                a = self.type_aliases[alias_name]
+                raise GamaTypeError(
+                    f"type alias {base} is not generic", a.line, a.col)
+            self._validate_alias(base, stack)
+            return
+        rec = self.records.get(base)
+        if rec is not None:
+            want = len(getattr(rec, "type_params", None) or [])
+            if len(args) != want:
+                a = self.type_aliases[alias_name]
+                raise GamaTypeError(
+                    f"type alias {alias_name}: {base} expects {want} type "
+                    f"argument{'s' if want != 1 else ''}, got {len(args)}",
+                    a.line, a.col)
+            for arg in args:
+                self._validate_alias_target(arg, alias_name, stack)
+            return
+        enum_params = self.enum_params.get(base)
+        if enum_params is not None:
+            want = len(enum_params)
+            if len(args) != want:
+                a = self.type_aliases[alias_name]
+                raise GamaTypeError(
+                    f"type alias {alias_name}: {base} expects {want} type "
+                    f"argument{'s' if want != 1 else ''}, got {len(args)}",
+                    a.line, a.col)
+            for arg in args:
+                self._validate_alias_target(arg, alias_name, stack)
+            return
+        if base in BASE_TYPE_NAMES:
+            # Builtin type names may carry documentation arguments
+            # (``List<Point>``); erasure keeps the base.
+            for arg in args:
+                self._validate_alias_target(arg, alias_name, stack)
+            return
+        a = self.type_aliases[alias_name]
+        raise GamaTypeError(
+            f"type alias {alias_name}: unknown type {base}", a.line, a.col)
+    def _validate_alias(self, name, stack):
+        alias = self.type_aliases[name]
+        if name in stack:
+            raise GamaTypeError(
+                f"type alias {name}: cyclic alias", alias.line, alias.col)
+        self._validate_alias_target(
+            alias.type_name, name, stack + (name,))
     def get(self, n):
         for s in reversed(self.scope):
             if n in s: return s[n]
         return None
     def set(self, n, t): self.scope[-1][n] = t
     def program(self, stmts):
+        # Type aliases live in the type namespace. Register them first so a
+        # record/enum declared later can be rejected when it collides, and so
+        # every annotation can be expanded while checking declarations.
+        for s in stmts:
+            if not isinstance(s, TypeAlias):
+                continue
+            if s.name in self.type_aliases:
+                e = GamaTypeError(f"duplicate type alias {s.name}", s.line, s.col)
+                e.src = getattr(s, "_src", None)
+                raise e
+            if s.name in BASE_TYPE_NAMES:
+                e = GamaTypeError(
+                    f"type alias {s.name} collides with an existing type name",
+                    s.line, s.col)
+                e.src = getattr(s, "_src", None)
+                raise e
+            self.type_aliases[s.name] = s
         for s in stmts:
             if isinstance(s, RecordDecl):
                 if s.name in self.records:
                     e = GamaTypeError(f"duplicate record {s.name}", s.line, s.col)
+                    e.src = getattr(s, "_src", None)
+                    raise e
+                if s.name in self.type_aliases:
+                    e = GamaTypeError(
+                        f"record {s.name} collides with type alias {s.name}",
+                        s.line, s.col)
                     e.src = getattr(s, "_src", None)
                     raise e
                 if s.name in BUILTINS:
@@ -2225,6 +2394,12 @@ class Checker:
                     e = GamaTypeError(f"duplicate enum {s.name}", s.line, s.col)
                     e.src = getattr(s, "_src", None)
                     raise e
+                if s.name in self.type_aliases:
+                    e = GamaTypeError(
+                        f"enum {s.name} collides with type alias {s.name}",
+                        s.line, s.col)
+                    e.src = getattr(s, "_src", None)
+                    raise e
                 tparams = list(getattr(s, "type_params", None) or [])
                 dup = next((tp for i, tp in enumerate(tparams)
                             if tp in tparams[:i]), None)
@@ -2246,6 +2421,17 @@ class Checker:
                 self.enum_params[s.name] = tparams
                 self.enum_bounds[s.name] = dict(
                     getattr(s, "type_param_bounds", None) or {})
+        # Alias targets may name a record/enum declared later, so resolve and
+        # validate them once every declaration is registered.
+        for s in stmts:
+            if not isinstance(s, TypeAlias):
+                continue
+            try:
+                self._validate_alias(s.name, ())
+            except GamaError as e:
+                if e.src is None:
+                    e.src = getattr(s, "_src", None)
+                raise
         # Enum payloads may name enum type parameters or other generic enums;
         # validate their arity once every declaration is registered.
         for s in stmts:
@@ -2292,6 +2478,8 @@ class Checker:
         if isinstance(s, EnumDecl):
             raise GamaError("enum declarations must be top-level", s.line, s.col)
         if isinstance(s, Use):
+            return
+        if isinstance(s, TypeAlias):
             return
         if isinstance(s, RecordDecl):
             return
@@ -2348,7 +2536,7 @@ class Checker:
                     payload_types = _payload_type_list(payload_type)
                     eparams = set(self.enum_params.get(base) or [])
                     payload_types = tuple(
-                        _erase_type_ref(pt, eparams) for pt in payload_types)
+                        self._erase_ann(pt, eparams) for pt in payload_types)
                     if not payload_types and names:
                         raise GamaTypeError(
                             f"enum variant {base}.{variant} is nullary and cannot bind a payload",
@@ -2375,10 +2563,12 @@ class Checker:
         if isinstance(s, Let):
             self._check_type_annotation(s.type_name, s.line, s.col)
             tn = self.erase_type(s.type_name)
+            resolved_ann = (self.resolve_alias(s.type_name)
+                            if s.type_name else None)
             if (isinstance(s.expr, Call)
                     and not getattr(s.expr, "type_args", None)
-                    and s.type_name and "<" in s.type_name):
-                self._check_annotated_record_call(s.type_name, s.expr)
+                    and resolved_ann and "<" in resolved_ann):
+                self._check_annotated_record_call(resolved_ann, s.expr)
             # Bind the name before checking a lambda body so recursive
             # lambdas can refer to themselves.
             if isinstance(s.expr, Lambda):
@@ -2441,7 +2631,7 @@ class Checker:
             if tp in bounds:
                 seen_alts = set()
                 for alt in _split_bound(bounds[tp]):
-                    base, args = _type_ref_parts(alt)
+                    base, args = _type_ref_parts(self.resolve_alias(alt))
                     if args:
                         raise GamaTypeError(
                             f"type parameter {tp} bound must be a simple type, "
@@ -2614,7 +2804,9 @@ class Checker:
         bound = bounds.get(tp)
         if not bound or got == "Any":
             return
-        if not any(self.compat(got, alt) for alt in _split_bound(bound)):
+        got = self.resolve_alias(got)
+        if not any(self.compat(got, self.resolve_alias(alt))
+                   for alt in _split_bound(bound)):
             raise GamaTypeError(
                 f"{fname}: type parameter {tp} {got} != bound {bound}",
                 line, col)
@@ -2622,7 +2814,9 @@ class Checker:
         bound = bounds.get(tp)
         if not bound or t in self._type_param_names():
             return
-        if not any(self.compat(t, alt) for alt in _split_bound(bound)):
+        t = self.resolve_alias(t)
+        if not any(self.compat(t, self.resolve_alias(alt))
+                   for alt in _split_bound(bound)):
             raise GamaTypeError(
                 f"{fname}: type argument {t} != bound {bound} for {tp}",
                 line, col)
@@ -2655,7 +2849,8 @@ class Checker:
     def is_type_name(self, t):
         """True when ``t`` names a concrete type or an in-scope type param."""
         return (t in BASE_TYPE_NAMES or t in self._type_param_names()
-                or t in self.records or t in self.enums)
+                or t in self.records or t in self.enums
+                or t in self.type_aliases)
     def check_field_assign(self, s, value_type):
         """Validate a dotted assignment target ``base.field[.field...]``.
 
@@ -2731,21 +2926,21 @@ class Checker:
                     bindings.setdefault(pbase, at)
             elif _type_ref_uses_param(p.type_name, tset):
                 if explicit is not None:
-                    want = _erase_type_ref(
+                    want = self._erase_ann(
                         _subst_type_ref(p.type_name, bindings), tset)
                 else:
-                    want = _erase_type_ref(p.type_name, tset)
+                    want = self._erase_ann(p.type_name, tset)
                 if not self.compat(at, want):
                     raise GamaTypeError(
                         f"lambda: {p.name} {at} != {want}", e.line, e.col)
-            elif not self.compat(at, p.type_name):
+            elif not self.compat(at, self._erase_ann(p.type_name, tset)):
                 raise GamaTypeError(
                     f"lambda: {p.name} {at} != {p.type_name}", e.line, e.col)
         self.effects |= (lmb.effects or set())
         rt = lmb.ret or "Any"
         if rt in tset:
             return bindings.get(rt, "Any")
-        return _erase_type_ref(rt, tset)
+        return self._erase_ann(rt, tset)
 
     def expr(self, e, row=None) -> str:
         if isinstance(e, Literal): return tname(e.value)
@@ -3031,7 +3226,7 @@ class Checker:
                             self._check_inferred_bound(
                                 e.name, ptype, at, ebounds.get(ptype),
                                 e.line, e.col)
-                        want = _erase_type_ref(ptype, eparams)
+                        want = self._erase_ann(ptype, eparams)
                         if not self.compat(at, want):
                             where = ("" if len(payload_types) == 1
                                      else f" {idx + 1}")
@@ -3098,21 +3293,23 @@ class Checker:
                     elif _type_ref_uses_param(p.type_name, tparam_set):
                         # Erased annotation that mentions a type parameter,
                         # e.g. ``Option<T>``: compare against the nominal base.
-                        want = _erase_type_ref(p.type_name, tparam_set)
+                        want = self._erase_ann(p.type_name, tparam_set)
                         if not self.compat(at, want):
                             raise GamaTypeError(
                                 f"{e.name}: {p.name} {at} != {want}",
                                 e.line, e.col)
-                    elif not self.compat(at, p.type_name):
+                    elif not self.compat(
+                            at, self._erase_ann(p.type_name, tparam_set)):
                         raise GamaTypeError(f"{e.name}: {p.name} {at} != {p.type_name}", e.line, e.col)
                 self.effects |= (f.effects or set())
                 rt = f.ret or "Any"
                 if rt in tparam_set:
                     return bindings.get(rt, "Any")
-                return _erase_type_ref(rt, tparam_set)
+                return self._erase_ann(rt, tparam_set)
             for p, a in zip(f.params, e.args):
                 at = self.expr(a)
-                if not self.compat(at, p.type_name): raise GamaTypeError(f"{e.name}: {p.name} {at} != {p.type_name}", e.line, e.col)
+                want = self.erase_type(p.type_name)
+                if not self.compat(at, want): raise GamaTypeError(f"{e.name}: {p.name} {at} != {p.type_name}", e.line, e.col)
             self.effects |= (f.effects or set())
             return self.erase_type(f.ret or "Any")
         if isinstance(e, CallExpr):
@@ -3146,15 +3343,23 @@ class Checker:
                                     callee.name, p.type_name, at, tbounds,
                                     e.line, e.col)
                                 bindings.setdefault(p.type_name, at)
-                        elif not self.compat(at, p.type_name):
-                            raise GamaTypeError(f"{callee.name}: {p.name} {at} != {p.type_name}", e.line, e.col)
+                        else:
+                            want = self._erase_ann(
+                                p.type_name, f.type_params)
+                            if not self.compat(at, want):
+                                raise GamaTypeError(
+                                    f"{callee.name}: {p.name} {at} != "
+                                    f"{p.type_name}", e.line, e.col)
                     rt = f.ret or "Any"
-                    return bindings.get(rt, "Any") if rt in f.type_params else rt
+                    if rt in f.type_params:
+                        return bindings.get(rt, "Any")
+                    return self._erase_ann(rt, f.type_params)
                 for p, a in zip(f.params, e.args):
                     at = self.expr(a)
-                    if not self.compat(at, p.type_name):
+                    want = self.erase_type(p.type_name)
+                    if not self.compat(at, want):
                         raise GamaTypeError(f"{callee.name}: {p.name} {at} != {p.type_name}", e.line, e.col)
-                return f.ret or "Any"
+                return self.erase_type(f.ret or "Any")
             for a in e.args: self.expr(a)
             return "Any"
         if isinstance(e, Pipe):
@@ -3208,7 +3413,7 @@ _ALIAS_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # at least one explicit export, unexported enums are private like every other
 # unexported declaration. Renamed exports change only the alias-surface name.
 _ALIAS_ALLOWED_TOPLEVEL = (Fn, Let, Import, Use, RecordDecl, EnumDecl,
-                           ExportList)
+                           TypeAlias, ExportList)
 _STMT_KIND = {Let: "let", Assign: "assignment", Print: "print",
               Prove: "prove", Verify: "verify",
               ExprStmt: "expression statement"}
@@ -3217,8 +3422,8 @@ def _alias_toplevel_error(stmt, alias: str) -> GamaError:
     kind = _STMT_KIND.get(type(stmt), type(stmt).__name__.lower())
     return GamaError(
         "aliased import %r: unsupported top-level statement %r "
-        "(only fn definitions, top-level let constants, enum declarations, "
-        "plain imports, and use are allowed)"
+        "(only fn definitions, top-level let constants, record/enum/type "
+        "declarations, plain imports, and use are allowed)"
         % (alias, kind),
         getattr(stmt, "line", 0), getattr(stmt, "col", 0))
 
@@ -3280,6 +3485,10 @@ def _rename_refs(node, mapping):
             arms=[(_rename_qualified(kind, mapping), bindings,
                    _rename_refs(body, mapping))
                   for kind, bindings, body in node.arms])
+    if isinstance(node, TypeAlias):
+        return replace(
+            node, name=mapping.get(node.name, node.name),
+            type_name=_rename_type_ref(node.type_name, mapping))
     if isinstance(node, EnumDecl):
         own = set(getattr(node, "type_params", None) or [])
         pmap = {k: v for k, v in mapping.items() if k not in own}
@@ -3403,7 +3612,8 @@ def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
     # generated `alias.fn` names must not clash with them.
     declared = set()
     for s in ast:
-        if isinstance(s, (Fn, Let, Assign, Use, RecordDecl, EnumDecl)):
+        if isinstance(s, (Fn, Let, Assign, Use, RecordDecl, EnumDecl,
+                          TypeAlias)):
             declared.add(s.name)
     out = []
     aliases = set()
@@ -3455,7 +3665,8 @@ def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
             # namespaced bindings and plain-imported names are not local
             # declarations, so neither is re-exportable.
             sub_decls = [st for st in sub
-                         if isinstance(st, (Fn, Let, RecordDecl, EnumDecl))]
+                         if isinstance(st, (Fn, Let, RecordDecl, EnumDecl,
+                                            TypeAlias))]
             export_map = {}
             for st in sub_decls:
                 if not getattr(st, "exported", False):
@@ -3972,6 +4183,7 @@ class Interpreter:
             else:
                 env.assign(s.name, value)
         elif isinstance(s, Use): pass
+        elif isinstance(s, TypeAlias): pass
         elif isinstance(s, RecordDecl):
             self.records[s.name] = s
             self.record_env[s.name] = env

@@ -1311,6 +1311,13 @@ class _AstFormatter:
             self._emit(ind + "export { " + ", ".join(parts) + " }",
                        [s.line, self._stmt_end_line(s)], suffix=semi)
             return
+        if isinstance(s, G.TypeAlias):
+            prefix = "export " if getattr(s, "exported", False) else ""
+            self._emit(
+                ind + prefix + "type " + s.name + " = " + s.type_name
+                + _export_alias_text(s),
+                [self._stmt_end_line(s)], suffix=semi)
+            return
         if isinstance(s, G.Break):
             self._emit(ind + "break", [s.line], suffix=semi)
             return
@@ -2752,6 +2759,10 @@ class _AstFormatter:
             return "continue"
         if isinstance(s, G.Use):
             return "use " + s.name
+        if isinstance(s, G.TypeAlias):
+            prefix = "export " if getattr(s, "exported", False) else ""
+            return (prefix + "type " + s.name + " = " + s.type_name
+                    + _export_alias_text(s))
         if isinstance(s, G.Import):
             alias = (" as " + s.alias) if s.alias else ""
             return "import " + self._import_path_text(s) + alias
