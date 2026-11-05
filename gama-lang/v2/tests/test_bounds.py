@@ -6,10 +6,12 @@ Syntax::
     fn numeric<T: Int>(x: T) -> Int { return x + 1 }
 
 A bound is one of the base types ``Int``, ``Decimal``, ``Text`` or ``Bool``,
-or a declared record/enum.  Exactly one bound per parameter; there are no
-multiple bounds and no higher-kinded bounds.  Records and enums can also
-declare bounds (see ``test_generic_bounds.py``); the function-bound tests here
-keep their original scope.  Bounds are a checker-only contract: runtime erasure is
+or a declared record/enum.  A parameter may also combine alternatives with
+``&`` (intersection, see ``test_intersection_bounds.py``) or ``|`` (union);
+mixing the two in one list is rejected.  Records and enums can also
+declare single bounds (see ``test_generic_bounds.py``); the function-bound
+tests here keep their original scope.  Bounds are a checker-only contract:
+runtime erasure is
 unchanged (``T`` -> ``Any``), explicit call type arguments are checked against
 the bound, and inferred calls accept values compatible with the bound
 (``Int``/``Decimal`` are mutually compatible for a numeric bound).  A value
@@ -62,9 +64,15 @@ class BoundParsingTests(unittest.TestCase):
         self.assertEqual(enum.type_params, ["T"])
         self.assertEqual(enum.type_param_bounds, {"T": "Int"})
 
-    def test_multiple_bounds_are_rejected(self):
-        with self.assertRaises(G.GamaError):
-            G.check('fn f<T: Int & Text>(x: T) -> T { return x }\n')
+    def test_multiple_bounds_parse_and_are_checked(self):
+        fn = G.parse(
+            'fn f<T: Int & Text>(x: T) -> T { return x }\n')[0]
+        self.assertEqual(fn.type_param_bounds, {"T": "Int & Text"})
+        with self.assertRaisesRegex(
+                G.GamaTypeError, r"does not satisfy all bounds Int & Text"):
+            G.check(
+                'fn f<T: Int & Text>(x: T) -> T { return x }\n'
+                'print f(1)\n')
 
 
 class ShowBoundTests(unittest.TestCase):

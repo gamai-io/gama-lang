@@ -280,7 +280,7 @@ def lex(src: str) -> list[Tok]:
         two = src[i:i+2]
         if two in ("==","!=","<=",">=","&&","||",":=","->","=>"):
             out.append(Tok("OP", two, line, col)); i += 2; col += 2; continue
-        if c in "+-*/%<>!|(){}[],:;=?":
+        if c in "+-*/%<>!|&(){}[],:;=?":
             out.append(Tok("OP", c, line, col)); i += 1; col += 1; continue
         raise GamaError(f"unexpected character {c!r}", line, col)
     out.append(Tok("EOF", None, line, col))
@@ -855,11 +855,20 @@ class Parser:
                         e.line, e.col)
                 alts = [self.type_ref()]
                 self.skip_nl()
-                while self.at("OP", "|"):
+                sep = None
+                while self.at("OP", "|") or self.at("OP", "&"):
+                    tok = self.peek()
+                    if sep is None:
+                        sep = tok.val
+                    elif tok.val != sep:
+                        raise GamaError(
+                            f"type parameter {name}: cannot mix '&' and '|' "
+                            f"in bounds", tok.line, tok.col)
                     self.take(); self.skip_nl()
                     alts.append(self.type_ref())
                     self.skip_nl()
-                bounds[name] = " | ".join(alts)
+                bounds[name] = ((" & " if sep == "&" else " | ")
+                                .join(alts))
                 self.skip_nl()
             if not self.at("OP", ","):
                 break
@@ -1289,6 +1298,9 @@ def _erase_type_ref(t, params):
     """
     if t is None:
         return None
+    inters = _split_intersection(t)
+    if len(inters) > 1:
+        return " & ".join(_erase_type_ref(a, params) for a in inters)
     alts = _split_bound(t)
     if len(alts) > 1:
         return " | ".join(_erase_type_ref(a, params) for a in alts)
@@ -1338,10 +1350,37 @@ def _split_bound(t):
     parts.append("".join(cur).strip())
     return [p for p in parts if p]
 
+def _split_intersection(t):
+    """Split a bound into components on top-level ``&``.
+
+    ``Named & Aged`` -> ``["Named", "Aged"]`` and a single bound yields a
+    one-element list.  A ``&`` nested inside ``<...>`` is ignored.
+    """
+    if not isinstance(t, str):
+        return [t]
+    parts = []
+    cur = []
+    depth = 0
+    for ch in t:
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth = max(0, depth - 1)
+        if ch == "&" and depth == 0:
+            parts.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    parts.append("".join(cur).strip())
+    return [p for p in parts if p]
+
 def _rename_type_ref(t, mapping):
     """Rename the base of a type ref through an aliased-import mapping."""
     if not isinstance(t, str):
         return t
+    inters = _split_intersection(t)
+    if len(inters) > 1:
+        return " & ".join(_rename_type_ref(a, mapping) for a in inters)
     alts = _split_bound(t)
     if len(alts) > 1:
         return " | ".join(_rename_type_ref(a, mapping) for a in alts)
@@ -1924,6 +1963,11 @@ class Checker:
         the alias declaration's position.
 
         """
+        inters = _split_intersection(t)
+        if len(inters) > 1:
+            return " & ".join(
+                self._resolve_alias_ref_inner(a, params, stack)
+                for a in inters)
         alts = _split_bound(t)
         if len(alts) > 1:
             return " | ".join(
@@ -2060,6 +2104,11 @@ class Checker:
             bound = bounds.get(tp)
             if not bound:
                 continue
+            if len(_split_intersection(bound)) > 1:
+                raise GamaTypeError(
+                    f"intersection bounds are only supported on functions: "
+                    f"type parameter {tp} has bounds {bound}",
+                    node.line, node.col)
             base, args = _type_ref_parts(self.resolve_alias(bound))
             if args:
                 raise GamaTypeError(
@@ -2769,8 +2818,12 @@ class Checker:
                 raise GamaTypeError(f"duplicate type parameter {tp}", f.line, f.col)
             seen_tp.add(tp)
             if tp in bounds:
+                bound = bounds[tp]
+                parts = (_split_intersection(bound)
+                         if len(_split_intersection(bound)) > 1
+                         else _split_bound(bound))
                 seen_alts = set()
-                for alt in _split_bound(bounds[tp]):
+                for alt in parts:
                     base, args = _type_ref_parts(self.resolve_alias(alt))
                     if args:
                         raise GamaTypeError(
@@ -2959,26 +3012,55 @@ class Checker:
             return True
         return self._structural_compat(got, want, seen)
 
+    def _bound_mode(self, bound):
+        """``(mode, parts)``: ``("&", ...)`` intersection, else union."""
+        inters = _split_intersection(bound)
+        if len(inters) > 1:
+            return "&", inters
+        return "|", _split_bound(bound)
+    def _bound_satisfied(self, got, bound):
+        """Whether ``got`` satisfies a union or intersection bound.
+
+        An intersection requires every component (structural record
+        compatibility or the usual ``compat`` rules); a union accepts any
+        component.  Base-type numeric compatibility is unchanged.
+        """
+        mode, parts = self._bound_mode(bound)
+        if mode == "&":
+            return all(self.compat(got, self.resolve_alias(part))
+                       for part in parts)
+        return any(self.compat(got, self.resolve_alias(part))
+                   for part in parts)
     def _check_type_bound(self, fname, tp, got, bounds, line, col):
         bound = bounds.get(tp)
         if not bound or got == "Any":
             return
         got = self.resolve_alias(got)
-        if not any(self.compat(got, self.resolve_alias(alt))
-                   for alt in _split_bound(bound)):
+        if self._bound_satisfied(got, bound):
+            return
+        mode, _parts = self._bound_mode(bound)
+        if mode == "&":
             raise GamaTypeError(
-                f"{fname}: type parameter {tp} {got} != bound {bound}",
-                line, col)
+                f"{fname}: type parameter {tp} {got} does not satisfy all "
+                f"bounds {bound}", line, col)
+        raise GamaTypeError(
+            f"{fname}: type parameter {tp} {got} != bound {bound}",
+            line, col)
     def _check_explicit_bound(self, fname, tp, t, bounds, line, col):
         bound = bounds.get(tp)
         if not bound or t in self._type_param_names():
             return
         t = self.resolve_alias(t)
-        if not any(self.compat(t, self.resolve_alias(alt))
-                   for alt in _split_bound(bound)):
+        if self._bound_satisfied(t, bound):
+            return
+        mode, _parts = self._bound_mode(bound)
+        if mode == "&":
             raise GamaTypeError(
-                f"{fname}: type argument {t} != bound {bound} for {tp}",
-                line, col)
+                f"{fname}: type argument {t} does not satisfy all bounds "
+                f"{bound} for {tp}", line, col)
+        raise GamaTypeError(
+            f"{fname}: type argument {t} != bound {bound} for {tp}",
+            line, col)
     def _check_annotated_record_call(self, tn, call):
         """Check a record constructor against a generic ``let`` annotation.
 
