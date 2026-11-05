@@ -13,8 +13,9 @@ parameters, return types, record fields, enum payloads and generic arguments.
 Runtime erasure is unchanged: an alias never creates a value, a ``DEF`` or a
 type check at run time, and the IR backend emits a ``NOP`` for the declaration.
 
-Limits: aliases are not generic (``type Pair<T> = ...`` is rejected) and union
-aliases (``type Name = Text | Bool``) are rejected because union types are not
+Limits: generic aliases are covered separately in
+``test_generic_aliases.py``, and union aliases (``type Name = Text | Bool``)
+are rejected because union types are not
 modelled in annotations.  Aliases are type-namespace declarations; they may be
 exported (plain, renamed, or through a selective ``export { ... }`` list) and
 are visible through plain and aliased imports (``geo.Id``).
@@ -213,10 +214,14 @@ class TypeAliasTests(unittest.TestCase):
                                     r"type alias A is not generic"):
             G.check('type A = Int\nlet x: A<Int> = 1\n')
 
-    def test_generic_alias_declaration_is_rejected(self):
-        with self.assertRaisesRegex(G.GamaError,
-                                    r"generic type aliases are not supported"):
-            G.check('type Pair<T> = Box<T>\n')
+    def test_generic_alias_declaration_is_supported(self):
+        ast = G.check(
+            'record Box<T> { value: T }\n'
+            'type Pair<T> = Box<T>\n')
+        alias = next(s for s in ast if isinstance(s, G.TypeAlias))
+        self.assertEqual(alias.name, "Pair")
+        self.assertEqual(alias.type_params, ["T"])
+        self.assertEqual(alias.type_name, "Box<T>")
 
     def test_union_target_is_rejected(self):
         with self.assertRaisesRegex(

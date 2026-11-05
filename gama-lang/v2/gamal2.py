@@ -340,7 +340,7 @@ class Match: expr: Any; arms: list; line: int; col: int
 @dataclass
 class EnumDecl: name: str; variants: list; line: int; col: int; exported: bool = False; type_params: list = field(default_factory=list); type_param_bounds: dict = field(default_factory=dict); export_name: str | None = None
 @dataclass
-class TypeAlias: name: str; type_name: str; line: int; col: int; exported: bool = False; export_name: str | None = None
+class TypeAlias: name: str; type_name: str; line: int; col: int; exported: bool = False; export_name: str | None = None; type_params: list = field(default_factory=list)
 @dataclass
 class If: cond: Any; then: list; other: list | None; line: int; col: int
 @dataclass
@@ -621,12 +621,12 @@ class Parser:
             name = self.take().val; self.take(); return Assign(name, self.expr(), x.line, x.col)
         return ExprStmt(self.expr(), x.line, x.col)
     def type_alias_decl(self):
-        """Parse a top-level ``type Name = <type-ref>`` declaration.
+        """Parse a top-level ``type Name<T, ...> = <type-ref>`` declaration.
 
         Aliases are transparent compile-time names. Optional ``export`` and
         ``as Alias`` are handled by the ``export`` wrapper, matching other
-        declaration forms. Generic aliases (``type Pair<T> = ...``) and union
-        targets are not modelled yet and are rejected with a clear message.
+        declaration forms. Type parameters are captured so the checker can
+        substitute them into the target; union targets are still rejected.
         """
         x = self.take()  # `type`
         name_tok = self.expect("IDENT")
@@ -634,10 +634,7 @@ class Parser:
             raise GamaError(
                 "type alias name must be a simple identifier",
                 name_tok.line, name_tok.col)
-        if self.at("OP", "<"):
-            e = self.peek()
-            raise GamaError(
-                "generic type aliases are not supported", e.line, e.col)
+        type_params, _bounds = self.type_params()
         self.expect("OP", "="); self.skip_nl()
         target = self.type_ref()
         if self.at("OP", "|"):
@@ -645,7 +642,8 @@ class Parser:
             raise GamaError(
                 "union types are not supported in type aliases",
                 e.line, e.col)
-        return TypeAlias(name_tok.val, target, x.line, x.col)
+        return TypeAlias(name_tok.val, target, x.line, x.col,
+                         type_params=type_params)
     def export_list(self):
         """Parse a top-level selective re-export list.
 
@@ -1890,8 +1888,12 @@ class Checker:
         """Expand type aliases recursively, preserving generic arguments.
 
         Type parameters in ``params`` shadow aliases (a record/function ``T``
-        is a type parameter, not the global alias ``T``). Generic arguments
-        are expanded too, so ``type Ids = List<UserId>`` resolves the nested
+        is a type parameter, not the global alias ``T``). A generic alias
+        ``type Boxed<T> = Box<T>`` substitutes its declared parameters with
+        the arguments at the use site before expanding the target, so
+        ``Boxed<Int>`` becomes ``Box<Int>`` and nested uses such as
+        ``Boxed<Boxed<Int>>`` become ``Box<Box<Int>>``. Generic arguments are
+        expanded too, so ``type Ids = List<UserId>`` resolves the nested
         alias. Cycles are rejected with the alias declaration's position.
         """
         base, args = _type_ref_parts(t)
@@ -1903,14 +1905,28 @@ class Checker:
                        for a in args])
         alias = self.type_aliases.get(base)
         if alias is not None:
-            if args:
+            tparams = list(getattr(alias, "type_params", None) or [])
+            if len(args) != len(tparams):
+                if not tparams:
+                    raise GamaTypeError(
+                        f"type alias {base} is not generic",
+                        alias.line, alias.col)
                 raise GamaTypeError(
-                    f"type alias {base} is not generic", alias.line, alias.col)
+                    f"type alias {base} expects {len(tparams)} type "
+                    f"argument{'s' if len(tparams) != 1 else ''}, "
+                    f"got {len(args)}", alias.line, alias.col)
             if base in stack:
                 raise GamaTypeError(
                     f"type alias {base}: cyclic alias", alias.line, alias.col)
+            # Arguments are user terms inside the alias use, not part of the
+            # alias body: expand them with the current stack first, so a nested
+            # use such as ``Boxed<Boxed<Int>>`` is not mistaken for a cycle.
+            expanded = [self._resolve_alias_ref_inner(a, params, stack)
+                        for a in args]
+            target = _subst_type_ref(alias.type_name,
+                                     dict(zip(tparams, expanded)))
             return self._resolve_alias_ref_inner(
-                alias.type_name, params, stack + (base,))
+                target, params, stack + (base,))
         if args:
             return _render_type_ref(
                 base, [self._resolve_alias_ref_inner(a, params, stack)
@@ -2084,9 +2100,17 @@ class Checker:
             return
         alias = self.type_aliases.get(base)
         if alias is not None:
-            if args:
+            tparams = list(getattr(alias, "type_params", None) or [])
+            if len(args) != len(tparams):
+                if not tparams:
+                    raise GamaTypeError(
+                        f"type alias {base} is not generic", line, col)
                 raise GamaTypeError(
-                    f"type alias {base} is not generic", line, col)
+                    f"type alias {base} expects {len(tparams)} type "
+                    f"argument{'s' if len(tparams) != 1 else ''}, "
+                    f"got {len(args)}", line, col)
+            for a in args:
+                self._check_type_annotation(a, line, col, params)
             return
         rec = self.records.get(base)
         if rec is not None:
@@ -2114,14 +2138,35 @@ class Checker:
             return
         if args:
             raise GamaTypeError(f"type {base} is not generic", line, col)
-    def _validate_alias_target(self, t, alias_name, stack):
-        """Validate one alias target: known names, arity, nested aliases."""
+    def _validate_alias_target(self, t, alias_name, stack, params):
+        """Validate one alias target: known names, arity, nested aliases.
+
+        ``params`` are the type parameters declared by the alias whose target
+        is being validated (or by an enclosing alias); they shadow global
+        aliases and are accepted wherever a concrete type name is expected.
+        """
         base, args = _type_ref_parts(t)
-        if base in self.type_aliases:
+        if base in params:
             if args:
                 a = self.type_aliases[alias_name]
                 raise GamaTypeError(
-                    f"type alias {base} is not generic", a.line, a.col)
+                    f"type parameter {base} cannot take type arguments",
+                    a.line, a.col)
+            return
+        if base in self.type_aliases:
+            target_alias = self.type_aliases[base]
+            want = len(getattr(target_alias, "type_params", None) or [])
+            if len(args) != want:
+                a = self.type_aliases[alias_name]
+                if not want:
+                    raise GamaTypeError(
+                        f"type alias {base} is not generic", a.line, a.col)
+                raise GamaTypeError(
+                    f"type alias {alias_name}: {base} expects {want} type "
+                    f"argument{'s' if want != 1 else ''}, got {len(args)}",
+                    a.line, a.col)
+            for arg in args:
+                self._validate_alias_target(arg, alias_name, stack, params)
             self._validate_alias(base, stack)
             return
         rec = self.records.get(base)
@@ -2134,7 +2179,7 @@ class Checker:
                     f"argument{'s' if want != 1 else ''}, got {len(args)}",
                     a.line, a.col)
             for arg in args:
-                self._validate_alias_target(arg, alias_name, stack)
+                self._validate_alias_target(arg, alias_name, stack, params)
             return
         enum_params = self.enum_params.get(base)
         if enum_params is not None:
@@ -2146,13 +2191,13 @@ class Checker:
                     f"argument{'s' if want != 1 else ''}, got {len(args)}",
                     a.line, a.col)
             for arg in args:
-                self._validate_alias_target(arg, alias_name, stack)
+                self._validate_alias_target(arg, alias_name, stack, params)
             return
         if base in BASE_TYPE_NAMES:
             # Builtin type names may carry documentation arguments
             # (``List<Point>``); erasure keeps the base.
             for arg in args:
-                self._validate_alias_target(arg, alias_name, stack)
+                self._validate_alias_target(arg, alias_name, stack, params)
             return
         a = self.type_aliases[alias_name]
         raise GamaTypeError(
@@ -2162,8 +2207,9 @@ class Checker:
         if name in stack:
             raise GamaTypeError(
                 f"type alias {name}: cyclic alias", alias.line, alias.col)
+        params = set(getattr(alias, "type_params", None) or [])
         self._validate_alias_target(
-            alias.type_name, name, stack + (name,))
+            alias.type_name, name, stack + (name,), params)
     def get(self, n):
         for s in reversed(self.scope):
             if n in s: return s[n]
@@ -2186,6 +2232,16 @@ class Checker:
                     s.line, s.col)
                 e.src = getattr(s, "_src", None)
                 raise e
+            tparams = list(getattr(s, "type_params", None) or [])
+            tseen = set()
+            for tp in tparams:
+                if tp in tseen:
+                    e = GamaTypeError(
+                        f"type alias {s.name}: duplicate type parameter {tp}",
+                        s.line, s.col)
+                    e.src = getattr(s, "_src", None)
+                    raise e
+                tseen.add(tp)
             self.type_aliases[s.name] = s
         for s in stmts:
             if isinstance(s, RecordDecl):
@@ -3488,9 +3544,11 @@ def _rename_refs(node, mapping):
                    _rename_refs(body, mapping))
                   for kind, bindings, body in node.arms])
     if isinstance(node, TypeAlias):
+        own = set(getattr(node, "type_params", None) or [])
+        pmap = {k: v for k, v in mapping.items() if k not in own}
         return replace(
             node, name=mapping.get(node.name, node.name),
-            type_name=_rename_type_ref(node.type_name, mapping))
+            type_name=_rename_type_ref(node.type_name, pmap))
     if isinstance(node, EnumDecl):
         own = set(getattr(node, "type_params", None) or [])
         pmap = {k: v for k, v in mapping.items() if k not in own}
