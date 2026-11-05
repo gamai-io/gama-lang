@@ -536,6 +536,8 @@ class Parser:
                                 x.line, x.col)
             self.take()
             inner = self.statement(top=True)
+            if not hasattr(inner, "exported"):
+                raise GamaError("malformed exported declaration", x.line, x.col)
             export_name = getattr(inner, "export_name", None)
             if self.at("IDENT", "as"):
                 self.take()
@@ -4494,8 +4496,10 @@ class Interpreter:
             return _NO_METHOD
         try:
             receiver = self.expr(Var(receiver_name, e.line, e.col), env, row)
-        except GamaRuntimeError:
-            return _NO_METHOD
+        except GamaRuntimeError as ex:
+            if "unknown variable" in str(ex):
+                return _NO_METHOD
+            raise
         if not isinstance(receiver, RecordVal):
             return _NO_METHOD
         dispatch = getattr(e, "_dispatch_record", None)

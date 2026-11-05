@@ -668,37 +668,31 @@ class GeneratedMutationTests(unittest.TestCase):
 
 
 class FeatureProbeTests(unittest.TestCase):
-    """Gracefully skip surface features that are not implemented yet."""
+    """Concrete smoke cases for features added after the fuzz generator."""
 
-    def test_selective_reexports_if_supported(self):
-        probes = ("export add\n", "export { add }\n",
-                  'export "lib.gm" as m\n')
-        supported = False
-        for src in probes:
-            try:
-                G.parse(src)
-            except G.GamaError:
-                continue
-            except Exception as ex:  # noqa: BLE001
-                self.fail("probe leaked %s: %s" % (type(ex).__name__, ex))
-            supported = True
-        if not supported:
-            self.skipTest("selective re-exports are not supported")
+    def test_selective_reexports(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            (root / "lib.gm").write_text(
+                "fn add(a: Int, b: Int) -> Int effects {} "
+                "{ return a + b }\n"
+                "fn hidden() -> Int effects {} { return 9 }\n"
+                "export { add as plus }\n", encoding="utf-8")
+            (root / "main.gm").write_text(
+                'import "lib.gm" as m\nprint m.plus(2, 3)\n',
+                encoding="utf-8")
+            out = G.run_file(str(root / "main.gm")).out
+        self.assertEqual(out, ["5"])
 
-    def test_type_aliases_if_supported(self):
-        try:
-            G.parse("type UserId = Int\nlet x: UserId = 1\n")
-        except G.GamaError:
-            self.skipTest("type aliases are not supported")
-        except Exception as ex:  # noqa: BLE001
-            self.fail("probe leaked %s: %s" % (type(ex).__name__, ex))
-        self.skipTest("type aliases parsed but no run-time case was generated")
+    def test_type_aliases(self):
+        src = "type UserId = Int\nlet x: UserId = 1\nprint x\n"
+        self.assertEqual(G.run(src).out, ["1"])
 
-    def test_ir_host_callables_if_supported(self):
-        names = ("HostCallable", "HostFunction", "register_host")
-        if not any(hasattr(IR, n) for n in names):
-            self.skipTest("IR host callables are not exposed by the backend")
-        self.skipTest("IR host callables exposed; add concrete cases here")
+    def test_ir_host_callables(self):
+        src = "print host(2)\n"
+        ast = G.parse(src)
+        out = IR.run_program(ast, env={"host": lambda x: x * 2}).out
+        self.assertEqual(out, ["4"])
 
 
 def _make_case(fn, idx, label):
@@ -784,7 +778,6 @@ class Fuzz5RegressionPins(unittest.TestCase):
     when the swallow is fixed this test will fail (unexpected success).
     """
 
-    @unittest.expectedFailure
     def test_expr_step_limit_on_method_receiver_is_not_swallowed(self):
         src = (
             "record B { n: Int\n"
@@ -804,7 +797,6 @@ class Fuzz5RegressionPins(unittest.TestCase):
                 lambda: IR.run_program(G.check(src)))
         self.assertEqual(ir, it)
 
-    @unittest.expectedFailure
     def test_malformed_export_record_without_body_is_gamerror(self):
         # ``export`` treats ``record <Name>`` as a declaration start even when
         # the record body is malformed later, so the expression fallback
