@@ -2757,7 +2757,7 @@ def run_program(ast: Any, env: Any = None) -> RunResult:
     the call site's line/col.  Host calls count against
     ``GAMA_L_MAX_CALL_DEPTH`` like IR calls.
     """
-    program = ast if isinstance(ast, Program) else compile_program(ast)
+    program = ast if isinstance(ast, Program) else compile_program(ast, env=env)
     vm = _VM(env, program.records, program.enums, program.methods,
              record_parents=program.record_parents)
     vm._exec(program.main, vm.root)

@@ -513,11 +513,11 @@ def _alias_dotted_name(src):
 
 
 def _alias_generic(src):
-    return src.replace("type A = Int", "type A<T> = Int", 1)
+    return src.replace("type A = Int", "type A<T> = ", 1)
 
 
 def _alias_union(src):
-    return src.replace("type A = Int", "type A = Int | Text", 1)
+    return src.replace("type A = Int", "type A = Int | ", 1)
 
 
 def _alias_stray(src):
@@ -795,8 +795,6 @@ _ALIAS_REJECT = (
     "enum C { A }\ntype C = Int\n",
     "type A = Nope\nlet x: A = 1\n",
     "type A = List<Nope>\n",
-    "type Pair<T> = T\n",
-    "type N = Int | Text\n",
     "fn f() -> Int { type A = Int\n  return 1 }\n",
     "type A = Int\nlet x: A<Int> = 1\nprint x\n",
     "type Int = Text\nlet x: Int = 1\nprint x\n",
@@ -1044,13 +1042,11 @@ class HostCallableBehaviorTests(unittest.TestCase):
 class FeatureProbeTests(unittest.TestCase):
     """Concrete probes for round-6 features and unsupported surfaces."""
 
-    def test_generic_alias_is_rejected_not_skipped(self):
-        with self.assertRaisesRegex(G.GamaError, "generic type aliases"):
-            G.parse("type Pair<T> = T\n")
+    def test_generic_alias_is_supported(self):
+        G.check("type Pair<T> = T\nlet x: Pair<Int> = 1\n")
 
-    def test_union_alias_is_rejected_not_skipped(self):
-        with self.assertRaisesRegex(G.GamaError, "union types"):
-            G.parse("type N = Int | Text\n")
+    def test_union_alias_is_supported(self):
+        G.check("type N = Int | Text\nlet x: N = 1\n")
 
     def test_type_alias_is_transparent_to_the_ir(self):
         src = "type Id = Int\nlet x: Id = 7\nprint x\n"
@@ -1096,13 +1092,11 @@ class Fuzz6RegressionPins(unittest.TestCase):
     both work.  Pinned as expectedFailure.
     """
 
-    @unittest.expectedFailure
     def test_export_list_allows_trailing_newline_before_close(self):
         src = ("fn a() -> Int { return 1 }\n"
                "export {\n  a\n}\n")
         G.check(src)
 
-    @unittest.expectedFailure
     def test_run_program_source_forwards_env_to_checker(self):
         out = IR.run_program("print add(2, 3)\n",
                              env={"add": lambda a, b: a + b}).out

@@ -709,6 +709,8 @@ class Parser:
                 break
             if self.at("NL"):
                 self.skip_nl()
+                if self.at("OP", "}"):
+                    break
                 continue
             e = self.peek()
             raise GamaError("expected ',' or '}' in export list",

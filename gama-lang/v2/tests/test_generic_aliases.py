@@ -276,10 +276,8 @@ class GenericTypeAliasTests(unittest.TestCase):
                 G.GamaTypeError, r"collides with an existing type name"):
             G.check('type Int<T> = Text\n')
 
-    def test_union_target_is_rejected(self):
-        with self.assertRaisesRegex(
-                G.GamaError, r"union types are not supported in type aliases"):
-            G.check('type A<T> = Text | Bool\n')
+    def test_generic_union_target_is_supported(self):
+        G.check('type A<T> = Text | Bool\nlet x: A<Int> = "x"\n')
 
     def test_alias_only_at_top_level(self):
         with self.assertRaisesRegex(G.GamaError, r"only allowed at top level"):
