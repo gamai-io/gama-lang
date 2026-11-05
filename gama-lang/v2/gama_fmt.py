@@ -137,8 +137,29 @@ except Exception:  # pragma: no cover - only when imported oddly
     _G = None
 
 
+def _literal_text(p) -> str:
+    if p.kind == "Text":
+        return '"' + str(p.value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+    if p.kind == "Bool":
+        return "true" if p.value else "false"
+    if p.kind == "Null":
+        return "null"
+    return str(p.value)
+
+
+def _list_pattern_text(p) -> str:
+    parts = [_pattern_item_text(x) for x in p.items]
+    if p.rest is not None:
+        parts.append("..." + p.rest)
+    return "[" + ", ".join(parts) + "]"
+
+
 def _pattern_item_text(p) -> str:
-    """Render one match pattern item (name, ``_`` or nested record pattern)."""
+    """Render one match pattern item (name, literal, list or record pattern)."""
+    if _G is not None and isinstance(p, _G.ListPattern):
+        return _list_pattern_text(p)
+    if _G is not None and isinstance(p, _G.LitPattern):
+        return _literal_text(p)
     if _G is not None and isinstance(p, _G.RecordPattern):
         body = ", ".join(_pattern_item_text(x) for x in p.items)
         return p.name + "(" + body + ")"
@@ -147,6 +168,10 @@ def _pattern_item_text(p) -> str:
 
 def _pattern_label(name, bindings) -> str:
     """Render a match arm label, including nested record patterns."""
+    if _G is not None and isinstance(name, _G.ListPattern):
+        return _list_pattern_text(name)
+    if _G is not None and isinstance(name, _G.VarPattern):
+        return name.name
     if name == "_" or bindings is None:
         return name
     items = _G._pattern_items(bindings) if _G is not None else list(bindings)
@@ -2583,17 +2608,16 @@ class _AstFormatter:
         if outer is not None:
             arm_pairs = self._child_pairs(outer)
             prev_end = outer[0].line
-            for i, (name, bindings, body) in enumerate(s.arms):
+            for i, arm in enumerate(s.arms):
+                name, bindings, body = arm
+                guard = _G._arm_guard(arm) if _G is not None else None
                 pair = arm_pairs[i] if i < len(arm_pairs) else None
                 limit = pair[0].line if pair else outer[1].line
                 prev_end = self._flush_before(prev_end, limit, indent + 1,
                                               outer[0].line)
-                if name == "_" or not bindings:
-                    label = name
-                elif isinstance(bindings, str):
-                    label = name + "(" + bindings + ")"
-                else:
-                    label = _pattern_label(name, bindings)
+                label = _pattern_label(name, bindings)
+                if guard is not None:
+                    label += " if " + self._expr(guard)
                 label += " {"
                 self._emit(_UNIT * (indent + 1) + label,
                            [pair[0].line] if pair else [s.line])
@@ -2806,8 +2830,12 @@ class _AstFormatter:
                     " { " + body + " }")
         if isinstance(s, G.Match):
             arms = []
-            for name, var, body in s.arms:
+            for arm in s.arms:
+                name, var, body = arm
+                guard = G._arm_guard(arm)
                 label = _pattern_label(name, var)
+                if guard is not None:
+                    label += " if " + self._expr(guard)
                 inner = self._inline_block(body)
                 arms.append(label + " { " + inner + " }")
             return "match " + self._expr(s.expr) + " { " + " ".join(arms) + " }"

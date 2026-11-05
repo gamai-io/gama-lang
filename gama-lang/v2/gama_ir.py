@@ -1282,7 +1282,21 @@ class _Compiler:
         self.emit("LET", hidden)
 
         end_jumps: list[int] = []
-        for kind, bindings, body in stmt.arms:
+        for arm in stmt.arms:
+            kind, bindings, body = arm
+            guard = g2._arm_guard(arm)
+            if isinstance(kind, g2.ListPattern):
+                raise IRUnsupported(
+                    "list patterns are not supported by the IR backend",
+                    stmt.line, stmt.col)
+            if isinstance(kind, g2.VarPattern):
+                raise IRUnsupported(
+                    "variable match patterns are not supported by the IR "
+                    "backend", stmt.line, stmt.col)
+            if guard is not None:
+                raise IRUnsupported(
+                    "match guards are not supported by the IR backend",
+                    stmt.line, stmt.col)
             if kind != "_" and kind in self.records:
                 raise IRUnsupported(
                     f"record destructuring pattern {kind} is not supported "

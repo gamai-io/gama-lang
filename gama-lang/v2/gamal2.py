@@ -277,6 +277,8 @@ def lex(src: str) -> list[Tok]:
             txt = src[j:i]
             out.append(Tok("KW" if txt in KEYWORDS else "IDENT", txt, start[0], start[1]))
             col += len(txt); continue
+        if src[i:i+3] == "...":
+            out.append(Tok("OP", "...", line, col)); i += 3; col += 3; continue
         two = src[i:i+2]
         if two in ("==","!=","<=",">=","&&","||",":=","->","=>"):
             out.append(Tok("OP", two, line, col)); i += 2; col += 2; continue
@@ -338,7 +340,47 @@ class Lambda: params: list; ret: str | None; effects: set | None; body: list; li
 @dataclass
 class Match: expr: Any; arms: list; line: int; col: int
 @dataclass
+class MatchArm:
+    """One ``match`` arm: pattern label, bindings, optional guard and body.
+
+    Unpacks like the historical ``(kind, bindings, body)`` tuple so existing
+    visitors keep working; the optional ``guard`` (an expression evaluated
+    after the bindings) is available as an attribute.
+    """
+    kind: Any
+    bindings: Any
+    body: list
+    guard: Any = None
+    line: int = 0
+    col: int = 0
+    def __iter__(self):
+        return iter((self.kind, self.bindings, self.body))
+    def __getitem__(self, index):
+        return (self.kind, self.bindings, self.body, self.guard)[index]
+    def __len__(self):
+        return 3
+@dataclass
 class RecordPattern: name: str; items: list; line: int; col: int
+@dataclass
+class ListPattern:
+    """``[]``, ``[a, b]``, ``[a, ...rest]`` and nested list patterns."""
+    items: list
+    rest: str | None = None
+    line: int = 0
+    col: int = 0
+@dataclass
+class LitPattern:
+    """A literal pattern item: ``0``, ``"x"``, ``true``, ``false``, ``null``."""
+    value: Any
+    kind: str
+    line: int = 0
+    col: int = 0
+@dataclass
+class VarPattern:
+    """A top-level variable pattern: binds the whole subject (e.g. ``x if ...``)."""
+    name: str
+    line: int = 0
+    col: int = 0
 @dataclass
 class EnumDecl: name: str; variants: list; line: int; col: int; exported: bool = False; type_params: list = field(default_factory=list); type_param_bounds: dict = field(default_factory=dict); export_name: str | None = None
 @dataclass
@@ -1044,48 +1086,143 @@ class Parser:
         while not self.at("OP", "}"):
             self.skip_seps()
             if self.at("OP", "}"): break
-            arm = self.take()
-            if arm.kind != "IDENT":
-                raise GamaError("match arm must be Ok(x), Err(e), Variant(x), Variant, Enum.Variant or _", arm.line, arm.col)
-            kind = arm.val
+            tok = self.peek()
             bindings = None
-            if kind == "_":
-                pass
-            elif self.at("OP", "("):
+            if self.at("OP", "["):
+                kind = self._list_pattern()
+            else:
+                if tok.kind != "IDENT":
+                    raise GamaError("match arm must be Ok(x), Err(e), Variant(x), Variant, Enum.Variant, [pattern] or _", tok.line, tok.col)
+                kind = self.take().val
+                if kind == "_":
+                    pass
+                elif self.at("OP", "("):
+                    self.take(); self.skip_nl()
+                    items = []
+                    while not self.at("OP", ")"):
+                        items.append(self._match_pattern_item())
+                        self.skip_nl()
+                        if self.at("OP", ","):
+                            self.take(); self.skip_nl()
+                        elif not self.at("OP", ")"):
+                            y = self.peek()
+                            raise GamaError(
+                                "expected ',' or ')' in match pattern",
+                                y.line, y.col)
+                    self.expect("OP", ")")
+                    if len(items) == 1 and isinstance(items[0], str):
+                        bindings = items[0]
+                    else:
+                        bindings = items
+                elif kind in ("Ok", "Err"):
+                    raise GamaError(
+                        f"{kind} match patterns require a binding: {kind}(x)",
+                        tok.line, tok.col)
+                elif "." not in kind and kind[0].islower():
+                    # A bare lower-case label is a variable pattern: it binds
+                    # the whole subject (``x if x > 0 => ...``).  Qualified
+                    # names (``sub.Color.Red``) stay enum variant labels.
+                    kind = VarPattern(kind, tok.line, tok.col)
+            guard = None
+            if self.at("KW", "if"):
                 self.take(); self.skip_nl()
-                items = []
-                while not self.at("OP", ")"):
-                    items.append(self._match_pattern_item())
-                    self.skip_nl()
-                    if self.at("OP", ","):
-                        self.take(); self.skip_nl()
-                    elif not self.at("OP", ")"):
-                        y = self.peek()
-                        raise GamaError(
-                            "expected ',' or ')' in match pattern",
-                            y.line, y.col)
-                self.expect("OP", ")")
-                if len(items) == 1 and isinstance(items[0], str):
-                    bindings = items[0]
-                else:
-                    bindings = items
-            elif kind in ("Ok", "Err"):
-                raise GamaError(
-                    f"{kind} match patterns require a binding: {kind}(x)",
-                    arm.line, arm.col)
+                guard = self.expr()
+                self.skip_nl()
             if self.at("OP", "=>"):
                 self.take(); self.skip_nl()
-            self.skip_nl(); body = self.block(); arms.append((kind, bindings, body))
+            self.skip_nl(); body = self.block()
+            arms.append(MatchArm(kind, bindings, body, guard,
+                                 tok.line, tok.col))
             if self.at("OP", ","): self.take()
             self.skip_seps()
         self.expect("OP", "}")
         return Match(subject, arms, x.line, x.col)
+    def _match_pattern(self):
+        """Parse one nested pattern: a list, literal, wildcard, name or record."""
+        tok = self.peek()
+        if self.at("OP", "["):
+            return self._list_pattern()
+        if (self.at("OP", "-") and self.peek(1).kind == "NUMBER"):
+            minus = self.take(); num = self.take()
+            return LitPattern(-num.val,
+                              "Decimal" if isinstance(num.val, Decimal)
+                              else "Int", minus.line, minus.col)
+        if tok.kind == "NUMBER":
+            self.take()
+            return LitPattern(tok.val,
+                              "Decimal" if isinstance(tok.val, Decimal)
+                              else "Int", tok.line, tok.col)
+        if tok.kind == "STRING":
+            self.take()
+            return LitPattern(tok.val, "Text", tok.line, tok.col)
+        if tok.kind == "KW" and tok.val in ("true", "false"):
+            self.take()
+            return LitPattern(tok.val == "true", "Bool", tok.line, tok.col)
+        if tok.kind == "KW" and tok.val == "null":
+            self.take()
+            return LitPattern(None, "Null", tok.line, tok.col)
+        if tok.kind != "IDENT":
+            raise GamaError(
+                "expected binding name, _, literal, list or record pattern",
+                tok.line, tok.col)
+        name = self.take().val
+        if self.at("OP", "("):
+            self.take(); self.skip_nl()
+            items = []
+            while not self.at("OP", ")"):
+                items.append(self._match_pattern_item())
+                self.skip_nl()
+                if self.at("OP", ","):
+                    self.take(); self.skip_nl()
+                elif not self.at("OP", ")"):
+                    y = self.peek()
+                    raise GamaError(
+                        "expected ',' or ')' in match pattern",
+                        y.line, y.col)
+            self.expect("OP", ")")
+            return RecordPattern(name, items, tok.line, tok.col)
+        return name
+    def _list_pattern(self):
+        """Parse ``[]``, ``[a, b]``, ``[a, ...rest]`` and nested lists."""
+        start = self.expect("OP", "[")
+        items = []; rest = None
+        self.skip_nl()
+        while not self.at("OP", "]"):
+            if self.at("OP", "..."):
+                self.take(); self.skip_nl()
+                tok = self.peek()
+                if tok.kind != "IDENT":
+                    raise GamaError(
+                        "rest pattern requires a binding name: ...rest",
+                        tok.line, tok.col)
+                rest = self.take().val
+                self.skip_nl()
+                if self.at("OP", ","):
+                    self.take(); self.skip_nl()
+                if not self.at("OP", "]"):
+                    y = self.peek()
+                    raise GamaError(
+                        "rest pattern must be the last element in a list "
+                        "pattern", y.line, y.col)
+                break
+            items.append(self._match_pattern())
+            self.skip_nl()
+            if self.at("OP", ","):
+                self.take(); self.skip_nl()
+            elif not self.at("OP", "]"):
+                y = self.peek()
+                raise GamaError("expected ',' or ']' in list pattern",
+                                y.line, y.col)
+        self.expect("OP", "]")
+        return ListPattern(items, rest, start.line, start.col)
     def _match_pattern_item(self):
         tok = self.peek()
-        if tok.kind != "IDENT":
+        if tok.kind != "IDENT" and not self.at("OP", "["):
             raise GamaError(
                 "expected binding name, _ or record pattern",
                 tok.line, tok.col)
+        if self.at("OP", "["):
+            return self._list_pattern()
         name = self.take().val
         if self.at("OP", "("):
             self.take(); self.skip_nl()
@@ -1527,6 +1664,12 @@ def _pattern_items(bindings):
     if isinstance(bindings, str):
         return [bindings]
     return list(bindings)
+
+def _arm_guard(arm):
+    """Return a match arm's optional guard, accepting old tuple arms."""
+    if isinstance(arm, MatchArm):
+        return arm.guard
+    return arm[3] if len(arm) > 3 else None
 
 BUILTINS = {
     "sql": ({"sql.read"}, "Table"),
@@ -2167,6 +2310,48 @@ class Checker:
                 raise GamaTypeError(
                     "match: invalid record pattern item", line, col)
         return out
+    def _check_list_pattern(self, pat, line, col, seen=None):
+        """Validate one list pattern and return its typed bindings.
+
+        Item bindings and rest bindings are ``List`` elements, so their static
+        type is ``Any`` (the language has no element-type parameter on List);
+        a ``...rest`` binding is itself a ``List``.  ``_`` skips a position.
+        Duplicate names are rejected across the whole arm, including nested
+        list patterns.
+        """
+        if seen is None:
+            seen = set()
+        out = []
+        for item in pat.items:
+            if isinstance(item, ListPattern):
+                out.extend(self._check_list_pattern(
+                    item, item.line, item.col, seen=seen))
+            elif isinstance(item, LitPattern):
+                if item.kind not in ("Int", "Decimal", "Text", "Bool", "Null"):
+                    raise GamaTypeError(
+                        "match: invalid literal list pattern item",
+                        item.line, item.col)
+            elif isinstance(item, RecordPattern):
+                out.extend(self._check_record_pattern(
+                    item.name, item.items, item.line, item.col, seen=seen))
+            elif item == "_":
+                continue
+            elif isinstance(item, str):
+                if item in seen:
+                    raise GamaTypeError(
+                        f"match: duplicate binding {item}", line, col)
+                seen.add(item)
+                out.append((item, "Any"))
+            else:
+                raise GamaTypeError(
+                    "match: invalid list pattern item", line, col)
+        if pat.rest not in (None, "_"):
+            if pat.rest in seen:
+                raise GamaTypeError(
+                    f"match: duplicate binding {pat.rest}", line, col)
+            seen.add(pat.rest)
+            out.append((pat.rest, "List"))
+        return out
     @staticmethod
     def _override_compatible(child_m, base_m):
         """An override must keep the exact parameter list and return type.
@@ -2603,7 +2788,11 @@ class Checker:
                 self._collect_stmt_effects(x, env, out)
         elif isinstance(s, Match):
             self._collect_expr_effects(s.expr, env, out)
-            for _kind, _bindings, body in s.arms:
+            for arm in s.arms:
+                _kind, _bindings, body = arm
+                guard = _arm_guard(arm)
+                if guard is not None:
+                    self._collect_expr_effects(guard, env, out)
                 for x in body:
                     self._collect_stmt_effects(x, env, out)
         elif isinstance(s, Try):
@@ -3032,14 +3221,27 @@ class Checker:
             return
         if isinstance(s, Match):
             t = self.expr(s.expr)
-            if (t not in ("Result", "Any") and t not in self.enums
-                    and t not in self.records):
+            if (t not in ("Result", "Any", "List")
+                    and t not in self.enums and t not in self.records
+                    and not any(isinstance(a[0], VarPattern) for a in s.arms)):
                 raise GamaTypeError(
-                    "match expects Result, enum or record", s.line, s.col)
-            for kind, bindings, body in s.arms:
+                    "match expects Result, enum, record or List", s.line, s.col)
+            for arm in s.arms:
+                kind, bindings, body = arm
+                guard = _arm_guard(arm)
                 names = _binding_list(bindings)
-                payload_types = ()
-                if kind == "_":
+                typed_bindings = []
+                if isinstance(kind, ListPattern):
+                    if t not in ("List", "Any"):
+                        raise GamaTypeError(
+                            f"match: list pattern does not match subject type "
+                            f"{t}", s.line, s.col)
+                    seen = set()
+                    typed_bindings = self._check_list_pattern(
+                        kind, s.line, s.col, seen=seen)
+                elif isinstance(kind, VarPattern):
+                    typed_bindings = [(kind.name, t)]
+                elif kind == "_":
                     if names:
                         raise GamaTypeError(
                             "match: _ pattern cannot bind a payload",
@@ -3050,14 +3252,8 @@ class Checker:
                             f"match: {kind} record pattern does not match "
                             f"subject type {t}", s.line, s.col)
                     seen = set()
-                    record_bindings = self._check_record_pattern(
+                    typed_bindings = self._check_record_pattern(
                         kind, bindings, s.line, s.col, seen=seen)
-                    self.push()
-                    for name, ptype in record_bindings:
-                        self.set(name, ptype or "Any")
-                    [self.stmt(x, allowed) for x in body]
-                    self.pop()
-                    continue
                 elif kind in ("Ok", "Err"):
                     if t not in ("Result", "Any"):
                         raise GamaTypeError(
@@ -3067,7 +3263,7 @@ class Checker:
                         raise GamaTypeError(
                             f"match: {kind} pattern binds exactly one value: "
                             f"{kind}(x)", s.line, s.col)
-                    payload_types = ("Any",)
+                    typed_bindings = [(names[0], "Any")]
                 else:
                     for item in _pattern_items(bindings):
                         if isinstance(item, RecordPattern):
@@ -3107,9 +3303,16 @@ class Checker:
                             f"{len(payload_types)} payload binding"
                             f"{'s' if len(payload_types) != 1 else ''}, "
                             f"got {len(names)}", s.line, s.col)
+                    typed_bindings = list(zip(names, payload_types))
                 self.push()
-                for name, ptype in zip(names, payload_types):
+                for name, ptype in typed_bindings:
                     self.set(name, ptype or "Any")
+                if guard is not None:
+                    gt = self.expr(guard)
+                    if gt != "Bool":
+                        raise GamaTypeError(
+                            f"match guard must be Bool, got {gt}",
+                            guard.line, guard.col)
                 [self.stmt(x, allowed) for x in body]
                 self.pop()
             return
@@ -4296,11 +4499,18 @@ def _rename_refs(node, mapping):
     if isinstance(node, Var):
         return replace(node, name=_rename_qualified(node.name, mapping))
     if isinstance(node, Match):
+        def _rename_arm(arm):
+            kind, bindings, body = arm
+            return MatchArm(
+                (_rename_qualified(kind, mapping)
+                 if isinstance(kind, str) else kind),
+                bindings, _rename_refs(body, mapping),
+                (_rename_refs(_arm_guard(arm), mapping)
+                 if _arm_guard(arm) is not None else None),
+                getattr(arm, "line", 0), getattr(arm, "col", 0))
         return replace(
             node, expr=_rename_refs(node.expr, mapping),
-            arms=[(_rename_qualified(kind, mapping), bindings,
-                   _rename_refs(body, mapping))
-                  for kind, bindings, body in node.arms])
+            arms=[_rename_arm(arm) for arm in node.arms])
     if isinstance(node, TypeAlias):
         own = set(getattr(node, "type_params", None) or [])
         pmap = {k: v for k, v in mapping.items() if k not in own}
@@ -5019,6 +5229,53 @@ class Interpreter:
             else:
                 local.set(item, value)
         return True
+    def _match_pattern_value(self, value, item, local):
+        """Match one nested pattern item against ``value``, binding into local."""
+        if isinstance(item, ListPattern):
+            return self._match_list_value(value, item, local)
+        if isinstance(item, LitPattern):
+            if item.kind in ("Int", "Decimal"):
+                return (isinstance(value, (int, Decimal))
+                        and not isinstance(value, bool)
+                        and value == item.value)
+            if item.kind == "Text":
+                return isinstance(value, str) and value == item.value
+            if item.kind == "Bool":
+                return isinstance(value, bool) and value == item.value
+            if item.kind == "Null":
+                return value is None
+            return value == item.value
+        if isinstance(item, RecordPattern):
+            return self._match_record_value(
+                value, item.name, item.items, local)
+        if item == "_":
+            return True
+        if isinstance(item, str):
+            local.set(item, value)
+            return True
+        raise GamaRuntimeError("match: invalid list pattern item")
+    def _match_list_value(self, seq, pat, local):
+        """Match ``seq`` against a list pattern and bind into ``local``.
+
+        A fixed pattern requires an exact length; with ``...rest`` the subject
+        may be longer and the tail is bound as a fresh List.  Nested list
+        patterns recurse, literals compare by equality, ``_`` skips and plain
+        names bind the element value.
+        """
+        if not isinstance(seq, (list, tuple)):
+            return False
+        items = pat.items
+        if pat.rest is None:
+            if len(seq) != len(items):
+                return False
+        elif len(seq) < len(items):
+            return False
+        for item, value in zip(items, seq):
+            if not self._match_pattern_value(value, item, local):
+                return False
+        if pat.rest not in (None, "_"):
+            local.set(pat.rest, list(seq[len(items):]))
+        return True
     def stmt(self, s, env):
         self._tick(s.line, s.col)
         if isinstance(s, Let): env.set(s.name, self.expr(s.expr, env))
@@ -5064,14 +5321,27 @@ class Interpreter:
                 except BreakSignal: break
         elif isinstance(s, Match):
             rv = self.expr(s.expr, env)
-            if not isinstance(rv, (ResultVal, EnumVal, RecordVal)):
+            if (not isinstance(rv, (ResultVal, EnumVal, RecordVal, list, tuple))
+                    and not any(isinstance(a[0], VarPattern) for a in s.arms)):
                 # Keep the historical message for non-Result subjects; the
                 # IR-subset parity tests compare this text byte-for-byte.
                 raise GamaRuntimeError(
                     "match expects Result", s.line, s.col)
-            for kind, bindings, body in s.arms:
+            for arm in s.arms:
+                kind, bindings, body = arm
+                guard = _arm_guard(arm)
                 local = None
-                if kind == "_":
+                if isinstance(kind, VarPattern):
+                    hit = True
+                    local = Env(env)
+                    local.set(kind.name, rv)
+                elif isinstance(kind, ListPattern):
+                    if isinstance(rv, (list, tuple)):
+                        local = Env(env)
+                        hit = self._match_list_value(rv, kind, local)
+                    else:
+                        hit = False
+                elif kind == "_":
                     hit = True
                 elif isinstance(rv, RecordVal):
                     if kind in self.records:
@@ -5119,6 +5389,14 @@ class Interpreter:
                                 f"got {len(names)}", s.line, s.col)
                         for name, value in zip(names, rv.payloads):
                             local.set(name, value)
+                    if guard is not None:
+                        gv = self.expr(guard, local)
+                        if not isinstance(gv, bool):
+                            raise GamaRuntimeError(
+                                "match guard must be Bool", guard.line,
+                                guard.col)
+                        if not gv:
+                            continue
                     for x in body: self.stmt(x, local)
                     return
             raise GamaRuntimeError("match: no arm matched", s.line, s.col)
