@@ -933,7 +933,8 @@ def _set_record_extends(decl, parent):
 
 
 def _record_extends(decl):
-    return getattr(decl, "extends", None)
+    return (getattr(decl, "extends", None)
+            or getattr(decl, "parent", None))
 
 
 def _record_extends_map(text: str):
