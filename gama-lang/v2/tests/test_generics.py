@@ -10,8 +10,8 @@ parameter and return annotations (and in ``let`` annotations inside the body),
 but the checker never instantiates them: calls accept any argument type and
 the call result is inferred from the argument where possible, otherwise
 ``Any``.  Explicit call type arguments (``id<Int>(5)``) are supported and
-covered in ``test_type_args.py``.  Not supported (and intentionally
-rejected/ignored): generic records or enums, bounds, and generic lambdas.
+covered in ``test_type_args.py``; generic lambdas (``fn<T>(...)``) are covered
+in ``test_generic_lambdas.py``.  Not supported: bounds.
 """
 import pathlib
 import sys
@@ -194,10 +194,11 @@ class GenericFunctionTests(unittest.TestCase):
         self.assertNotIn("<", out)
         self.assertIn("fn add(a: Int, b: Int) -> Int", out)
 
-    # -- unsupported surface stays unsupported ---------------------------
-    def test_generic_lambda_is_not_supported(self):
-        with self.assertRaises(G.GamaError):
-            G.check('let f = fn<T>(x: T) -> T { return x }\n')
+    # -- generic lambdas are supported (details in test_generic_lambdas) --
+    def test_generic_lambda_is_supported(self):
+        it = G.run('let f = fn<T>(x: T) -> T { return x }\n'
+                   'print f(1)\n')
+        self.assertEqual(it.out, ["1"])
 
     def test_explicit_call_type_arguments_are_supported(self):
         it = G.run('fn id<T>(x: T) -> T { return x }\nprint id<Int>(1)\n')

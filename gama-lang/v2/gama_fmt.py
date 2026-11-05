@@ -1726,9 +1726,10 @@ class _AstFormatter:
         """
         ret = (" -> " + node.ret) if node.ret else ""
         inner = close_indent + 2
+        head = "fn" + self._type_params_text(node)
         lines = None
         if wrap_params and node.params:
-            lines = ["fn("]
+            lines = [head + "("]
             inline_lines: set[int] = set()
             pspan = self._lambda_param_span(node)
             if pspan is not None:
@@ -1777,7 +1778,7 @@ class _AstFormatter:
                         lines[-1] += ","
             close = " " * close_indent + ")" + ret
         else:
-            close = "fn(" + self._params_text(node.params) + ")" + ret
+            close = head + "(" + self._params_text(node.params) + ")" + ret
         check_col = base_col if lines is None else 0
 
         effects = node.effects
@@ -1836,7 +1837,8 @@ class _AstFormatter:
             return single
 
         ret = (" -> " + node.ret) if node.ret else ""
-        head_inline = "fn(" + self._params_text(node.params) + ")" + ret
+        head_inline = ("fn" + self._type_params_text(node)
+                       + "(" + self._params_text(node.params) + ")" + ret)
         opener = " effects {" if node.effects else " {"
         wrap_params = bool(node.params) and (
             self._lambda_params_have_comment(node)
@@ -2645,8 +2647,9 @@ class _AstFormatter:
 
     def _inline_lambda(self, node) -> str:
         ret = (" -> " + node.ret) if node.ret else ""
-        header = "fn(" + self._params_text(node.params) + ")" + ret + \
-            self._effects_text(node.effects) + " { "
+        header = ("fn" + self._type_params_text(node)
+                  + "(" + self._params_text(node.params) + ")" + ret
+                  + self._effects_text(node.effects) + " { ")
         body = self._inline_block(node.body)
         return header + body + " }"
 

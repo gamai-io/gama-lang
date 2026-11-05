@@ -284,7 +284,7 @@ class Param: name: str; type_name: str; default: Any = None
 @dataclass
 class Fn: name: str; params: list; ret: str | None; effects: set | None; body: list; line: int; col: int; type_params: list = field(default_factory=list); exported: bool = False
 @dataclass
-class Lambda: params: list; ret: str | None; effects: set | None; body: list; line: int; col: int
+class Lambda: params: list; ret: str | None; effects: set | None; body: list; line: int; col: int; type_params: list = field(default_factory=list)
 @dataclass
 class Match: expr: Any; arms: list; line: int; col: int
 @dataclass
@@ -354,6 +354,17 @@ class Parser:
             if (toks[j].kind == "KW" and toks[j].val in ("fn", "make")
                     and toks[j + 1].kind == "IDENT"
                     and toks[j + 2].kind == "OP" and toks[j + 2].val == "<"):
+                self.generic_fn_names.add(toks[j + 1].val)
+        # A generic lambda bound with ``let id = fn<T>(...)`` can also be
+        # called with explicit type arguments (``id<Int>(5)``).  Only names
+        # introduced by that exact shape are registered, so ordinary
+        # comparisons (``a < b``) keep their meaning.
+        for j in range(len(toks) - 4):
+            if (toks[j].kind == "KW" and toks[j].val == "let"
+                    and toks[j + 1].kind == "IDENT"
+                    and toks[j + 2].kind == "OP" and toks[j + 2].val == "="
+                    and toks[j + 3].kind == "KW" and toks[j + 3].val == "fn"
+                    and toks[j + 4].kind == "OP" and toks[j + 4].val == "<"):
                 self.generic_fn_names.add(toks[j + 1].val)
     def peek(self, k=0): return self.t[min(self.i+k, len(self.t)-1)]
     def at(self, kind, val=None):
@@ -645,8 +656,36 @@ class Parser:
         except GamaError:
             self.i = save
             return None
+    def _lambda_ahead(self):
+        """True when the current ``fn`` token starts a lambda expression.
+
+        Accepts both ``fn(...)`` and the generic form ``fn<T>(...)``.  A
+        named function declaration (``fn id(...)``) never matches because the
+        token after ``fn`` must be ``(`` or a complete ``<...>`` list directly
+        followed by ``(``.
+        """
+        if not self.at("KW", "fn"):
+            return False
+        k = 1
+        if self.peek(k).kind == "OP" and self.peek(k).val == "<":
+            depth = 0
+            while k < len(self.t):
+                tok = self.peek(k)
+                if tok.kind == "OP" and tok.val == "<":
+                    depth += 1
+                elif tok.kind == "OP" and tok.val == ">":
+                    depth -= 1
+                    if depth == 0:
+                        k += 1
+                        break
+                k += 1
+            if depth != 0:
+                return False
+        return self.peek(k).kind == "OP" and self.peek(k).val == "("
     def lambda_expr(self):
-        x = self.take(); self.expect("OP", "("); self.skip_nl()
+        x = self.take()  # `fn`
+        type_params = self.type_params()
+        self.expect("OP", "("); self.skip_nl()
         params = []
         if not self.at("OP", ")"):
             while True:
@@ -666,7 +705,8 @@ class Parser:
                 effects.add(self.expect("IDENT").val); self.skip_nl()
                 if self.at("OP", ","): self.take(); self.skip_nl()
             self.expect("OP", "}")
-        return Lambda(params, ret, effects, self.block(), x.line, x.col)
+        return Lambda(params, ret, effects, self.block(), x.line, x.col,
+                      type_params)
     def if_stmt(self):
         x = self.take(); cond = self.expr(); self.skip_nl(); then = self.block(); other = None
         save = self.i; self.skip_seps()
@@ -843,7 +883,7 @@ class Parser:
         return e
     def primary(self):
         x = self.peek()
-        if x.kind == "KW" and x.val == "fn" and self.peek(1).kind == "OP" and self.peek(1).val == "(":
+        if x.kind == "KW" and x.val == "fn" and self._lambda_ahead():
             return self.lambda_expr()
         if x.kind == "NUMBER": self.take(); return Literal(x.val, x.line, x.col)
         if x.kind == "STRING": self.take(); return Literal(x.val, x.line, x.col)
@@ -1535,8 +1575,25 @@ class Checker:
         # Stack of generic type-parameter scopes. Names are erased to ``Any``
         # wherever they appear as a type annotation.
         self.type_params: list[set[str]] = []
-    def push(self): self.scope.append({})
-    def pop(self): self.scope.pop()
+        # Lambda expressions bound with ``let``/``:=`` are remembered per
+        # lexical scope so calls through the variable can infer type-parameter
+        # results (erasure) without leaking across shadowing blocks.
+        self.lambda_scopes: list[dict[str, Lambda]] = [{}]
+    def push(self):
+        self.scope.append({})
+        self.lambda_scopes.append({})
+    def pop(self):
+        self.scope.pop()
+        self.lambda_scopes.pop()
+    def _get_lambda(self, n):
+        for scope in reversed(self.lambda_scopes):
+            if n in scope:
+                return scope[n]
+        return None
+    def _set_lambda(self, n, lmb):
+        self.lambda_scopes[-1][n] = lmb
+    def _drop_lambda(self, n):
+        self.lambda_scopes[-1].pop(n, None)
     def _type_param_names(self):
         out = set()
         for scope in self.type_params:
@@ -1854,6 +1911,7 @@ class Checker:
             # lambdas can refer to themselves.
             if isinstance(s.expr, Lambda):
                 self.set(s.name, tn or "Function")
+                self._set_lambda(s.name, s.expr)
                 t = self.expr(s.expr)
                 if tn and not self.compat(t, tn):
                     raise GamaTypeError(f"{s.name}: {t} != {s.type_name}", s.line, s.col)
@@ -1862,8 +1920,14 @@ class Checker:
                 t = self.expr(s.expr)
                 if tn and not self.compat(t, tn): raise GamaTypeError(f"{s.name}: {t} != {s.type_name}", s.line, s.col)
                 self.set(s.name, tn or t)
+                self._drop_lambda(s.name)
         elif isinstance(s, Assign):
             t = self.expr(s.expr)
+            if "." not in s.name:
+                if isinstance(s.expr, Lambda):
+                    self._set_lambda(s.name, s.expr)
+                else:
+                    self._drop_lambda(s.name)
             cur = self.get(s.name)
             if cur is None and "." in s.name:
                 self.check_field_assign(s, t)
@@ -2060,24 +2124,101 @@ class Checker:
             raise GamaTypeError(f"unknown field {field!r} on {t}",
                                 s.line, s.col)
         return self.resolve_field_type(t, fmap[field])
+    def _lambda_call(self, lmb, args, e, row=None):
+        """Check a call whose callee is a lambda expression/value.
+
+        Type parameters are erased to ``Any``; the result type is inferred from
+        the argument types when the return annotation is a type parameter, and
+        explicit call type arguments (``id<Int>(5)``) bind them directly.
+        """
+        required = sum(1 for p in lmb.params if p.default is None)
+        if not (required <= len(args) <= len(lmb.params)):
+            raise GamaTypeError(
+                f"lambda expects {required}..{len(lmb.params)} args, "
+                f"got {len(args)}", e.line, e.col)
+        tparams = list(getattr(lmb, "type_params", None) or [])
+        tset = set(tparams)
+        explicit = getattr(e, "type_args", None)
+        bindings = {}
+        if explicit is not None:
+            if not tparams:
+                raise GamaTypeError(
+                    "lambda is not generic; it takes no type arguments",
+                    e.line, e.col)
+            if len(explicit) != len(tparams):
+                raise GamaTypeError(
+                    f"lambda expects {len(tparams)} type argument"
+                    f"{'s' if len(tparams) != 1 else ''}, got {len(explicit)}",
+                    e.line, e.col)
+            for t in explicit:
+                if not self.is_type_name(t):
+                    raise GamaTypeError(
+                        f"unknown type argument {t!r} for lambda",
+                        e.line, e.col)
+            bindings = dict(zip(tparams, explicit))
+        for p, a in zip(lmb.params, args):
+            at = self.expr(a, row)
+            pbase, _pargs = _type_ref_parts(p.type_name)
+            if explicit is None and pbase in tset:
+                if at != "Any":
+                    bindings.setdefault(pbase, at)
+            elif _type_ref_uses_param(p.type_name, tset):
+                if explicit is not None:
+                    want = _erase_type_ref(
+                        _subst_type_ref(p.type_name, bindings), tset)
+                else:
+                    want = _erase_type_ref(p.type_name, tset)
+                if not self.compat(at, want):
+                    raise GamaTypeError(
+                        f"lambda: {p.name} {at} != {want}", e.line, e.col)
+            elif not self.compat(at, p.type_name):
+                raise GamaTypeError(
+                    f"lambda: {p.name} {at} != {p.type_name}", e.line, e.col)
+        self.effects |= (lmb.effects or set())
+        rt = lmb.ret or "Any"
+        if rt in tset:
+            return bindings.get(rt, "Any")
+        return _erase_type_ref(rt, tset)
+
     def expr(self, e, row=None) -> str:
         if isinstance(e, Literal): return tname(e.value)
         if isinstance(e, Lambda):
+            seen_tp = set()
+            for tp in (getattr(e, "type_params", None) or []):
+                if tp in seen_tp:
+                    raise GamaTypeError(
+                        f"duplicate type parameter {tp}", e.line, e.col)
+                seen_tp.add(tp)
+            seen_params = set()
             for p in e.params:
-                self._check_type_annotation(p.type_name, e.line, e.col)
-            self._check_type_annotation(e.ret, e.line, e.col)
+                if p.name in seen_params:
+                    raise GamaTypeError(
+                        f"duplicate parameter {p.name}", e.line, e.col)
+                seen_params.add(p.name)
+            for p in e.params:
+                self._check_type_annotation(
+                    p.type_name, e.line, e.col, seen_tp)
+            self._check_type_annotation(e.ret, e.line, e.col, seen_tp)
             self.push()
-            for p in e.params: self.set(p.name, self.erase_type(p.type_name))
-            old = self.effects; self.effects = set()
-            old_ret = self.ret_type; self.ret_type = self.erase_type(e.ret or "Any")
-            for s in e.body: self.stmt(s, e.effects or set())
-            used = set(self.effects); self.effects = old; self.ret_type = old_ret
-            allowed = e.effects or set()
-            self.pop()
-            bad = used - allowed
-            if bad:
-                raise GamaEffectError(
-                    "lambda uses undeclared effects: " + ",".join(sorted(bad)), e.line, e.col)
+            self.type_params.append(seen_tp)
+            try:
+                for p in e.params:
+                    self.set(p.name, self.erase_type(p.type_name))
+                old = self.effects; self.effects = set()
+                old_ret = self.ret_type
+                self.ret_type = self.erase_type(e.ret or "Any")
+                for s in e.body: self.stmt(s, e.effects or set())
+                used = set(self.effects)
+                self.effects = old; self.ret_type = old_ret
+                allowed = e.effects or set()
+                bad = used - allowed
+                if bad:
+                    raise GamaEffectError(
+                        "lambda uses undeclared effects: "
+                        + ",".join(sorted(bad)), e.line, e.col)
+            finally:
+                self.type_params.pop()
+                self.pop()
             return "Function"
         if isinstance(e, ListExpr):
             types = {self.expr(x, row) for x in e.items}
@@ -2257,6 +2398,11 @@ class Checker:
                         return TableType(DEMO_ROWS[0].keys())
                     return TableType(None)
                 return rt
+            lmb = self._get_lambda(e.name)
+            if (lmb is not None and self.get(e.name) in (None, "Function")
+                    and (getattr(lmb, "type_params", None)
+                         or getattr(e, "type_args", None) is not None)):
+                return self._lambda_call(lmb, e.args, e, row)
             f = self.funcs.get(e.name)
             if not f:
                 vt = self.get(e.name)
@@ -2371,16 +2517,13 @@ class Checker:
                 raise GamaTypeError("expression is not callable", e.line, e.col)
             callee = e.callee
             if isinstance(callee, Lambda):
-                required = sum(1 for p in callee.params if p.default is None)
-                if not (required <= len(e.args) <= len(callee.params)):
-                    raise GamaTypeError(
-                        f"lambda expects {required}..{len(callee.params)} args, got {len(e.args)}",
-                        e.line, e.col)
-                for p, a in zip(callee.params, e.args):
-                    at = self.expr(a)
-                    if not self.compat(at, p.type_name):
-                        raise GamaTypeError(f"lambda: {p.name} {at} != {p.type_name}", e.line, e.col)
-                return callee.ret or "Any"
+                return self._lambda_call(callee, e.args, e, row)
+            bound_lambda = (self._get_lambda(callee.name)
+                            if isinstance(callee, Var) else None)
+            if (bound_lambda is not None
+                    and self.get(callee.name) in (None, "Function")
+                    and getattr(bound_lambda, "type_params", None)):
+                return self._lambda_call(bound_lambda, e.args, e, row)
             if isinstance(callee, Var) and callee.name in self.funcs:
                 f = self.funcs[callee.name]
                 required = sum(1 for p in f.params if p.default is None)
