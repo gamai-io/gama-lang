@@ -1368,6 +1368,14 @@ class _AstFormatter:
                  for n in names]
         return ("<" + ", ".join(parts) + ">") if parts else ""
 
+    def _record_head(self, s) -> str:
+        """``Name<...> [extends Parent]`` for a record declaration header."""
+        head = s.name + self._type_params_text(s)
+        parent = getattr(s, "parent", None)
+        if parent:
+            head += " extends " + parent
+        return head
+
     def _type_args_text(self, s) -> str:
         args = getattr(s, "type_args", None) or []
         return ("<" + ", ".join(args) + ">") if args else ""
@@ -2097,7 +2105,7 @@ class _AstFormatter:
         parts = [fn + ": " + ft for fn, ft in s.fields]
         for m in getattr(s, "methods", []):
             parts.append(self._method_inline_text(m))
-        name = s.name + self._type_params_text(s)
+        name = self._record_head(s)
         if not parts:
             return prefix + "record " + name + " { }"
         return prefix + "record " + name + " { " + ", ".join(parts) + " }"
@@ -2256,8 +2264,8 @@ class _AstFormatter:
         ind = _UNIT * indent
         if getattr(s, "methods", []):
             prefix = "export " if getattr(s, "exported", False) else ""
-            self._emit(ind + prefix + "record " + s.name
-                       + self._type_params_text(s) + " {", [s.line])
+            self._emit(ind + prefix + "record " + self._record_head(s)
+                       + " {", [s.line])
             for fn, ft in s.fields:
                 self._emit(_UNIT * (indent + 1) + fn + ": " + ft)
             for m in s.methods:
@@ -2272,7 +2280,7 @@ class _AstFormatter:
             return
         prefix = "export " if getattr(s, "exported", False) else ""
         inner = len(ind) + 2
-        lines = [prefix + "record " + s.name + self._type_params_text(s) + " {"]
+        lines = [prefix + "record " + self._record_head(s) + " {"]
         self._render_decl_body(
             s, s.fields, self._record_field_positions(s),
             [fn + ": " + ft for fn, ft in s.fields],

@@ -112,6 +112,52 @@ def _record_value_str(v) -> str:
         return json.dumps(v, ensure_ascii=False, default=str)
     return str(v)
 
+def _record_chain(records, name):
+    """Return ``(chain, ok)`` for ``name``: ``[child, parent, ...]``.
+
+    ``ok`` is False when a parent is missing or the chain cycles.  The chain
+    stops before the repeated name so callers can still report a location.
+    """
+    chain, seen, cur = [], set(), name
+    while cur is not None:
+        if cur in seen:
+            return chain, False
+        seen.add(cur)
+        rec = records.get(cur)
+        if rec is None:
+            return chain, False
+        chain.append(rec)
+        cur = getattr(rec, "parent", None)
+    return chain, True
+
+
+def _record_all_fields(records, name):
+    """Flattened field list for ``name``: inherited fields first, then own.
+
+    Inherited fields come from the whole chain in root-first order; the return
+    value is ``(fields, ok)`` like :func:`_record_chain`.
+    """
+    chain, ok = _record_chain(records, name)
+    fields = []
+    for rec in reversed(chain):
+        fields.extend(rec.fields)
+    return fields, ok
+
+
+def _find_record_method(records, name, method_name):
+    """Return ``(declaring_record_name, method)`` walking up the parent chain.
+
+    The child's own method wins (override); otherwise the nearest ancestor
+    method is used.  ``None`` when no record in the chain declares it.
+    """
+    chain, _ok = _record_chain(records, name)
+    for rec in chain:
+        for m in getattr(rec, "methods", None) or []:
+            if m.name == method_name:
+                return rec.name, m
+    return None
+
+
 _NO_PAYLOAD = object()
 _NO_METHOD = object()
 
@@ -302,7 +348,7 @@ class Try: expr: Any; line: int; col: int
 @dataclass
 class Method: name: str; params: list; ret: str | None; effects: set | None; body: list; line: int; col: int; end_line: int = 0; end_col: int = 0
 @dataclass
-class RecordDecl: name: str; fields: list; line: int; col: int; exported: bool = False; methods: list = field(default_factory=list); type_params: list = field(default_factory=list); type_param_bounds: dict = field(default_factory=dict)
+class RecordDecl: name: str; fields: list; line: int; col: int; exported: bool = False; methods: list = field(default_factory=list); type_params: list = field(default_factory=list); type_param_bounds: dict = field(default_factory=dict); parent: str | None = None
 @dataclass
 class RecordLit: name: str; fields: list; line: int; col: int
 @dataclass
@@ -343,6 +389,10 @@ class Parser:
                             k += 1
                             break
                     k += 1
+            if (k + 1 < len(toks) and toks[k].kind == "IDENT"
+                    and toks[k].val == "extends"
+                    and toks[k + 1].kind == "IDENT"):
+                k += 2
             if (k < len(toks) and toks[k].kind == "OP"
                     and toks[k].val == "{"):
                 self.record_names.add(toks[j + 1].val)
@@ -435,8 +485,11 @@ class Parser:
             return replace(inner, exported=True)
         if (x.kind == "IDENT" and x.val == "record"
                 and self.peek(1).kind == "IDENT"
-                and self.peek(2).kind == "OP"
-                and self.peek(2).val in ("{", "<")):
+                and ((self.peek(2).kind == "OP"
+                      and self.peek(2).val in ("{", "<"))
+                     or (self.peek(2).kind == "IDENT"
+                         and self.peek(2).val == "extends"
+                         and self.peek(3).kind == "IDENT"))):
             return self.record_decl()
         if x.kind == "KW" and x.val == "import":
             self.take(); path = self.expect("STRING").val
@@ -493,6 +546,14 @@ class Parser:
         name = self.expect("IDENT").val
         type_params, type_param_bounds = self.type_params(allow_bounds=True)
         self.skip_nl()
+        parent = None
+        if self.at("IDENT", "extends"):
+            self.take()
+            ptok = self.peek()
+            if ptok.kind != "IDENT":
+                raise GamaError("parent record name expected", ptok.line, ptok.col)
+            parent = self.take().val
+            self.skip_nl()
         self.expect("OP", "{")
         self.skip_seps()
         fields = []; methods = []
@@ -515,7 +576,8 @@ class Parser:
         self.expect("OP", "}")
         return RecordDecl(name, fields, x.line, x.col, methods=methods,
                           type_params=type_params,
-                          type_param_bounds=type_param_bounds)
+                          type_param_bounds=type_param_bounds,
+                          parent=parent)
     def method(self):
         x = self.take()  # `fn`
         name_tok = self.peek()
@@ -1629,6 +1691,9 @@ class Checker:
         # lexical scope so calls through the variable can infer type-parameter
         # results (erasure) without leaking across shadowing blocks.
         self.lambda_scopes: list[dict[str, Lambda]] = [{}]
+        # Flattened field lists (inherited first) per record, filled once the
+        # whole program is registered so forward parent references work.
+        self._all_fields: dict[str, list] = {}
     def push(self):
         self.scope.append({})
         self.lambda_scopes.append({})
@@ -1657,6 +1722,38 @@ class Checker:
     def record_params(self, name):
         rec = self.records.get(name)
         return set(getattr(rec, "type_params", None) or [])
+    def record_all_fields(self, name):
+        """Flattened ``(field, type)`` list: inherited fields first.
+
+        Recomputed lazily and cached after :meth:`program` has validated the
+        inheritance graph, so a parent declared later in the file resolves.
+        """
+        cached = self._all_fields.get(name)
+        if cached is not None:
+            return cached
+        fields, _ok = _record_all_fields(self.records, name)
+        self._all_fields[name] = fields
+        return fields
+    def is_subrecord(self, child, parent):
+        """True when ``child`` nominally extends ``parent`` (reflexive false)."""
+        if child == parent or child not in self.records:
+            return False
+        chain, _ok = _record_chain(self.records, child)
+        return any(rec.name == parent for rec in chain[1:])
+    @staticmethod
+    def _override_compatible(child_m, base_m):
+        """An override must keep the exact parameter list and return type.
+
+        Parameter types and the return type are compared as written (``Any``
+        when absent).  ``self`` is excluded because it is bound by the receiver
+        and must already name the child record.
+        """
+        cp, bp = child_m.params[1:], base_m.params[1:]
+        if len(cp) != len(bp):
+            return False
+        if any(a.type_name != b.type_name for a, b in zip(cp, bp)):
+            return False
+        return (child_m.ret or "Any") == (base_m.ret or "Any")
     def resolve_field_type(self, rec_name, ft, bindings=None):
         """Static type of a record field after erasure.
 
@@ -1873,6 +1970,68 @@ class Checker:
                             e.src = getattr(s, "_src", None)
                             raise e
                 self.records[s.name] = s
+        # Resolve nominal inheritance once every record is known, so a parent
+        # may be declared later in the file (and may be namespaced).  This also
+        # flattens fields (inherited first) and validates overrides.
+        self._all_fields = {}
+        for s in stmts:
+            if not isinstance(s, RecordDecl):
+                continue
+            seen_chain = [s.name]
+            cur = getattr(s, "parent", None)
+            while cur:
+                if cur in seen_chain:
+                    e = GamaTypeError(
+                        f"record {s.name}: inheritance cycle", s.line, s.col)
+                    e.src = getattr(s, "_src", None)
+                    raise e
+                seen_chain.append(cur)
+                prec = self.records.get(cur)
+                if prec is None:
+                    e = GamaTypeError(
+                        f"record {s.name}: unknown parent {cur}",
+                        s.line, s.col)
+                    e.src = getattr(s, "_src", None)
+                    raise e
+                if getattr(prec, "type_params", None):
+                    e = GamaTypeError(
+                        f"record {s.name}: cannot extend generic record {cur}",
+                        s.line, s.col)
+                    e.src = getattr(s, "_src", None)
+                    raise e
+                cur = getattr(prec, "parent", None)
+            if not getattr(s, "parent", None):
+                continue
+            fields, _ok = _record_all_fields(self.records, s.name)
+            seen_fields = set()
+            for fn, _ft in fields:
+                if fn in seen_fields:
+                    e = GamaTypeError(
+                        f"record {s.name}: duplicate field {fn}",
+                        s.line, s.col)
+                    e.src = getattr(s, "_src", None)
+                    raise e
+                seen_fields.add(fn)
+            for m in s.methods:
+                if m.name in seen_fields:
+                    e = GamaTypeError(
+                        f"record {s.name}: method {m.name} collides with a field",
+                        m.line, m.col)
+                    e.src = getattr(s, "_src", None)
+                    raise e
+                found = _find_record_method(
+                    self.records, s.parent, m.name)
+                if found is None:
+                    continue
+                _decl, base_m = found
+                if not self._override_compatible(m, base_m):
+                    e = GamaTypeError(
+                        f"record {s.name}: method {m.name} overrides "
+                        f"{_decl}.{m.name} with an incompatible signature",
+                        m.line, m.col)
+                    e.src = getattr(s, "_src", None)
+                    raise e
+            self._all_fields[s.name] = fields
         # Field annotations may refer to records declared later in the file, so
         # generic-reference arity is validated after every record is known.
         for s in stmts:
@@ -2246,15 +2405,16 @@ class Checker:
             return None
         if rt not in self.records:
             return None
-        rec = self.records[rt]
-        m = next((x for x in rec.methods if x.name == method_name), None)
-        if m is None:
+        found = _find_record_method(self.records, rt, method_name)
+        if found is None:
             raise GamaTypeError(
                 f"unknown method {method_name!r} on {rt}", e.line, e.col)
         # Remember the static receiver type: methods dispatch on the static
         # target type even when the runtime value is a structurally compatible
         # record (e.g. a Point3 value held in a ``Point`` binding).
         e._dispatch_record = rt
+        _decl, m = found
+
         params = m.params[1:]
         required = sum(1 for p in params if p.default is None)
         if not (required <= len(e.args) <= len(params)):
@@ -2277,6 +2437,8 @@ class Checker:
         return (want in ("Any", got)
                 or (want in NUM and got in NUM)
                 or (want == "List" and got in ("List", "Table"))
+                or (got in self.records and want in self.records
+                    and self.is_subrecord(got, want))
                 or self._structural_compat(got, want, set()))
 
     def _structural_compat(self, got, want, seen):
@@ -2320,6 +2482,7 @@ class Checker:
         if want == "List" and got in ("List", "Table"):
             return True
         return self._structural_compat(got, want, seen)
+
     def _check_type_bound(self, fname, tp, got, bounds, line, col):
         bound = bounds.get(tp)
         if not bound or got == "Any":
@@ -2352,10 +2515,11 @@ class Checker:
             return  # annotation arity is reported by _check_type_annotation
         for a in targs:
             self._check_type_annotation(a, call.line, call.col)
-        if len(call.args) != len(rec.fields):
+        all_fields = self.record_all_fields(base)
+        if len(call.args) != len(all_fields):
             return  # arity error is reported by the constructor path
         bindings = dict(zip(params, targs))
-        for (fn, ft), a in zip(rec.fields, call.args):
+        for (fn, ft), a in zip(all_fields, call.args):
             want = self.resolve_field_type(base, ft, bindings)
             at = self.expr(a)
             if not self.compat(at, want):
@@ -2395,7 +2559,7 @@ class Checker:
             raise GamaTypeError(
                 f"cannot assign field {field!r} on non-record type {t}",
                 s.line, s.col)
-        fmap = dict(self.records[t].fields)
+        fmap = dict(self.record_all_fields(t))
         if field not in fmap:
             raise GamaTypeError(f"unknown field {field!r} on {t}",
                                 s.line, s.col)
@@ -2519,8 +2683,9 @@ class Checker:
             rec = self.records.get(e.name)
             if rec is None:
                 raise GamaTypeError(f"unknown record {e.name}", e.line, e.col)
+            all_fields = self.record_all_fields(e.name)
             decl = {fn: self.resolve_field_type(e.name, ft)
-                    for fn, ft in rec.fields}
+                    for fn, ft in all_fields}
             seen = set()
             for k, val in e.fields:
                 if k in seen:
@@ -2534,7 +2699,7 @@ class Checker:
                 if not self.compat(at, decl[k]):
                     raise GamaTypeError(
                         f"{e.name}.{k}: {at} != {decl[k]}", e.line, e.col)
-            missing = [fn for fn, _ft in rec.fields if fn not in seen]
+            missing = [fn for fn, _ft in all_fields if fn not in seen]
             if missing:
                 raise GamaTypeError(
                     f"{e.name}: missing field{'s' if len(missing) > 1 else ''} "
@@ -2547,7 +2712,7 @@ class Checker:
                     f"with expects a record receiver, got {bt}",
                     e.line, e.col)
             decl = {fn: self.resolve_field_type(bt, ft)
-                    for fn, ft in self.records[bt].fields}
+                    for fn, ft in self.record_all_fields(bt)}
             seen = set()
             for k, val in e.fields:
                 if k in seen:
@@ -2593,7 +2758,7 @@ class Checker:
                     for part in parts[i:]:
                         if t in self.records:
                             fmap = {fn: self.resolve_field_type(t, ft)
-                                    for fn, ft in self.records[t].fields}
+                                    for fn, ft in self.record_all_fields(t)}
                             if part not in fmap:
                                 raise GamaTypeError(
                                     f"unknown field {part!r} on {t}",
@@ -2627,14 +2792,22 @@ class Checker:
                 if a != "Bool" or b != "Bool": raise GamaTypeError(f"{e.op} expects Bool", e.line, e.col)
                 return "Bool"
             if "Any" in (a, b): return "Bool"
+            # Equality stays nominal: only types on one inheritance chain may
+            # be compared (unrelated records remain a type error), and the
+            # runtime compares the nominal type name, so a Dog value never
+            # equals an independently constructed Animal value.
+            if (a in self.records and b in self.records
+                    and (self.is_subrecord(a, b) or self.is_subrecord(b, a))):
+                return "Bool"
             if a != b and not (a in NUM and b in NUM): raise GamaTypeError("== expects matching types", e.line, e.col)
             return "Bool"
         if isinstance(e, Call):
             if e.name in self.records:
                 rec = self.records[e.name]
-                if len(e.args) != len(rec.fields):
+                all_fields = self.record_all_fields(e.name)
+                if len(e.args) != len(all_fields):
                     raise GamaTypeError(
-                        f"{e.name} expects {len(rec.fields)} fields, got "
+                        f"{e.name} expects {len(all_fields)} fields, got "
                         f"{len(e.args)}", e.line, e.col)
                 rec_args = getattr(e, "type_args", None) or []
                 if rec_args:
@@ -2658,13 +2831,13 @@ class Checker:
                     rec_params = set(getattr(rec, "type_params", None) or [])
                     rec_bounds = dict(
                         getattr(rec, "type_param_bounds", None) or {})
-                    for (fn, ft), at in zip(rec.fields, arg_types):
+                    for (fn, ft), at in zip(all_fields, arg_types):
                         fbase, fargs = _type_ref_parts(ft)
                         if fbase in rec_params and not fargs:
                             self._check_inferred_bound(
                                 e.name, fbase, at, rec_bounds.get(fbase),
                                 e.line, e.col)
-                for (fn, ft), at in zip(rec.fields, arg_types):
+                for (fn, ft), at in zip(all_fields, arg_types):
                     want = self.resolve_field_type(e.name, ft, bindings)
                     if not self.compat(at, want):
                         raise GamaTypeError(
@@ -2998,8 +3171,10 @@ def _rename_refs(node, mapping):
         own = set(getattr(node, "type_params", None) or [])
         pmap = {k: v for k, v in mapping.items() if k not in own}
         bounds = getattr(node, "type_param_bounds", None) or {}
+        parent = getattr(node, "parent", None)
         return replace(
             node, name=mapping.get(node.name, node.name),
+            parent=(mapping.get(parent, parent) if parent else parent),
             fields=[(fn, _rename_type_ref(ft, mapping))
                     for fn, ft in node.fields],
             methods=[_rename_refs(m, mapping) for m in node.methods],
@@ -3944,29 +4119,34 @@ class Interpreter:
             return _NO_METHOD
         if not isinstance(receiver, RecordVal):
             return _NO_METHOD
-        # Methods dispatch on the statically resolved target type when the
-        # checker recorded one, so a structurally compatible value (Point3 in
-        # a ``Point`` binding) still runs the method declared for ``Point``.
         dispatch = getattr(e, "_dispatch_record", None)
-        rec_name = (dispatch if dispatch in self.records
-                    else receiver.type_name)
+        if dispatch in self.records:
+            chain, ok = _record_chain(self.records, receiver.type_name)
+            nominal = ok and (receiver.type_name == dispatch
+                              or any(r.name == dispatch for r in chain[1:]))
+            rec_name = receiver.type_name if nominal else dispatch
+        else:
+            rec_name = receiver.type_name
         rec = self.records.get(rec_name)
         if rec is None:
             return _NO_METHOD
-        m = next((x for x in rec.methods if x.name == method_name), None)
-        if m is None:
+        found = _find_record_method(
+            self.records, rec_name, method_name)
+        if found is None:
             raise GamaRuntimeError(
                 f"unknown method {method_name!r} on {rec_name}",
                 e.line, e.col)
+        decl, m = found
         params = m.params[1:]
         required = sum(1 for p in params if p.default is None)
         if not (required <= len(e.args) <= len(params)):
             raise GamaRuntimeError(
                 f"{rec_name}.{method_name} expects {required}.."
                 f"{len(params)} args, got {len(e.args)}", e.line, e.col)
-        closure = self.record_env.get(rec_name, self.env)
+        closure = self.record_env.get(decl, self.env)
         fv = FunctionVal(params, m.ret, m.effects, m.body, closure,
-                         f"{rec_name}.{m.name}")
+                         f"{decl}.{m.name}")
+
         return self.invoke(fv, e.args, env, row, e.line, e.col,
                            self_value=receiver)
     def expr(self, e, env, row=None):
@@ -3983,7 +4163,12 @@ class Interpreter:
             rec = self.records.get(e.name)
             if rec is None:
                 raise GamaRuntimeError(f"unknown record {e.name}", e.line, e.col)
-            decl = dict(rec.fields)
+            all_fields, ok = _record_all_fields(self.records, e.name)
+            if not ok:
+                raise GamaRuntimeError(
+                    f"record {e.name}: invalid inheritance chain",
+                    e.line, e.col)
+            decl = dict(all_fields)
             values = {}
             for k, val in e.fields:
                 if k in values:
@@ -3993,12 +4178,12 @@ class Interpreter:
                     raise GamaRuntimeError(
                         f"{e.name}: unknown field {k}", e.line, e.col)
                 values[k] = self.expr(val, env, row)
-            missing = [fn for fn, _ft in rec.fields if fn not in values]
+            missing = [fn for fn, _ft in all_fields if fn not in values]
             if missing:
                 raise GamaRuntimeError(
                     f"{e.name}: missing field{'s' if len(missing) > 1 else ''} "
                     + ", ".join(missing), e.line, e.col)
-            return RecordVal(e.name, {fn: values[fn] for fn, _ft in rec.fields})
+            return RecordVal(e.name, {fn: values[fn] for fn, _ft in all_fields})
         if isinstance(e, RecordUpdate):
             base = self.expr(e.base, env, row)
             if not isinstance(base, RecordVal):
@@ -4008,6 +4193,12 @@ class Interpreter:
             if rec is None:
                 raise GamaRuntimeError(
                     f"unknown record {base.type_name}", e.line, e.col)
+            all_fields, ok = _record_all_fields(
+                self.records, base.type_name)
+            if not ok:
+                raise GamaRuntimeError(
+                    f"record {base.type_name}: invalid inheritance chain",
+                    e.line, e.col)
             # Shallow copy: the field dict is new, but unchanged nested record
             # and container values are shared with the receiver (documented).
             values = dict(base.fields)
@@ -4018,13 +4209,13 @@ class Interpreter:
                         f"{base.type_name}: duplicate field {k} in with",
                         e.line, e.col)
                 seen.add(k)
-                if k not in dict(rec.fields):
+                if k not in dict(all_fields):
                     raise GamaRuntimeError(
                         f"{base.type_name}: unknown field {k} in with",
                         e.line, e.col)
                 values[k] = self.expr(val, env, row)
             return RecordVal(
-                base.type_name, {fn: values[fn] for fn, _ft in rec.fields})
+                base.type_name, {fn: values[fn] for fn, _ft in all_fields})
         if isinstance(e, Lambda):
             return FunctionVal(e.params, e.ret, e.effects, e.body, env)
         if isinstance(e, ListExpr): return [self.expr(x, env, row) for x in e.items]
@@ -4107,14 +4298,18 @@ class Interpreter:
                 raise GamaRuntimeError(f"{e.op}: {ex}", e.line, e.col) from None
         if isinstance(e, Call):
             if e.name in self.records:
-                rec = self.records[e.name]
-                if len(e.args) != len(rec.fields):
+                all_fields, ok = _record_all_fields(self.records, e.name)
+                if not ok:
                     raise GamaRuntimeError(
-                        f"{e.name} expects {len(rec.fields)} fields, got "
+                        f"record {e.name}: invalid inheritance chain",
+                        e.line, e.col)
+                if len(e.args) != len(all_fields):
+                    raise GamaRuntimeError(
+                        f"{e.name} expects {len(all_fields)} fields, got "
                         f"{len(e.args)}", e.line, e.col)
                 vals = [self.expr(a, env, row) for a in e.args]
                 return RecordVal(e.name, {fn: v for (fn, _ft), v in
-                                          zip(rec.fields, vals)})
+                                          zip(all_fields, vals)})
             if e.name in ("Ok", "Err"):
                 if len(e.args) != 1: raise GamaRuntimeError(f"{e.name} expects 1 arg", e.line, e.col)
                 return ResultVal(e.name == "Ok", self.expr(e.args[0], env, row))

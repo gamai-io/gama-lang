@@ -93,6 +93,9 @@ Limitations (raise ``IRUnsupported`` / documented runtime errors)
   ``expr with { field = value, ... }`` compiles to a shallow copy of the
   receiver with the named fields replaced (declaration order preserved), and
   the original value is left untouched.
+* Nominal record inheritance (``record Dog extends Animal { ... }``) is
+  **rejected loudly** by this backend with :class:`IRUnsupported`; only the
+  tree-walking interpreter executes inheritance.
 * Enum payload variants are supported for declarations, constructors and
   ``match`` bindings, including aliased imports: the core loader namespaces
   declarations and references (``geo.Color`` / ``geo.Color.Red`` /
@@ -616,6 +619,8 @@ class _Compiler:
             self.emit("NOP")
             return
         if isinstance(stmt, g2.RecordDecl):
+            if getattr(stmt, "parent", None):
+                _unsupported(stmt, "record inheritance")
             fields = tuple(fn for fn, _ft in stmt.fields)
             # Methods compile exactly like named functions; the first
             # parameter (``self``) is bound by the call path, not passed by
@@ -1832,6 +1837,8 @@ def _top_level_decls(stmts: list) -> tuple[dict, dict]:
     enums: dict[str, Any] = {}
     for stmt in stmts:
         if isinstance(stmt, g2.RecordDecl):
+            if getattr(stmt, "parent", None):
+                _unsupported(stmt, "record inheritance")
             records[stmt.name] = tuple(fn for fn, _ft in stmt.fields)
         elif isinstance(stmt, g2.EnumDecl):
             enums[stmt.name] = _enum_spec(stmt.variants)
