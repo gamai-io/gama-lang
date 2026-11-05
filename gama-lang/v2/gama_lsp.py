@@ -310,6 +310,7 @@ KIND_FIELD = 5
 KIND_CLASS = 7
 KIND_ENUM = 13
 KIND_ENUM_MEMBER = 20
+KIND_METHOD = 2
 
 NAME_RE = re.compile(r"\b(let|fn)\s+([A-Za-z_]\w*)")
 WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -343,12 +344,16 @@ FN_TYPE_PARAM_HEADER_RE = re.compile(
 LINE_CHAIN_TAIL_RE = re.compile(
     r"([A-Za-z_][A-Za-z0-9_]*)(?:\s*\.\s*[A-Za-z0-9_]*)*"
     r"\s*\.\s*[A-Za-z0-9_]*$")
-RECORD_DECL_RE = re.compile(
-    r"\brecord\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{([^}]*)\}")
 ENUM_DECL_RE = re.compile(
     r"\benum\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[A-Za-z0-9_,\s]*>)?\s*\{([^}]*)\}")
 RECORD_FIELD_RE = re.compile(
     r"([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([A-Za-z_][A-Za-z0-9_.]*)")
+RECORD_HEADER_RE = re.compile(
+    r"\brecord\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^>{}]*>)?\s*\{")
+METHOD_HEADER_RE = re.compile(
+    r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*"
+    r"(?:->\s*([A-Za-z_][A-Za-z0-9_.]*(?:\s*<[^>{}]*>)?))?"
+    r"\s*(?:effects\s*\{[^}]*\})?")
 
 # short human descriptions for builtins and keyword-like builtins
 DESCRIPTIONS = {
@@ -747,12 +752,11 @@ def _record_decls(text):
                 out[node.name] = node
         return out
     out = {}
-    for match in RECORD_DECL_RE.finditer(text or ""):
-        name, body = match.group(1), match.group(2)
-        fields = [(fm.group(1), fm.group(2))
-                  for fm in RECORD_FIELD_RE.finditer(body)]
-        if name not in out:
-            out[name] = G.RecordDecl(name, fields, 0, 0)
+    for name, body in _record_bodies(text):
+        if name in out:
+            continue
+        fields, methods = _record_body_members(body)
+        out[name] = G.RecordDecl(name, fields, 0, 0, methods=methods)
     return out
 
 
@@ -776,6 +780,146 @@ def _enum_decls(text):
     return out
 
 
+def _record_bodies(text):
+    """Yield ``(name, body)`` for balanced record declarations in raw text.
+
+    Unlike a flat ``record ... { ... }`` regex this tolerates method bodies
+    containing braces, which is exactly what a record with methods looks like.
+    """
+    for match in RECORD_HEADER_RE.finditer(text or ""):
+        rng = _brace_body_range(text, match.end() - 1)
+        if rng is None:
+            continue
+        yield match.group(1), (text or "")[rng[0]:rng[1]]
+
+
+def _split_top_level(spec: str) -> list:
+    """Split a comma list at bracket depth 0 (generics included)."""
+    parts = []
+    depth = 0
+    quote = None
+    start = 0
+    i = 0
+    while i < len(spec):
+        ch = spec[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch in "([{<":
+            depth += 1
+        elif ch in ")]}>":
+            depth = max(0, depth - 1)
+        elif ch == "," and depth == 0:
+            parts.append(spec[start:i])
+            start = i + 1
+        i += 1
+    parts.append(spec[start:])
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _parse_method_params(spec: str) -> list:
+    """Best-effort ``Param`` list for a raw method parameter string."""
+    params = []
+    for part in _split_top_level(spec):
+        decl = part.split("=", 1)[0].strip()
+        name, sep, type_name = decl.partition(":")
+        name = name.strip()
+        if not ALIAS_RE.match(name):
+            continue
+        params.append(G.Param(name, type_name.strip() if sep else "Any", None))
+    return params
+
+
+def _iter_method_blocks(body: str):
+    """``[(start, end, match|None)]`` for top-level ``fn`` blocks.
+
+    A top-level ``fn`` that does not match the method header grammar is still
+    masked out of the field scan, so a broken method cannot leak parameters
+    such as ``self: Point`` as record fields.
+    """
+    out = []
+    i = 0
+    n = len(body)
+    depth = 0
+    quote = None
+    while i < n:
+        ch = body[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch == '"':
+            quote = ch
+            i += 1
+            continue
+        if ch == "#":
+            nl = body.find("\n", i)
+            i = n if nl < 0 else nl
+            continue
+        if ch == "{":
+            depth += 1
+            i += 1
+            continue
+        if ch == "}":
+            depth = max(0, depth - 1)
+            i += 1
+            continue
+        if depth == 0 and body.startswith("fn", i) and (
+                i == 0 or not (body[i - 1].isalnum() or body[i - 1] == "_")):
+            after = i + 2
+            if after < n and (body[after].isalnum() or body[after] == "_"):
+                i += 1
+                continue
+            match = METHOD_HEADER_RE.match(body, i)
+            brace = body.find("{", match.end() if match is not None else i)
+            if brace < 0:
+                # A broken top-level method without a body consumes the rest
+                # of the raw record body; mask it so its parameters cannot be
+                # mistaken for fields.
+                end = len(body)
+            else:
+                end = match.end() if match is not None else i + 2
+                rng = _brace_body_range(body, brace)
+                end = rng[1] + 1 if rng is not None else len(body)
+            out.append((i, end, match))
+            i = max(end, i + 1)
+            continue
+        i += 1
+    return out
+
+
+def _record_body_members(body: str):
+    """Best-effort ``(fields, methods)`` for a raw record body."""
+    blocks = _iter_method_blocks(body)
+    if blocks:
+        chars = list(body)
+        for start, end, _match in blocks:
+            for k in range(start, min(end, len(chars))):
+                if chars[k] != "\n":
+                    chars[k] = " "
+        masked = "".join(chars)
+    else:
+        masked = body
+    fields = [(match.group(1), match.group(2))
+              for match in RECORD_FIELD_RE.finditer(masked)]
+    methods = [
+        G.Method(match.group(1), _parse_method_params(match.group(2)),
+                 match.group(3), None, [], 0, 0)
+        for _start, _end, match in blocks
+        if match is not None
+    ]
+    return fields, methods
+
+
 def _record_name_for(type_name, records, aliases):
     """Resolve a type annotation to a locally declared record name.
 
@@ -785,6 +929,7 @@ def _record_name_for(type_name, records, aliases):
     """
     if not type_name:
         return None
+    type_name = type_name.split("<", 1)[0].strip()
     if type_name in records:
         return type_name
     if "." in type_name:
@@ -848,7 +993,7 @@ def _var_type_name(text, name, line, records, aliases):
         elif isinstance(node, G.Assign) and node.name == name:
             candidates.append(
                 (int(node.line or 0), _expr_record_type(node.expr, records)))
-        elif isinstance(node, (G.Fn, G.Lambda)):
+        elif isinstance(node, (G.Fn, G.Lambda, G.Method)):
             for param in node.params:
                 if param.name == name:
                     candidates.append(
@@ -910,21 +1055,75 @@ def _context_text(text, line, character):
     return "\n".join(rows)
 
 
+def _method_signature_text(method, owner=None, qualifier=None,
+                          include_self=True):
+    """Signature text for a record method.
+
+    ``self`` is included by default so completion/hover show the declared
+    binding; call-site signature help passes ``include_self=False``.
+    """
+    name = getattr(method, "name", "?")
+    if qualifier:
+        name = "%s.%s" % (qualifier, name)
+    params = list(getattr(method, "params", None) or [])
+    if not include_self and params and params[0].name == "self":
+        params = params[1:]
+    return signature_text(name, [_param_label(p) for p in params],
+                          getattr(method, "ret", None) or "Any",
+                          getattr(method, "effects", None))
+
+
+def _record_methods(decl):
+    return list(getattr(decl, "methods", None) or [])
+
+
+def _method_hover_text(method, owner, receiver=None):
+    signature = _method_signature_text(method, owner, qualifier=owner)
+    self_type = owner
+    if getattr(method, "params", None):
+        self_type = method.params[0].type_name or owner
+    bound = "`%s`" % receiver if receiver else "the receiver"
+    return ("`%s`\n\nGAMA-L method `%s` of record `%s`; `self` is bound "
+            "to %s (`self: %s`)."
+            % (signature, method.name, owner, bound, self_type))
+
+
+def _method_decl_hover(text, name, line):
+    """Hover for a method name written inside a record declaration."""
+    for decl in _record_decls(text).values():
+        for method in _record_methods(decl):
+            if method.name == name and int(getattr(method, "line", 0) or 0) \
+                    == int(line) + 1:
+                return _method_hover_text(method, decl.name)
+    return None
+
+
 def _record_signature_text(decl, qualifier=None):
-    fields = ", ".join("%s: %s" % (name, type_name)
-                       for name, type_name in decl.fields)
+    parts = ["%s: %s" % (name, type_name)
+             for name, type_name in decl.fields]
+    for method in _record_methods(decl):
+        parts.append("fn " + _method_signature_text(method, decl.name))
+    body = ", ".join(parts)
     if qualifier:
         head = "%s.%s" % (qualifier, decl.name)
-        return head + (" { %s }" % fields if fields else " { }")
+        return head + (" { %s }" % body if body else " { }")
     head = "record %s" % decl.name
-    return head + (" { %s }" % fields if fields else " { }")
+    return head + (" { %s }" % body if body else " { }")
 
 
 def _record_hover_text(decl, qualifier=None):
     fields = ", ".join("`%s: %s`" % pair for pair in decl.fields)
+    methods = ", ".join("`%s`" % _method_signature_text(method, decl.name)
+                        for method in _record_methods(decl))
+    facts = []
     if fields:
-        return ("`%s`\n\nGAMA-L record `%s` with fields %s."
-                % (_record_signature_text(decl, qualifier), decl.name, fields))
+        facts.append("fields %s" % fields)
+    if methods:
+        facts.append("methods %s" % methods)
+    if facts:
+        return ("`%s`\n\nGAMA-L record `%s` with %s."
+                % (_record_signature_text(decl, qualifier), decl.name,
+                   " and ".join(facts)))
     return ("`%s`\n\nGAMA-L record `%s` (no fields)."
             % (_record_signature_text(decl, qualifier), decl.name))
 
@@ -975,8 +1174,8 @@ def _dotted_member_at(text, line, character):
     return None
 
 
-def _local_member_hover(text, line, character):
-    """Hover for a record field or enum variant in a member expression."""
+def _local_member_hover(text, line, character, uri=None):
+    """Hover for a record field/method or enum variant in a member expression."""
     found = _dotted_member_at(text, line, character)
     if found is None:
         return None
@@ -992,38 +1191,51 @@ def _local_member_hover(text, line, character):
                 return None
             return ("`%s.%s`\n\nGAMA-L enum variant `%s` of enum `%s`."
                     % (parts[0], member, member, parts[0]))
-    type_name = _var_type_name(context, parts[0], line, records, aliases)
-    record = _record_name_for(type_name, records, aliases)
-    for part in parts[1:]:
-        if record is None:
-            return None
-        fields = dict(records[record].fields)
-        if part not in fields:
-            return None
-        record = _record_name_for(fields[part], records, aliases)
-    if record is None:
+
+    ref = None
+    if uri:
+        ref = _resolve_member_owner(
+            uri, context, parts, line, records, aliases)
+    if ref is None:
+        type_name = _var_type_name(context, parts[0], line, records, aliases)
+        record = _record_name_for(type_name, records, aliases)
+        for part in parts[1:]:
+            if record is None:
+                break
+            fields = dict(records[record].fields)
+            if part not in fields:
+                record = None
+                break
+            record = _record_name_for(fields[part], records, aliases)
+        if record is not None:
+            ref = {"owner": record, "decl": records[record], "local": True,
+                   "path": None, "import": None}
+    if ref is None:
         return None
-    fields = dict(records[record].fields)
-    if member not in fields:
-        return None
-    return ("`%s.%s`\n\nGAMA-L field `%s: %s` of record `%s`."
-            % (".".join(parts), member, member, fields[member], record))
+    decl = ref["decl"]
+    fields = dict(decl.fields)
+    if member in fields:
+        return ("`%s.%s`\n\nGAMA-L field `%s: %s` of record `%s`."
+                % (".".join(parts), member, member, fields[member],
+                   ref["owner"]))
+    for method in _record_methods(decl):
+        if method.name == member:
+            return _method_hover_text(method, ref["owner"],
+                                      receiver=".".join(parts))
+    return None
 
 
-def _member_type_items(text, line, character, parts):
-    """Completion items for fields/variants after a dotted prefix."""
+def _member_type_items(text, line, character, parts, uri=None):
+    """Completion items for record fields/methods and enum variants."""
     context = _context_text(text, line, character)
     records = _record_decls(context)
     enums = _enum_decls(context)
     aliases = _alias_map(text)
     target = _chain_target_type(context, parts, records, enums, aliases, line)
-    if target is None:
-        return []
-    kind, name = target
     items = []
     seen = set()
-    if kind == "enum":
-        decl = enums.get(name)
+    if target is not None and target[0] == "enum":
+        decl = enums.get(target[1])
         if decl is None:
             return []
         for variant_info in decl.variants:
@@ -1034,12 +1246,20 @@ def _member_type_items(text, line, character, parts):
             items.append({
                 "label": variant,
                 "kind": KIND_ENUM_MEMBER,
-                "detail": "%s.%s" % (name, variant),
+                "detail": "%s.%s" % (target[1], variant),
                 "documentation": "Variant `%s` of enum `%s`."
-                                 % (variant, name),
+                                 % (variant, target[1]),
             })
         return items
-    decl = records.get(name)
+
+    decl = None
+    if target is not None and target[0] == "record":
+        decl = records.get(target[1])
+    if decl is None and uri:
+        ref = _resolve_member_owner(
+            uri, context, parts, line, records, aliases)
+        if ref is not None:
+            decl = ref["decl"]
     if decl is None:
         return []
     for field, type_name in decl.fields:
@@ -1051,7 +1271,20 @@ def _member_type_items(text, line, character, parts):
             "kind": KIND_FIELD,
             "detail": "field %s: %s" % (field, type_name),
             "documentation": "Field `%s` of record `%s`."
-                             % (field, name),
+                             % (field, decl.name),
+        })
+    for method in _record_methods(decl):
+        if method.name in seen:
+            continue
+        seen.add(method.name)
+        items.append({
+            "label": method.name,
+            "kind": KIND_METHOD,
+            "detail": "method " + _method_signature_text(method, decl.name),
+            "documentation": "Method `%s` of record `%s`; call as "
+                             "`%s.%s(...)` (self is the receiver)."
+                             % (method.name, decl.name, ".".join(parts),
+                                method.name),
         })
     return items
 
@@ -1253,7 +1486,8 @@ def completion(uri: str, text: str, line: int = 0, character: int = 0):
         parts = [part.strip() for part in chain.group(1).split(".")
                  if part.strip()]
         return {"isIncomplete": False,
-                "items": _member_type_items(text, line, character, parts)}
+                "items": _member_type_items(text, line, character, parts,
+                                             uri)}
 
     # Generic type-parameter declaration: ``fn id<`` / ``fn id<A, ``.
     # Only built-in type names can be suggested because the names are chosen
@@ -1804,6 +2038,7 @@ def _resolve_type_in_context(ctx, type_name):
     """
     if not type_name or ctx is None:
         return None
+    type_name = type_name.split("<", 1)[0].strip()
     records = ctx["records"]
     aliases = ctx["aliases"]
     if type_name in records:
@@ -1843,6 +2078,31 @@ def _context_for_ref(ref, ctx):
         # Bare record declared in the current context's own module.
         return ctx
     return _module_context(ctx["uri"], imp.get("path"))
+
+
+def _resolve_member_owner(uri, text, parts, line, records, aliases):
+    """Record declaration owning the final chain segment (local or imported).
+
+    ``parts`` are the segments *before* the member under the cursor. Field
+    types of imported records are resolved in the module that declares them,
+    mirroring :func:`_resolve_record_chain_ref` (which includes the member).
+    """
+    if not uri or not parts:
+        return None
+    ctx = _document_context(uri, records, aliases)
+    type_name = _var_type_name(text, parts[0], line, records, aliases)
+    ref = _resolve_type_in_context(ctx, type_name)
+    for part in parts[1:]:
+        if ref is None:
+            return None
+        fields = dict(ref["decl"].fields)
+        if part not in fields:
+            return None
+        ctx = _context_for_ref(ref, ctx)
+        if ctx is None:
+            return None
+        ref = _resolve_type_in_context(ctx, fields[part])
+    return ref
 
 
 def _resolve_record_ref(uri: str, text: str, type_name, records, aliases):
@@ -2896,9 +3156,11 @@ def hover(uri: str, text: str, line: int, character: int):
         return None
     value = _member_hover(uri, text, line, character)
     if value is None:
-        value = _local_member_hover(text, line, character)
+        value = _local_member_hover(text, line, character, uri)
     if value is None:
         value = _structural_hover(text, name)
+    if value is None:
+        value = _method_decl_hover(text, name, line)
     if value is None and name in TYPE_HOVERS:
         value = TYPE_HOVERS[name]
     elif value is None and name in TYPE_NAMES:
@@ -3038,7 +3300,8 @@ def _active_parameter(args: str) -> int:
     return commas
 
 
-def _signature_help(signature, params, type_params=None, param_types=None):
+def _signature_help(signature, params, type_params=None, param_types=None,
+                    documentation=None):
     type_params = list(type_params or [])
     parameter_items = []
     for i, label in enumerate(params):
@@ -3053,18 +3316,51 @@ def _signature_help(signature, params, type_params=None, param_types=None):
         "label": signature,
         "parameters": parameter_items,
     }
+    doc_parts = []
     if type_params:
+        doc_parts.append("Type parameters: " + ", ".join(
+            "`%s` (position %d)" % (name, i)
+            for i, name in enumerate(type_params)))
+    if documentation:
+        doc_parts.append(documentation)
+    if doc_parts:
         signature_info["documentation"] = {
             "kind": "markdown",
-            "value": "Type parameters: " + ", ".join(
-                "`%s` (position %d)" % (name, i)
-                for i, name in enumerate(type_params)),
+            "value": "\n\n".join(doc_parts),
         }
     return {
         "signatures": [signature_info],
         "activeSignature": 0,
         "activeParameter": 0,
     }
+
+
+def _method_call_signature(uri, text, callee, line):
+    """Signature tuple for ``receiver.method`` calls, excluding ``self``."""
+    receiver, _sep, name = callee.rpartition(".")
+    if not receiver or not name:
+        return None
+    parts = [part for part in receiver.split(".") if part]
+    records = _record_decls(text)
+    aliases = _alias_map(text)
+    ref = _resolve_member_owner(uri, text, parts, line, records, aliases)
+    if ref is None:
+        return None
+    method = next((m for m in _record_methods(ref["decl"])
+                   if m.name == name), None)
+    if method is None:
+        return None
+    params = list(method.params)
+    if params and params[0].name == "self":
+        params = params[1:]
+    owner = ref["owner"]
+    label = _method_signature_text(method, owner, qualifier=owner,
+                                   include_self=False)
+    self_type = (method.params[0].type_name
+                 if getattr(method, "params", None) else owner)
+    doc = "`self` is the receiver (`self: %s`)." % (self_type or owner)
+    return (label, [_param_label(p) for p in params], [],
+            [p.type_name for p in params], doc)
 
 
 def signature_help(uri: str, text: str, line: int, character: int):
@@ -3084,6 +3380,8 @@ def signature_help(uri: str, text: str, line: int, character: int):
                 if node.name == member:
                     sig = _node_signature(node, type_args)
                     break
+        else:
+            sig = _method_call_signature(uri, text, callee, line)
     elif callee in SIGNATURES:
         label, params = builtin_signature(callee)
         sig = (label, params, [], [])
@@ -3103,7 +3401,8 @@ def signature_help(uri: str, text: str, line: int, character: int):
 
     if sig is None:
         return None
-    result = _signature_help(sig[0], sig[1], sig[2], sig[3])
+    result = _signature_help(sig[0], sig[1], sig[2], sig[3],
+                             sig[4] if len(sig) > 4 else None)
     if result["signatures"][0]["parameters"]:
         result["activeParameter"] = min(
             active, len(result["signatures"][0]["parameters"]) - 1)
@@ -3115,6 +3414,8 @@ def signature_help(uri: str, text: str, line: int, character: int):
 # ------------------------------------------------- document symbols & themes
 KIND_SYMBOL_FUNCTION = 12
 KIND_SYMBOL_VARIABLE = 13
+KIND_SYMBOL_CLASS = 5
+KIND_SYMBOL_METHOD = 6
 
 TOKEN_TYPES = ["keyword", "type", "function", "variable", "string", "number", "operator"]
 TYPE_NAMES = {"Int", "Decimal", "Text", "Bool", "List", "Table", "Result",
@@ -3153,7 +3454,42 @@ def document_symbols(uri: str, text: str):
             "selectionRange": rng,
             "children": [],
         })
+    for node in _record_nodes(text):
+        loc = _decl_start(uri, text, node, node.name)
+        if loc is None:
+            continue
+        rng = loc["range"]
+        children = []
+        for method in _record_methods(node):
+            mloc = _decl_start(uri, text, method, method.name)
+            if mloc is None:
+                continue
+            children.append({
+                "name": method.name,
+                "detail": "fn(%s)" % method.name,
+                "kind": KIND_SYMBOL_METHOD,
+                "range": mloc["range"],
+                "selectionRange": mloc["range"],
+                "children": [],
+            })
+        out.append({
+            "name": node.name,
+            "detail": "record %s" % node.name,
+            "kind": KIND_SYMBOL_CLASS,
+            "range": rng,
+            "selectionRange": rng,
+            "children": children,
+        })
     return out
+
+
+def _record_nodes(text: str):
+    """Record declarations in document order (parsed AST only)."""
+    program = _parse_or_none(text)
+    if program is None:
+        return []
+    return [node for node in _walk(program)
+            if isinstance(node, G.RecordDecl)]
 
 
 def _line_offsets(src: str):
