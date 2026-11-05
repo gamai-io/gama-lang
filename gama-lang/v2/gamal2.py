@@ -1953,6 +1953,12 @@ class Checker:
         # Flattened field lists (inherited first) per record, filled once the
         # whole program is registered so forward parent references work.
         self._all_fields: dict[str, list] = {}
+        # Inferred effects for functions/methods that omit an ``effects`` set.
+        # ``None`` on the declaration still means "omitted"; the inferred set
+        # lives beside it so callers can see the result without rewriting the
+        # source (and the formatter keeps emitting no effects clause).
+        self.inferred_fn_effects: dict[str, set[str]] = {}
+        self.inferred_method_effects: dict[tuple[str, str], set[str]] = {}
     def push(self):
         self.scope.append({})
         self.lambda_scopes.append({})
@@ -2366,6 +2372,233 @@ class Checker:
             if n in s: return s[n]
         return None
     def set(self, n, t): self.scope[-1][n] = t
+    # ------------------------------------------------------ effect inference
+    def _effective_fn_effects(self, f: Fn) -> set[str]:
+        """Effects a call to ``f`` contributes: declared wins, else inferred."""
+        if getattr(f, "effects", None) is not None:
+            return set(f.effects)
+        return set(getattr(f, "inferred_effects", None)
+                   or self.inferred_fn_effects.get(f.name) or ())
+
+    def _effective_method_effects(self, m) -> set[str]:
+        if getattr(m, "effects", None) is not None:
+            return set(m.effects)
+        return set(getattr(m, "inferred_effects", None) or ())
+
+    def _effect_env(self, params, self_type=None) -> dict[str, str]:
+        env: dict[str, str] = {}
+        if self_type:
+            env["self"] = self_type
+        for p in params:
+            base, _args = _type_ref_parts(p.type_name)
+            if base in self.records:
+                env[p.name] = base
+        return env
+
+    def _path_type(self, path: str, env: dict[str, str]):
+        parts = path.split(".")
+        cur = env.get(parts[0])
+        for seg in parts[1:]:
+            if cur not in self.records:
+                return None
+            try:
+                cur = _type_ref_parts(
+                    self.resolve_field_type(cur, self._field_type(cur, seg)))[0]
+            except (GamaError, KeyError):
+                return None
+        return cur
+
+    def _field_type(self, rec_name: str, field: str):
+        for fn, ft in self.record_all_fields(rec_name):
+            if fn == field:
+                return ft
+        raise KeyError(field)
+
+    def _method_candidates(self, dotted: str, env: dict[str, str]):
+        receiver, _, method_name = dotted.rpartition(".")
+        rt = self._path_type(receiver, env) if receiver else None
+        if rt in self.records:
+            found = _find_record_method(self.records, rt, method_name)
+            if found is not None:
+                return [found[1]]
+        out = []
+        for rec in self.records.values():
+            for m in rec.methods:
+                if m.name == method_name:
+                    out.append(m)
+        return out
+
+    def _infer_effects(self):
+        """Iterate declared/inferred effects to a least fixpoint."""
+        omitted_fns = [f for f in self.funcs.values()
+                       if getattr(f, "effects", None) is None]
+        omitted_methods = []
+        for rec in self.records.values():
+            for m in rec.methods:
+                if getattr(m, "effects", None) is None:
+                    omitted_methods.append((rec.name, m))
+        if not omitted_fns and not omitted_methods:
+            return
+        for f in omitted_fns:
+            f.inferred_effects = set()
+            self.inferred_fn_effects[f.name] = f.inferred_effects
+        for rec_name, m in omitted_methods:
+            m.inferred_effects = set()
+            self.inferred_method_effects[(rec_name, m.name)] = \
+                m.inferred_effects
+        changed = True
+        while changed:
+            changed = False
+            for f in omitted_fns:
+                new = self._collect_body_effects(
+                    f.body, self._effect_env(f.params))
+                if new != f.inferred_effects:
+                    f.inferred_effects = new
+                    self.inferred_fn_effects[f.name] = new
+                    changed = True
+            for rec_name, m in omitted_methods:
+                new = self._collect_body_effects(
+                    m.body, self._effect_env(m.params, rec_name))
+                if new != m.inferred_effects:
+                    m.inferred_effects = new
+                    self.inferred_method_effects[(rec_name, m.name)] = new
+                    changed = True
+
+    def _collect_body_effects(self, body, env) -> set[str]:
+        out: set[str] = set()
+        for s in body:
+            self._collect_stmt_effects(s, env, out)
+        return out
+
+    def _collect_stmt_effects(self, s, env, out):
+        if isinstance(s, Print):
+            out.add("io.print")
+            self._collect_expr_effects(s.expr, env, out)
+        elif isinstance(s, Prove):
+            out.add("proof.write")
+            self._collect_expr_effects(s.expr, env, out)
+        elif isinstance(s, Verify):
+            out.add("proof.read")
+            self._collect_expr_effects(s.expr, env, out)
+        elif isinstance(s, (Let, Assign)):
+            self._collect_expr_effects(s.expr, env, out)
+            if isinstance(s, Let):
+                rt = self._expr_record_type(s.expr, env)
+                if rt is None and s.type_name:
+                    base, _args = _type_ref_parts(s.type_name)
+                    rt = base if base in self.records else None
+                if rt:
+                    env[s.name] = rt
+            elif "." not in s.name:
+                rt = self._expr_record_type(s.expr, env)
+                if rt:
+                    env[s.name] = rt
+        elif isinstance(s, Return):
+            self._collect_expr_effects(s.expr, env, out)
+        elif isinstance(s, ExprStmt):
+            self._collect_expr_effects(s.expr, env, out)
+        elif isinstance(s, If):
+            self._collect_expr_effects(s.cond, env, out)
+            for x in s.then:
+                self._collect_stmt_effects(x, env, out)
+            if isinstance(s.other, If):
+                self._collect_stmt_effects(s.other, env, out)
+            elif s.other:
+                for x in s.other:
+                    self._collect_stmt_effects(x, env, out)
+        elif isinstance(s, For):
+            self._collect_expr_effects(s.iterable, env, out)
+            for x in s.body:
+                self._collect_stmt_effects(x, env, out)
+        elif isinstance(s, While):
+            self._collect_expr_effects(s.cond, env, out)
+            for x in s.body:
+                self._collect_stmt_effects(x, env, out)
+        elif isinstance(s, Match):
+            self._collect_expr_effects(s.expr, env, out)
+            for _kind, _bindings, body in s.arms:
+                for x in body:
+                    self._collect_stmt_effects(x, env, out)
+        elif isinstance(s, Try):
+            self._collect_expr_effects(s.expr, env, out)
+        # Nested declarations, imports, break/continue: no runtime effects at
+        # the point of declaration.
+
+    def _expr_record_type(self, e, env):
+        if isinstance(e, RecordLit):
+            return e.name if e.name in self.records else None
+        if isinstance(e, RecordUpdate):
+            return self._expr_record_type(e.base, env)
+        if isinstance(e, Var):
+            return env.get(e.name)
+        return None
+
+    def _collect_expr_effects(self, e, env, out):
+        if e is None or isinstance(e, (Literal, Var, Lambda)):
+            return
+        if isinstance(e, Call):
+            name = e.name
+            if name in BUILTINS:
+                out |= BUILTINS[name][0]
+            elif name in self.funcs:
+                out |= self._effective_fn_effects(self.funcs[name])
+            elif "." in name:
+                for m in self._method_candidates(name, env):
+                    out |= self._effective_method_effects(m)
+            for a in e.args:
+                self._collect_expr_effects(a, env, out)
+            return
+        if isinstance(e, CallExpr):
+            self._collect_expr_effects(e.callee, env, out)
+            if isinstance(e.callee, Lambda):
+                out |= set(e.callee.effects or ())
+            elif isinstance(e.callee, Var) and e.callee.name in self.funcs:
+                out |= self._effective_fn_effects(self.funcs[e.callee.name])
+            for a in e.args:
+                self._collect_expr_effects(a, env, out)
+            return
+        if isinstance(e, ListExpr):
+            for x in e.items:
+                self._collect_expr_effects(x, env, out)
+            return
+        if isinstance(e, MapExpr):
+            for x in e.items.values():
+                self._collect_expr_effects(x, env, out)
+            return
+        if isinstance(e, Unary):
+            self._collect_expr_effects(e.right, env, out)
+            return
+        if isinstance(e, Binary):
+            self._collect_expr_effects(e.left, env, out)
+            self._collect_expr_effects(e.right, env, out)
+            return
+        if isinstance(e, Index):
+            self._collect_expr_effects(e.base, env, out)
+            self._collect_expr_effects(e.index, env, out)
+            return
+        if isinstance(e, Attr):
+            self._collect_expr_effects(e.base, env, out)
+            return
+        if isinstance(e, RecordLit):
+            for _k, v in e.fields:
+                self._collect_expr_effects(v, env, out)
+            return
+        if isinstance(e, RecordUpdate):
+            self._collect_expr_effects(e.base, env, out)
+            for _k, v in e.fields:
+                self._collect_expr_effects(v, env, out)
+            return
+        if isinstance(e, Pipe):
+            self._collect_expr_effects(e.base, env, out)
+            for _stage, args in e.stages:
+                for a in args:
+                    if not isinstance(a, str):
+                        self._collect_expr_effects(a, env, out)
+            return
+        if isinstance(e, Try):
+            self._collect_expr_effects(e.expr, env, out)
+            return
+
     def program(self, stmts):
         # Type aliases live in the type namespace. Register them first so a
         # record/enum declared later can be rejected when it collides, and so
@@ -2661,6 +2894,10 @@ class Checker:
                     if e.src is None:
                         e.src = getattr(s, "_src", None)
                     raise
+        # Infer effects for declarations that omit the ``effects`` clause.
+        # Runs after all functions/records are registered and inherited fields
+        # are flattened, so calls (including forward ones) resolve.
+        self._infer_effects()
         # Method bodies are checked after every record, function and enum is
         # registered so a method can call records/functions/enums declared
         # later in the file (and other methods of the same record).
@@ -3015,11 +3252,12 @@ class Checker:
             old_sink = self._infer_sink
             self._infer_sink = None
             try:
-                for s in f.body: self.stmt(s, f.effects or set())
+                for s in f.body: self.stmt(s, self._effective_fn_effects(f))
             finally:
                 self._infer_sink = old_sink
+
             used = set(self.effects); self.effects = old; self.ret_type = old_ret
-            allowed = f.effects or set()
+            allowed = self._effective_fn_effects(f)
             bad = used - allowed
             if bad: raise GamaEffectError(f"function {f.name} uses undeclared effects: {','.join(sorted(bad))}", f.line, f.col)
         finally:
@@ -3056,11 +3294,12 @@ class Checker:
             old_sink = self._infer_sink
             self._infer_sink = None
             try:
-                for s in m.body: self.stmt(s, m.effects or set())
+                for s in m.body: self.stmt(s, self._effective_method_effects(m))
             finally:
                 self._infer_sink = old_sink
+
             used = set(self.effects); self.effects = old; self.ret_type = old_ret
-            bad = used - (m.effects or set())
+            bad = used - self._effective_method_effects(m)
             if bad:
                 raise GamaEffectError(
                     f"method {record_name}.{m.name} uses undeclared effects: "
@@ -3111,9 +3350,10 @@ class Checker:
                 raise GamaTypeError(
                     f"{rt}.{method_name}: {p.name} {at} != {want}",
                     e.line, e.col)
-        self.effects |= (m.effects or set())
+        self.effects |= self._effective_method_effects(m)
         mret = self._ret_of(m, method_record=rt)
         if not mret:
+
             return "Any"
         return self.resolve_field_type(rt, mret)
 
@@ -3732,8 +3972,9 @@ class Checker:
                     if not self.compat(at, want):
                         raise GamaTypeError(
                             f"{e.name}: {p.name} {at} != {want}", e.line, e.col)
-                self.effects |= (f.effects or set())
+                self.effects |= self._effective_fn_effects(f)
                 rt = self._ret_of(f)
+
                 if rt in bindings:
                     rt = bindings[rt]
                 return self.erase_type(rt)
@@ -3762,8 +4003,9 @@ class Checker:
                     elif not self.compat(
                             at, self._erase_ann(p.type_name, tparam_set)):
                         raise GamaTypeError(f"{e.name}: {p.name} {at} != {p.type_name}", e.line, e.col)
-                self.effects |= (f.effects or set())
+                self.effects |= self._effective_fn_effects(f)
                 rt = self._ret_of(f)
+
                 if rt in tparam_set:
                     return bindings.get(rt, "Any")
                 return self._erase_ann(rt, tparam_set)
@@ -3771,8 +4013,9 @@ class Checker:
                 at = self.expr(a)
                 want = self.erase_type(p.type_name)
                 if not self.compat(at, want): raise GamaTypeError(f"{e.name}: {p.name} {at} != {p.type_name}", e.line, e.col)
-            self.effects |= (f.effects or set())
+            self.effects |= self._effective_fn_effects(f)
             return self.erase_type(self._ret_of(f))
+
         if isinstance(e, CallExpr):
             ct = self.expr(e.callee)
             if ct not in ("Function", "Any"):
