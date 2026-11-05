@@ -979,7 +979,8 @@ class _Compiler:
             # above.  A name that is missing at run time reports the same
             # "unknown function" error as the reference interpreter.
             self.emit(
-                "CHECK_CALL", (expr.name, len(expr.args), expr.line, expr.col))
+                "CHECK_CALL", (expr.name, len(expr.args), expr.line, expr.col,
+                               getattr(expr, "_dispatch_record", None)))
             for arg in expr.args:
                 self.compile_expr(arg)
             self.emit("CALL", len(expr.args))
@@ -1259,7 +1260,8 @@ class _VM:
         return obj
 
     def _resolve_method(self, name: str, argc: int, frame: Frame,
-                        row: Any, line: int, col: int):
+                        row: Any, line: int, col: int,
+                        dispatch_record: str | None = None):
         """Resolve a dotted call to a record method, or ``None``.
 
         Mirrors ``Interpreter.method_call``: only record receivers with a
@@ -1267,7 +1269,9 @@ class _VM:
         non-record receiver, or a record type not in the table falls through
         (so namespaced functions and unknown-function diagnostics keep their
         old behaviour).  A declared record without that method is an error.
-        Arity is checked before the arguments are evaluated.
+        Arity is checked before the arguments are evaluated.  ``dispatch_record``
+        is the static receiver type recorded by the checker; it selects the
+        method when the runtime value is a structurally compatible record.
         """
         if "." not in name:
             return None
@@ -1282,18 +1286,21 @@ class _VM:
             return None
         if receiver.type_name not in self.records:
             return None
-        table = self.methods.get(receiver.type_name)
+        rec_name = (dispatch_record
+                    if dispatch_record in self.records
+                    else receiver.type_name)
+        table = self.methods.get(rec_name)
         proto = table.get(method_name) if table else None
         if proto is None:
             raise IRRuntimeError(
-                f"unknown method {method_name!r} on {receiver.type_name}",
+                f"unknown method {method_name!r} on {rec_name}",
                 line, col)
         required = sum(1 for p in proto.params if p.default is None)
         if not (required <= argc <= len(proto.params)):
             raise IRRuntimeError(
-                f"{receiver.type_name}.{method_name} expects {required}.."
+                f"{rec_name}.{method_name} expects {required}.."
                 f"{len(proto.params)} args, got {argc}", line, col)
-        closure = self.record_env.get(receiver.type_name, self.root)
+        closure = self.record_env.get(rec_name, self.root)
         return _MethodTarget(proto, closure, receiver)
 
     def _define_record(self, name: str, fields: tuple[str, ...],
@@ -1670,7 +1677,8 @@ class _VM:
                     if len(frames) > 1:
                         frames.pop()
             elif op == "CHECK_CALL":
-                name, argc, line, col = arg
+                name, argc, line, col = arg[:4]
+                dispatch = arg[4] if len(arg) > 4 else None
                 entry = self.functions.get(name)
                 if entry is not None:
                     proto, closure = entry
@@ -1726,7 +1734,8 @@ class _VM:
                             # unknown function) and raises for a declared
                             # record with a missing method or bad arity.
                             target = self._resolve_method(
-                                name, argc, frames[-1], row, line, col)
+                                name, argc, frames[-1], row, line, col,
+                                dispatch)
                             if target is not None:
                                 stack.append(target)
                                 continue

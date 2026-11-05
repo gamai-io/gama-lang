@@ -2251,6 +2251,10 @@ class Checker:
         if m is None:
             raise GamaTypeError(
                 f"unknown method {method_name!r} on {rt}", e.line, e.col)
+        # Remember the static receiver type: methods dispatch on the static
+        # target type even when the runtime value is a structurally compatible
+        # record (e.g. a Point3 value held in a ``Point`` binding).
+        e._dispatch_record = rt
         params = m.params[1:]
         required = sum(1 for p in params if p.default is None)
         if not (required <= len(e.args) <= len(params)):
@@ -2270,7 +2274,52 @@ class Checker:
         return self.resolve_field_type(rt, m.ret)
 
     def compat(self, got, want):
-        return want in ("Any", got) or (want in NUM and got in NUM) or (want == "List" and got in ("List", "Table"))
+        return (want in ("Any", got)
+                or (want in NUM and got in NUM)
+                or (want == "List" and got in ("List", "Table"))
+                or self._structural_compat(got, want, set()))
+
+    def _structural_compat(self, got, want, seen):
+        """Structural record compatibility: ``got`` has every ``want`` field.
+
+        Extra fields on ``got`` are allowed; a missing field or an
+        incompatible field type is rejected.  Field types recurse with the
+        same rules, so nested records compose.  This only affects static
+        assignment/argument/return checks: values keep their nominal record
+        type, printing and equality at runtime.  ``seen`` makes recursive
+        record graphs coinductive (a repeated pair is assumed compatible).
+        """
+        if not isinstance(got, str) or not isinstance(want, str):
+            return False
+        if got == want:
+            return True
+        got_rec = self.records.get(got)
+        want_rec = self.records.get(want)
+        if got_rec is None or want_rec is None:
+            return False
+        key = (got, want)
+        if key in seen:
+            return True
+        seen.add(key)
+        got_fields = dict(got_rec.fields)
+        for field, want_field in want_rec.fields:
+            if field not in got_fields:
+                return False
+            got_type = self.resolve_field_type(got, got_fields[field])
+            want_type = self.resolve_field_type(want, want_field)
+            if not self._structural_type_compat(got_type, want_type, seen):
+                return False
+        return True
+
+    def _structural_type_compat(self, got, want, seen):
+        """Compatibility of two erased field types inside a structural match."""
+        if want in ("Any", got):
+            return True
+        if want in NUM and got in NUM:
+            return True
+        if want == "List" and got in ("List", "Table"):
+            return True
+        return self._structural_compat(got, want, seen)
     def _check_type_bound(self, fname, tp, got, bounds, line, col):
         bound = bounds.get(tp)
         if not bound or got == "Any":
@@ -3895,23 +3944,29 @@ class Interpreter:
             return _NO_METHOD
         if not isinstance(receiver, RecordVal):
             return _NO_METHOD
-        rec = self.records.get(receiver.type_name)
+        # Methods dispatch on the statically resolved target type when the
+        # checker recorded one, so a structurally compatible value (Point3 in
+        # a ``Point`` binding) still runs the method declared for ``Point``.
+        dispatch = getattr(e, "_dispatch_record", None)
+        rec_name = (dispatch if dispatch in self.records
+                    else receiver.type_name)
+        rec = self.records.get(rec_name)
         if rec is None:
             return _NO_METHOD
         m = next((x for x in rec.methods if x.name == method_name), None)
         if m is None:
             raise GamaRuntimeError(
-                f"unknown method {method_name!r} on {receiver.type_name}",
+                f"unknown method {method_name!r} on {rec_name}",
                 e.line, e.col)
         params = m.params[1:]
         required = sum(1 for p in params if p.default is None)
         if not (required <= len(e.args) <= len(params)):
             raise GamaRuntimeError(
-                f"{receiver.type_name}.{method_name} expects {required}.."
+                f"{rec_name}.{method_name} expects {required}.."
                 f"{len(params)} args, got {len(e.args)}", e.line, e.col)
-        closure = self.record_env.get(receiver.type_name, self.env)
+        closure = self.record_env.get(rec_name, self.env)
         fv = FunctionVal(params, m.ret, m.effects, m.body, closure,
-                         f"{receiver.type_name}.{m.name}")
+                         f"{rec_name}.{m.name}")
         return self.invoke(fv, e.args, env, row, e.line, e.col,
                            self_value=receiver)
     def expr(self, e, env, row=None):

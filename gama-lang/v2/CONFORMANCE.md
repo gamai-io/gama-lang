@@ -78,7 +78,11 @@ These are outside the T1–T10 checks or only partially covered; see
    unchanged nested record values are shallow-copied (shared) and updating a
    replaced field does not affect the receiver. Generics on named functions, records and enums are implemented with type
    erasure; bounds, generic lambdas, record methods and static record functions
-   are implemented; structural subtyping is missing. The IR prototype supports
+   are implemented; structural record compatibility is implemented for static
+   checks (extra fields allowed, missing/wrong-type fields rejected; runtime
+   values stay nominal and methods dispatch on the static target type). The IR
+   prototype performs no type checking of its own and preserves the same
+   field/static-method runtime behavior. The IR prototype supports
    records, enums (nullary, payload, generic erasure), copy/`with`, in-place
    field assignment, record methods (self binding, defaults, method-to-method
    calls, mutation, nested/namespaced receivers) and first-class
