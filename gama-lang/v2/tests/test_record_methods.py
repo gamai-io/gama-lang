@@ -1,4 +1,4 @@
-"""Record methods: parsing, checking, binding and explicit IR rejection.
+"""Record methods: parsing, checking, binding and IR parity.
 
 Semantics under test:
 
@@ -13,8 +13,8 @@ Semantics under test:
   wrong argument types, bad ``self`` declarations and duplicate method names
   as ``GamaTypeError``.
 * Methods on namespaced records (``geo.Point`` via an aliased import) work.
-* The bytecode IR has no method table, so it rejects record declarations that
-  carry methods instead of compiling a silently wrong record.
+* The bytecode IR compiles record declarations that carry methods and produces
+  the same observable behaviour as the interpreter.
 * The formatter round-trips method declarations.
 """
 import pathlib
@@ -337,9 +337,14 @@ class RecordMethodsFormatter(unittest.TestCase):
         self.assertEqual(G.run(formatted).out, ["6"])
 
 
-class RecordMethodsIRRejected(unittest.TestCase):
-    def test_ir_rejects_record_methods_explicitly(self):
-        src = (
+class RecordMethodsIR(unittest.TestCase):
+    def assert_same(self, src):
+        expected = G.run(src).out
+        got = IR.run_program(G.check(src)).out
+        self.assertEqual(got, expected)
+
+    def test_ir_runs_record_methods(self):
+        self.assert_same(
             'record Point {\n'
             '  x: Int\n'
             '  y: Int\n'
@@ -347,14 +352,18 @@ class RecordMethodsIRRejected(unittest.TestCase):
             '}\n'
             'let p = Point(1, 2)\n'
             'print p.sum()\n')
-        ast = G.check(src)  # checker accepts it...
-        with self.assertRaisesRegex(IR.IRUnsupported, "record methods"):
-            IR.compile_program(ast)  # ...but the IR refuses, not silently wrong
 
-    def test_ir_rejects_methods_even_without_a_call(self):
-        ast = G.parse('record P { x: Int fn f(self: P) -> Int { return 1 } }\n')
-        with self.assertRaisesRegex(IR.IRUnsupported, "record methods"):
-            IR.compile_program(ast)
+    def test_ir_registers_methods_before_their_declaration_runs(self):
+        # The interpreter registers top-level records (and their methods) up
+        # front, so a call before the declaration statement still works.
+        self.assert_same(
+            'let p = Point(2, 3)\n'
+            'print p.sum()\n'
+            'record Point {\n'
+            '  x: Int\n'
+            '  y: Int\n'
+            '  fn sum(self: Point) -> Int { return self.x + self.y }\n'
+            '}\n')
 
 
 if __name__ == "__main__":

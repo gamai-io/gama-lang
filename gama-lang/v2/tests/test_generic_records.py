@@ -269,7 +269,7 @@ class GenericRecordTests(unittest.TestCase):
             'print Box(9)\n')
         self.assertEqual(gama_ir.run_program(ast).out, ["Box { value: 9 }"])
 
-    def test_ir_rejects_record_methods(self):
+    def test_ir_erases_method_record_type_parameters(self):
         ast = G.check(
             'record Box<T> {\n'
             '  value: T\n'
@@ -277,9 +277,7 @@ class GenericRecordTests(unittest.TestCase):
             '}\n'
             'let b: Box<Int> = Box(1)\n'
             'print b.get()\n')
-        with self.assertRaisesRegex(gama_ir.IRUnsupported,
-                                    r"record methods"):
-            gama_ir.run_program(ast)
+        self.assertEqual(gama_ir.run_program(ast).out, ["1"])
 
 
 if __name__ == "__main__":

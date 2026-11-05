@@ -13,9 +13,9 @@ Supported statements
 ``let`` / ``:=`` (assign), ``print``, ``if``/``else`` (including ``else if``
 chains), ``while``, ``for`` (list/text iteration), ``break``, ``continue``,
 ``match`` on ``Ok``/``Err`` results and enum variants (nullary, one-payload and
-multi-payload patterns), ``record`` and ``enum`` declarations (including payload
-variants), ``fn`` (named function definitions), ``return`` (inside functions
-only), and expression statements.
+multi-payload patterns), ``record`` and ``enum`` declarations (including
+payload variants and record methods), ``fn`` (named function definitions),
+``return`` (inside functions only), and expression statements.
 
 Supported expressions
 ---------------------
@@ -33,7 +33,10 @@ variants ``Color.Red`` and payload constructors ``Some(5)`` /
 comparisons ``== != < <= > >=`` and short-circuit ``&&``/``||``; indexing
 ``base[i]`` (list/text, with the reference interpreter's ``int`` coercion and
 Python-style negative indices); calls to *named, user-defined* functions
-(including recursion and default parameters); lambda expressions
+(including recursion and default parameters); record method calls
+``p.m(args)`` (the receiver is bound to ``self``; defaults, method-to-method
+calls, recursion, nested receivers ``o.inner.m()`` and namespaced records
+``geo.Point`` are supported); lambda expressions
 ``fn(x: Int) -> Int { ... }`` compiled to function values that capture the
 defining lexical frame; calls through function values (``f(2)`` for a
 ``Function``-typed binding, a ``Function`` parameter, or any expression callee
@@ -49,6 +52,9 @@ and the core builtins ``len``, ``text``, ``number``, ``round`` and
 
 Records and enums follow the reference runtime exactly: record values are
 nominal (type name plus declaration-ordered fields, value-based equality),
+record methods live in a per-nominal table and dispatch only on record
+receivers (named functions and enum constructors keep precedence, as in the
+interpreter),
 enum values are ``Enum.Variant`` (nullary) or ``Enum.Variant(payload, ...)``,
 and both reuse the reference value classes for rendering.  Declarations are registered before the program runs
 (so functions may refer to records/enums declared later) and nested record
@@ -189,6 +195,11 @@ class IRRuntimeError(IRError, g2.GamaError):
         return f"{self.msg} (line {self.line}, col {self.col})"
 
 
+# Sentinel for "this call has no implicit ``self``" (a record value is never
+# ``None``, but a distinct object keeps the check obvious and robust).
+_NO_SELF = object()
+
+
 # ------------------------------------------------------------------ IR data
 @dataclass
 class Instr:
@@ -226,6 +237,11 @@ class Program:
     # name to its ordered field names and an enum name to its variant set; the
     # VM seeds its registries from these before running ``main``.
     records: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    # ``record -> {method name -> FunctionProto}`` for top-level records.  The
+    # VM seeds these before ``main`` runs (the reference interpreter registers
+    # top-level records and their methods up front), and nested declarations
+    # install their methods via ``DEF_RECORD`` when execution reaches them.
+    methods: dict[str, dict[str, "FunctionProto"]] = field(default_factory=dict)
     # ``enum -> (frozenset of variant names | variant -> payload type tuple)``.
     # A payload-free enum keeps the historical ``frozenset`` shape; an enum
     # with at least one payload stores ``{variant: (type, ...)}`` (nullary
@@ -543,7 +559,7 @@ class _Compiler:
     tracked so ``break``/``continue`` can unwind them precisely."""
 
     def __init__(self, in_function: bool = False, records=None, enums=None,
-                 ret_type: str | None = None):
+                 ret_type: str | None = None, methods=None):
         self.code = Code()
         self.frame_depth = 0
         self.loops: list[dict] = []
@@ -557,6 +573,11 @@ class _Compiler:
         # ``RecordLit`` are resolved dynamically at run time.
         self.records: dict[str, tuple[str, ...]] = records if records is not None else {}
         self.enums: dict[str, Any] = enums if enums is not None else {}
+        # Compiled methods per nominal record.  Only the main compiler's table
+        # is copied into ``Program.methods`` (top-level declarations); body
+        # compilers keep their own copies so nested declarations do not leak.
+        self.methods: dict[str, dict[str, FunctionProto]] = (
+            methods if methods is not None else {})
 
     # -- emission helpers ------------------------------------------------
     def emit(self, op: str, arg: Any = None) -> int:
@@ -595,14 +616,18 @@ class _Compiler:
             self.emit("NOP")
             return
         if isinstance(stmt, g2.RecordDecl):
-            if getattr(stmt, "methods", None):
-                # The IR value model has no method table or bound calls; reject
-                # explicitly instead of compiling a record that silently loses
-                # its methods (and would fail later on the call instead).
-                _unsupported(stmt, "record methods")
             fields = tuple(fn for fn, _ft in stmt.fields)
+            # Methods compile exactly like named functions; the first
+            # parameter (``self``) is bound by the call path, not passed by
+            # the caller, so it is dropped from the prototype's params just
+            # like ``Interpreter.method_call`` uses ``m.params[1:]``.
+            methods: dict[str, FunctionProto] = {}
+            for m in getattr(stmt, "methods", None) or []:
+                methods[m.name] = self._compile_proto(
+                    f"{stmt.name}.{m.name}", m.params[1:], m.body, m.ret)
             self.records[stmt.name] = fields
-            self.emit("DEF_RECORD", (stmt.name, fields))
+            self.methods[stmt.name] = methods
+            self.emit("DEF_RECORD", (stmt.name, fields, methods))
             return
         if isinstance(stmt, g2.EnumDecl):
             spec = _enum_spec(stmt.variants)
@@ -823,6 +848,7 @@ class _Compiler:
             records=dict(self.records),
             enums=dict(self.enums),
             ret_type=(ret or "Any"),
+            methods=dict(self.methods),
         )
         body.compile_statements(body_stmts)
         body.emit("CONST", None)
@@ -1080,8 +1106,24 @@ class _EnumCtorTarget:
         self.variant = variant
 
 
+class _MethodTarget:
+    """A resolved record method call: prototype, closure and bound receiver.
+
+    The receiver is evaluated before the arguments (matching
+    ``Interpreter.method_call``) and bound to ``self`` when the call runs.
+    """
+
+    __slots__ = ("proto", "closure", "receiver")
+
+    def __init__(self, proto: FunctionProto, closure: Frame, receiver: Any):
+        self.proto = proto
+        self.closure = closure
+        self.receiver = receiver
+
+
 class _VM:
-    def __init__(self, initial: Any = None, records=None, enums=None):
+    def __init__(self, initial: Any = None, records=None, enums=None,
+                 methods=None):
         if initial is None:
             self.root = Frame()
         elif isinstance(initial, Frame):
@@ -1098,9 +1140,17 @@ class _VM:
         # by declarations that activate only at run time.
         self.records: dict[str, tuple[str, ...]] = dict(records or {})
         self.enums: dict[str, Any] = dict(enums or {})
+        # Record methods and their declaration frames.  Top-level records are
+        # callable before their declaration statement because the reference
+        # interpreter registers them (with the top-level env) up front.
+        self.methods: dict[str, dict[str, FunctionProto]] = {
+            name: dict(table) for name, table in (methods or {}).items()}
+        self.record_env: dict[str, Frame] = {
+            name: self.root for name in self.records}
 
     # -- call handling ---------------------------------------------------
-    def _invoke(self, proto: FunctionProto, closure: Frame, args: list) -> Any:
+    def _invoke(self, proto: FunctionProto, closure: Frame, args: list,
+                self_value: Any = _NO_SELF) -> Any:
         self.call_depth += 1
         try:
             limit = self._call_depth_limit()
@@ -1108,6 +1158,11 @@ class _VM:
                 raise IRRuntimeError(
                     f"call depth limit exceeded: {self.call_depth} > GAMA_L_MAX_CALL_DEPTH={limit}")
             local = Frame(parent=closure)
+            if self_value is not _NO_SELF:
+                # ``self`` is bound before parameters/defaults, exactly like
+                # ``Interpreter.invoke`` (defaults still evaluate in the
+                # method's declaration closure, not in the call frame).
+                local.define("self", self_value)
             for i, param in enumerate(proto.params):
                 if i < len(args):
                     local.define(param.name, args[i])
@@ -1203,8 +1258,52 @@ class _VM:
             obj = obj[part]
         return obj
 
-    def _define_record(self, name: str, fields: tuple[str, ...]) -> None:
+    def _resolve_method(self, name: str, argc: int, frame: Frame,
+                        row: Any, line: int, col: int):
+        """Resolve a dotted call to a record method, or ``None``.
+
+        Mirrors ``Interpreter.method_call``: only record receivers with a
+        declared method take this path.  An unresolvable receiver, a
+        non-record receiver, or a record type not in the table falls through
+        (so namespaced functions and unknown-function diagnostics keep their
+        old behaviour).  A declared record without that method is an error.
+        Arity is checked before the arguments are evaluated.
+        """
+        if "." not in name:
+            return None
+        receiver_name, _, method_name = name.rpartition(".")
+        if not receiver_name:
+            return None
+        try:
+            receiver = self._load_name(frame, (receiver_name, line, col), row)
+        except IRRuntimeError:
+            return None
+        if not isinstance(receiver, g2.RecordVal):
+            return None
+        if receiver.type_name not in self.records:
+            return None
+        table = self.methods.get(receiver.type_name)
+        proto = table.get(method_name) if table else None
+        if proto is None:
+            raise IRRuntimeError(
+                f"unknown method {method_name!r} on {receiver.type_name}",
+                line, col)
+        required = sum(1 for p in proto.params if p.default is None)
+        if not (required <= argc <= len(proto.params)):
+            raise IRRuntimeError(
+                f"{receiver.type_name}.{method_name} expects {required}.."
+                f"{len(proto.params)} args, got {argc}", line, col)
+        closure = self.record_env.get(receiver.type_name, self.root)
+        return _MethodTarget(proto, closure, receiver)
+
+    def _define_record(self, name: str, fields: tuple[str, ...],
+                       methods: dict[str, FunctionProto] | None,
+                       frame: Frame) -> None:
         self.records[name] = tuple(fields)
+        self.methods[name] = dict(methods or {})
+        # A nested record captures the frame where its declaration executed;
+        # top-level records were already seeded with the root frame.
+        self.record_env[name] = frame
 
     def _define_enum(self, name: str, spec) -> None:
         self.enums[name] = spec
@@ -1620,6 +1719,17 @@ class _VM:
                                 f"ambiguous enum constructor {name}; write "
                                 f"Enum.{name}", line, col) from None
                         if ctor is None:
+                            # Not a function value or enum constructor: a
+                            # dotted name on a record receiver is a method
+                            # call.  ``_resolve_method`` returns ``None`` when
+                            # the receiver is not a record (then this is an
+                            # unknown function) and raises for a declared
+                            # record with a missing method or bad arity.
+                            target = self._resolve_method(
+                                name, argc, frames[-1], row, line, col)
+                            if target is not None:
+                                stack.append(target)
+                                continue
                             raise IRRuntimeError(
                                 f"unknown function {name}", line, col)
                         base, variant, payloads = ctor
@@ -1644,6 +1754,10 @@ class _VM:
                 if isinstance(target, _EnumCtorTarget):
                     stack.append(g2.EnumVal(
                         target.enum, target.variant, payloads=tuple(args)))
+                elif isinstance(target, _MethodTarget):
+                    stack.append(self._invoke(
+                        target.proto, target.closure, args,
+                        self_value=target.receiver))
                 else:
                     stack.append(self._invoke(
                         target.proto, target.closure, args))
@@ -1680,8 +1794,8 @@ class _VM:
             elif op == "DEF":
                 self.functions[arg.name] = (arg, frames[-1])
             elif op == "DEF_RECORD":
-                name, fields = arg
-                self._define_record(name, fields)
+                name, fields, methods = arg
+                self._define_record(name, fields, methods, frames[-1])
             elif op == "DEF_ENUM":
                 name, variants = arg
                 self._define_enum(name, variants)
@@ -1735,7 +1849,14 @@ def compile_program(ast: Any) -> Program:
     top_records, top_enums = _top_level_decls(stmts)
     compiler = _Compiler(records=dict(top_records), enums=dict(top_enums))
     compiler.compile_statements(stmts)
-    return Program(compiler.code, top_records, top_enums)
+    # Only declarations that are top-level *statements* are registered up
+    # front; a record inside an ``if``/function installs its methods via
+    # ``DEF_RECORD`` when execution reaches it.
+    top_methods = {
+        name: table for name, table in compiler.methods.items()
+        if name in top_records}
+    return Program(compiler.code, records=top_records, enums=top_enums,
+                   methods=top_methods)
 
 
 def compile_file(path: Any) -> Program:
@@ -1765,7 +1886,7 @@ def run_program(ast: Any, env: Any = None) -> RunResult:
     :class:`Frame`, or ``None``.
     """
     program = ast if isinstance(ast, Program) else compile_program(ast)
-    vm = _VM(env, program.records, program.enums)
+    vm = _VM(env, program.records, program.enums, program.methods)
     vm._exec(program.main, vm.root)
     return RunResult(list(vm.out), dict(vm.root.outermost().vars))
 

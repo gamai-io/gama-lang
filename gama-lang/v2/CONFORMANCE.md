@@ -80,8 +80,9 @@ These are outside the T1–T10 checks or only partially covered; see
    erasure; bounds, generic lambdas, record methods and static record functions
    are implemented; structural subtyping is missing. The IR prototype supports
    records, enums (nullary, payload, generic erasure), copy/`with`, in-place
-   field assignment and first-class functions/lambdas with interpreter parity
-   for its documented subset.
+   field assignment, record methods (self binding, defaults, method-to-method
+   calls, mutation, nested/namespaced receivers) and first-class
+   functions/lambdas with interpreter parity for its documented subset.
 5. **Formatter edges.** `fmt` is AST-based; it preserves comments and strings,
    is idempotent, and wraps at a configurable width (default 88,
    `fmt --width`): expressions (list/map/record literals, calls, binary chains,
