@@ -168,6 +168,13 @@ class IRMatchesInterpreter(unittest.TestCase):
     def test_expression_statement_call(self):
         self.assert_same('fn f() -> Int { return 3 }\nf()\nprint f()\n')
 
+    def test_lambda_value_and_call(self):
+        self.assert_same(
+            'let inc = fn(x: Int) -> Int { return x + 1 }\nprint inc(41)\n')
+
+    def test_expression_callee_iife(self):
+        self.assert_same('print (fn(x: Int) -> Int { return x + 1 })(41)\n')
+
 
 class IRRejectsUnsupported(unittest.TestCase):
     # ``for``, list/map literals, indexing, ``match`` and the core builtins
@@ -195,12 +202,6 @@ class IRRejectsUnsupported(unittest.TestCase):
 
     def test_import_statement(self):
         self.assert_unsupported('import "x.gm"\n')
-
-    def test_lambda(self):
-        self.assert_unsupported('let f = fn(x: Int) -> Int { return x }\n')
-
-    def test_expression_callee(self):
-        self.assert_unsupported('print (fn(x: Int) -> Int { return x })(1)\n')
 
     def test_builtin_sql_call(self):
         self.assert_unsupported('print sql("select 1")\n')

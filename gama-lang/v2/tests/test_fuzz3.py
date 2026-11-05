@@ -598,12 +598,19 @@ class IRUnsupportedTests(unittest.TestCase):
         ("wait_user", 'wait user "ok?"\n'),
         ("ask", 'print ask("q")\n'),
         ("try", "print Ok(1)?\n"),
-        ("lambda", "let f = fn(x: Int) -> Int { return x }\nprint f(1)\n"),
+        # Lambdas and expression callees are supported now; these slots keep
+        # constructs that are still outside the IR subset.
+        ("record methods",
+         "record Point {\n"
+         "  x: Int\n"
+         "  fn sum(self: Point) -> Int { return self.x }\n"
+         "}\n"
+         "print 1\n"),
         ("unsupported builtin", 'print upper("x")\n'),
         ("unsupported helper", "print is_ok(Ok(1))\n"),
         ("break outside loop", "break\n"),
         ("return outside function", "return 1\n"),
-        ("expression callee", "print (fn(x: Int) -> Int { return x })(1)\n"),
+        ("unsupported sql builtin", 'print sql("select 1")\n'),
     )
 
     def test_case_count(self):

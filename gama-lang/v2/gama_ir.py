@@ -33,7 +33,12 @@ variants ``Color.Red`` and payload constructors ``Some(5)`` /
 comparisons ``== != < <= > >=`` and short-circuit ``&&``/``||``; indexing
 ``base[i]`` (list/text, with the reference interpreter's ``int`` coercion and
 Python-style negative indices); calls to *named, user-defined* functions
-(including recursion and default parameters); the Result propagation operator
+(including recursion and default parameters); lambda expressions
+``fn(x: Int) -> Int { ... }`` compiled to function values that capture the
+defining lexical frame; calls through function values (``f(2)`` for a
+``Function``-typed binding, a ``Function`` parameter, or any expression callee
+such as ``(fn ...)(2)``); reading a named function as a value (``let g = add``,
+including namespaced functions); the Result propagation operator
 ``expr?`` (inside a function whose declared return type is ``Result`` or
 ``Any``: ``Ok`` yields its payload, ``Err`` returns that ``Err`` from the
 enclosing function); pipe expressions ``base | filter <expr> | select a, b |
@@ -93,11 +98,17 @@ Limitations (raise ``IRUnsupported`` / documented runtime errors)
   messages. Named record construction with a dotted type name
   (``geo.Point { ... }``) is not accepted by the parser; positional
   construction ``geo.Point(1, 2)`` works.
-* First-class function values (including reading a namespaced function as a
-  value) are unsupported.  Pipe expressions *are* supported for the six
-  documented stages; a hand-built AST with an unknown stage keyword (or a
-  stage missing its required argument) is rejected with :class:`IRUnsupported`
-  rather than silently ignored.
+* First-class functions are supported for IR-compiled functions only: lambdas
+  and named IR functions (including namespaced ones) can be stored, passed,
+  returned and called.  A value injected through ``run_program(env=...)`` must
+  be an IR function closure; host callables are never invoked.  Calls are
+  checked for callability and arity *before* their arguments are evaluated and
+  raise :class:`IRRuntimeError` with the interpreter's messages
+  (``expression is not callable (...)``, ``... is not callable (...)``,
+  ``<lambda> expects N..M args, got K``).  Pipe expressions are supported for
+  the six documented stages; a hand-built AST with an unknown stage keyword
+  (or a stage missing its required argument) is rejected with
+  :class:`IRUnsupported` rather than silently ignored.
 * ``?`` is accepted only inside a named function whose declared return type is
   ``Result`` or ``Any``. Using it at the top level, in a function returning a
   concrete non-``Result`` type, or inside a default-parameter expression is
@@ -790,20 +801,35 @@ class _Compiler:
         self.emit("JUMP", ctx["continue"])
 
     def compile_function(self, stmt: g2.Fn) -> FunctionProto:
-        # Function bodies get their own nominal tables (copied) so a record
-        # declared inside one body does not leak into later top-level code.
+        return self._compile_proto(
+            stmt.name, stmt.params, stmt.body, stmt.ret)
+
+    def compile_lambda(self, expr: g2.Lambda) -> FunctionProto:
+        """Compile a lambda body exactly like a named function body.
+
+        The only difference is the display name used by runtime messages
+        (``<lambda>``), matching :class:`gamal2.FunctionVal`'s default.
+        """
+        return self._compile_proto(
+            "<lambda>", expr.params, expr.body, expr.ret)
+
+    def _compile_proto(self, name: str, params_node: list, body_stmts: list,
+                       ret: str | None) -> FunctionProto:
+        # Function/lambda bodies get their own nominal tables (copied) so a
+        # record declared inside one body does not leak into later top-level
+        # code.
         body = _Compiler(
             in_function=True,
             records=dict(self.records),
             enums=dict(self.enums),
-            ret_type=(stmt.ret or "Any"),
+            ret_type=(ret or "Any"),
         )
-        body.compile_statements(stmt.body)
+        body.compile_statements(body_stmts)
         body.emit("CONST", None)
         body.emit("RETURN")
 
         params: list[ParamProto] = []
-        for param in stmt.params:
+        for param in params_node:
             default: Code | None = None
             if param.default is not None:
                 default_compiler = _Compiler(
@@ -812,12 +838,17 @@ class _Compiler:
                 default_compiler.emit("RETURN")
                 default = default_compiler.code
             params.append(ParamProto(param.name, default))
-        return FunctionProto(stmt.name, params, body.code)
+        return FunctionProto(name, params, body.code)
 
     # -- expressions -----------------------------------------------------
     def compile_expr(self, expr: Any) -> None:
         if isinstance(expr, g2.Literal):
             self.emit("CONST", expr.value)
+            return
+        if isinstance(expr, g2.Lambda):
+            # Compile the body once and capture the defining frame at run time
+            # (``MAKE_FUNC``), mirroring ``FunctionVal(params, ..., env)``.
+            self.emit("MAKE_FUNC", self.compile_lambda(expr))
             return
         if isinstance(expr, g2.Var):
             if "." in expr.name:
@@ -927,6 +958,18 @@ class _Compiler:
                 self.compile_expr(arg)
             self.emit("CALL", len(expr.args))
             return
+        if isinstance(expr, g2.CallExpr):
+            # Expression callee: ``(fn ...)(2)``, ``make()(2)`` or
+            # ``(add)(20, 22)``.  The callee is evaluated first, then
+            # callability/arity are validated before the arguments run, just
+            # like ``Interpreter.expr(CallExpr)`` + ``invoke``.
+            self.compile_expr(expr.callee)
+            self.emit("CHECK_CALL_VALUE",
+                      (len(expr.args), expr.line, expr.col))
+            for arg in expr.args:
+                self.compile_expr(arg)
+            self.emit("CALL_VALUE", len(expr.args))
+            return
         _unsupported(expr)
 
     def _stage_code(self, expr: Any) -> Code:
@@ -1000,6 +1043,31 @@ class _CallTarget:
     def __init__(self, proto: FunctionProto, closure: Frame):
         self.proto = proto
         self.closure = closure
+
+
+class _FuncValue:
+    """A compiled callable: function prototype plus its captured frame.
+
+    This is the IR counterpart of :class:`gamal2.FunctionVal`.  ``closure`` is
+    the live lexical :class:`Frame` in which the lambda/function value was
+    created, so later mutations of captured variables are observed exactly like
+    the reference interpreter (closures capture environments, not snapshots).
+    """
+
+    __slots__ = ("proto", "closure")
+
+    def __init__(self, proto: FunctionProto, closure: Frame):
+        self.proto = proto
+        self.closure = closure
+
+    @property
+    def name(self) -> str:
+        return self.proto.name
+
+    def __str__(self) -> str:
+        return f"<fn {self.proto.name}>"
+
+    __repr__ = __str__
 
 
 class _EnumCtorTarget:
@@ -1099,6 +1167,13 @@ class _VM:
             return frame.get(name)
         except IRRuntimeError:
             pass
+        # A named function (local or namespaced) is a first-class value when it
+        # is not shadowed by a binding; the interpreter checks ``self.funcs``
+        # after the environment and before enum variants / field walks.
+        entry = self.functions.get(name)
+        if entry is not None:
+            proto, closure = entry
+            return _FuncValue(proto, closure)
         variant_value = self._enum_value(name, line, col)
         if variant_value is not None:
             return variant_value
@@ -1256,7 +1331,18 @@ class _VM:
                 if row is not None and arg in row:
                     stack.append(row[arg])
                 else:
-                    stack.append(frames[-1].get(arg))
+                    try:
+                        stack.append(frames[-1].get(arg))
+                    except IRRuntimeError:
+                        # Reading a named function as a value (``let g = add``)
+                        # resolves from the function table exactly like
+                        # ``Interpreter.expr``: the environment wins, then the
+                        # function (with its defining closure).
+                        entry = self.functions.get(arg)
+                        if entry is None:
+                            raise
+                        proto, closure = entry
+                        stack.append(_FuncValue(proto, closure))
             elif op == "LOAD_NAME":
                 stack.append(self._load_name(frames[-1], arg, row))
             elif op == "LET":
@@ -1496,33 +1582,59 @@ class _VM:
                             line, col)
                     stack.append(_CallTarget(proto, closure))
                 else:
-                    # Functions first, then enum constructors: the reference
-                    # interpreter resolves ``Call`` through ``self.funcs`` before
-                    # ``find_enum_variant``, so a user function shadows a variant
-                    # with the same name.  Arity/kind failures happen here,
-                    # before arguments are evaluated, exactly like the
-                    # interpreter (which checks before ``self.expr``).
+                    # A call name may also be a function value bound in the
+                    # current scope: a lambda, a named-function value or a
+                    # ``Function``-typed parameter.  The reference interpreter
+                    # resolves ``Call`` through ``self.funcs`` and then the
+                    # environment before enum constructors, so a non-callable
+                    # binding is an error rather than a constructor fallback.
+                    # Callability and arity are checked here, before arguments
+                    # are evaluated, exactly like the interpreter.
                     try:
-                        ctor = _resolve_enum_variant(self.enums, name)
-                    except _AmbiguousVariant:
-                        raise IRRuntimeError(
-                            f"ambiguous enum constructor {name}; write "
-                            f"Enum.{name}", line, col) from None
-                    if ctor is None:
-                        raise IRRuntimeError(
-                            f"unknown function {name}", line, col)
-                    base, variant, payloads = ctor
-                    if not payloads:
-                        raise IRRuntimeError(
-                            f"enum variant {base}.{variant} is nullary; write "
-                            f"{base}.{variant} without parentheses", line, col)
-                    if argc != len(payloads):
-                        raise IRRuntimeError(
-                            f"enum variant {base}.{variant} expects "
-                            f"{len(payloads)} payload argument"
-                            f"{'s' if len(payloads) != 1 else ''}, "
-                            f"got {argc}", line, col)
-                    stack.append(_EnumCtorTarget(base, variant))
+                        fnval = frames[-1].get(name)
+                    except IRRuntimeError:
+                        fnval = None
+                    if fnval is not None:
+                        if not isinstance(fnval, _FuncValue):
+                            raise IRRuntimeError(
+                                f"{name} is not callable ({g2.tname(fnval)})",
+                                line, col)
+                        proto = fnval.proto
+                        required = sum(
+                            1 for p in proto.params if p.default is None)
+                        if not (required <= argc <= len(proto.params)):
+                            raise IRRuntimeError(
+                                f"{fnval.name} expects {required}.."
+                                f"{len(proto.params)} args, got {argc}",
+                                line, col)
+                        stack.append(_CallTarget(proto, fnval.closure))
+                    else:
+                        # Functions first, then enum constructors: the
+                        # reference interpreter resolves ``Call`` through
+                        # ``self.funcs`` before ``find_enum_variant``, so a user
+                        # function shadows a variant with the same name.
+                        try:
+                            ctor = _resolve_enum_variant(self.enums, name)
+                        except _AmbiguousVariant:
+                            raise IRRuntimeError(
+                                f"ambiguous enum constructor {name}; write "
+                                f"Enum.{name}", line, col) from None
+                        if ctor is None:
+                            raise IRRuntimeError(
+                                f"unknown function {name}", line, col)
+                        base, variant, payloads = ctor
+                        if not payloads:
+                            raise IRRuntimeError(
+                                f"enum variant {base}.{variant} is nullary; "
+                                f"write {base}.{variant} without parentheses",
+                                line, col)
+                        if argc != len(payloads):
+                            raise IRRuntimeError(
+                                f"enum variant {base}.{variant} expects "
+                                f"{len(payloads)} payload argument"
+                                f"{'s' if len(payloads) != 1 else ''}, "
+                                f"got {argc}", line, col)
+                        stack.append(_EnumCtorTarget(base, variant))
             elif op == "CALL":
                 argc = arg
                 args = stack[-argc:] if argc else []
@@ -1535,6 +1647,36 @@ class _VM:
                 else:
                     stack.append(self._invoke(
                         target.proto, target.closure, args))
+            elif op == "CHECK_CALL_VALUE":
+                # Expression callee (``(fn ...)(2)``, ``make()(2)``): validate
+                # the already-evaluated callee before arguments run, matching
+                # ``Interpreter.expr(CallExpr)`` plus ``invoke``'s arity check.
+                argc, line, col = arg
+                target = stack[-1]
+                if not isinstance(target, _FuncValue):
+                    raise IRRuntimeError(
+                        f"expression is not callable ({g2.tname(target)})",
+                        line, col)
+                proto = target.proto
+                required = sum(1 for p in proto.params if p.default is None)
+                if not (required <= argc <= len(proto.params)):
+                    raise IRRuntimeError(
+                        f"{target.name} expects {required}.."
+                        f"{len(proto.params)} args, got {argc}",
+                        line, col)
+            elif op == "CALL_VALUE":
+                argc = arg
+                args = stack[-argc:] if argc else []
+                if argc:
+                    del stack[-argc:]
+                target = stack.pop()
+                stack.append(self._invoke(
+                    target.proto, target.closure, args))
+            elif op == "MAKE_FUNC":
+                # A lambda/function value captures the *current* frame, so
+                # later mutations of captured variables are visible, exactly
+                # like ``FunctionVal`` closure capture in the interpreter.
+                stack.append(_FuncValue(arg, frames[-1]))
             elif op == "DEF":
                 self.functions[arg.name] = (arg, frames[-1])
             elif op == "DEF_RECORD":

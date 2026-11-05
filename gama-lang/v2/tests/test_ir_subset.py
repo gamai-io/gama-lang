@@ -131,6 +131,13 @@ class IRSubsetMatchesInterpreter(unittest.TestCase):
             'for a in [1, 2, 3] { for b in [1, 2, 3] { match Ok(b) { Ok(v) { if v == 2 { break }\n total := total + v } _ { print "?" } } } }\n'
             'print total\n')
 
+    def test_lambda_value_and_call(self):
+        self.assert_same(
+            'let inc = fn(x: Int) -> Int { return x + 1 }\nprint inc(41)\n')
+
+    def test_expression_callee_iife(self):
+        self.assert_same('print (fn(x: Int) -> Int { return x + 1 })(41)\n')
+
 
 class IRSubsetRuntimeErrorsMatchInterpreter(unittest.TestCase):
     def assert_same_runtime_error(self, src):
@@ -193,6 +200,21 @@ class IRSubsetRuntimeErrorsMatchInterpreter(unittest.TestCase):
     def test_for_needs_list_or_text_scalar(self):
         self.assert_same_runtime_error('for x in 5 { print x }\n')
 
+    def test_lambda_arity(self):
+        self.assert_same_runtime_error(
+            'let inc = fn(x: Int) -> Int { return x + 1 }\nprint inc()\n')
+
+    def test_named_function_value_arity(self):
+        self.assert_same_runtime_error(
+            'fn add(a: Int, b: Int) -> Int { return a + b }\n'
+            'let f = add\nprint f(1)\n')
+
+    def test_call_non_callable_binding(self):
+        self.assert_same_runtime_error('let f = 5\nprint f(1)\n')
+
+    def test_call_non_callable_expression(self):
+        self.assert_same_runtime_error('print (5)(1)\n')
+
 
 class IRSubsetStillRejectsUnsupported(unittest.TestCase):
     def assert_unsupported(self, src):
@@ -216,12 +238,6 @@ class IRSubsetStillRejectsUnsupported(unittest.TestCase):
 
     # Dotted calls (``mod.fn()``) are supported now; their IR-vs-interpreter
     # parity lives in ``test_ir_namespaces.py``.
-
-    def test_lambda(self):
-        self.assert_unsupported('let f = fn(x: Int) -> Int { return x }\n')
-
-    def test_expression_callee(self):
-        self.assert_unsupported('print (fn(x: Int) -> Int { return x })(1)\n')
 
     def test_try_expression(self):
         self.assert_unsupported('fn f() -> Result { return Ok(1) }\nprint f()?\n')

@@ -199,8 +199,13 @@ Exact supported subset:
   (`Color.Red`, `Some(5)`, `Option.Some(5)`, `Pair(1, 2)`), `!`/`-`,
   `+ - * / %`, `== != < <= > >=`, short-circuit `&&`/`||`, indexing `base[i]`
   (list/text, reference `int` coercion, negative indices), calls to named
-  user-defined functions (recursion and default parameters included), and
-  Result propagation
+  user-defined functions (recursion and default parameters included), lambda
+  expressions `fn(x: Int) -> Int { ... }` compiled to IR function values that
+  capture the defining lexical frame, calls through function values (`f(2)`
+  for a `Function`-typed binding or parameter), named functions read as values
+  (`let g = add`, including namespaced functions), expression callees such as
+  IIFEs `(fn ...)(41)` and returned lambdas `makeAdder(5)(37)`, and Result
+  propagation
   `expr?` inside a function returning `Result`/`Any` (an `Err` returns from
   that function; `?` elsewhere is `IRUnsupported`), and pipe expressions
   `base | filter <expr> | select a, b | sum a | limit <expr> | count | map a`.
@@ -218,11 +223,14 @@ Exact supported subset:
 
 Not supported (raises `IRUnsupported`; the normal interpreter still supports
 them): `prove`/`verify`, unresolved `import` nodes (file imports go through
-`compile_file`), bare `Attr` expression nodes, lambdas and
-first-class/expression callees (including reading a namespaced function as a
-value), structural matching beyond `Ok`/`Err`/enum arms (records cannot be
-destructured; enum payload variants are fully supported), and all other builtins (`sql`, `ask`, `split`, `unwrap`, `wait_user`, mail,
-remember/recall, ...). The IR also does
+`compile_file`), bare `Attr` expression nodes, host callables injected through
+`run_program(env=...)` (first-class functions cover IR-compiled lambdas and
+named functions only), structural matching beyond `Ok`/`Err`/enum arms
+(records cannot be destructured; enum payload variants are fully supported),
+and all other builtins (`sql`, `ask`, `split`, `unwrap`, `wait_user`, mail,
+remember/recall, ...). First-class calls are checked for callability and arity
+before their arguments are evaluated and raise `IRRuntimeError` with the
+interpreter's messages. The IR also does
 not enforce `GAMA_L_MAX_STEPS`/`GAMA_L_LOOP_LIMIT` (it does honour
 `GAMA_L_MAX_CALL_DEPTH`); it is a prototype, not a hardened runtime. Map
 literals are JSON values, so text-keyed maps are not indexable. Successful
@@ -236,7 +244,7 @@ error messages keep the interpreter's text and line/col.
 - explicit module exports: `export fn`, `export let` and `export record` mark the alias-visible surface; other top-level declarations stay private but remain callable inside the module. A module with at least one `export` exposes only exported names through `import ... as`; a module with no `export` keeps the legacy behaviour (all top-level `fn`/`let`/`record` visible). Plain imports always flatten all declarations for compatibility. `export` is only allowed at top level, duplicate export names are rejected, and `export enum` is currently rejected: enums keep the legacy-global surface, so an aliased import always exposes `alias.Enum` regardless of any explicit export list.
 - `let` with optional type annotation, `:=` assignment
 - `fn` and SPEC `make` with typed parameters, defaults, return type, `effects { ... }`
-- generic type parameters on named functions with type erasure: `fn id<T>(x: T) -> T { return x }`, `fn pair<A, B>(a: A, b: B) -> Text { ... }`. Type parameters are valid in parameter, return and `let` annotations and are erased to `Any` by the checker/runtime, so a call accepts any argument type. The checker infers a call result from the arguments when the return type is a type parameter (`id(5): Int`, `id("x"): Text`) and otherwise erases to `Any`; non-type-parameter positions keep normal arity/type checks. Duplicate type parameters and duplicate parameter names are rejected. Generic functions remain ordinary first-class named functions (recursion, defaults, higher-order use, and IR compilation with erasure all work). Limits: no bounds and no generic lambdas; the IR backend has no named-function-as-value support for either plain or generic functions
+- generic type parameters on named functions with type erasure: `fn id<T>(x: T) -> T { return x }`, `fn pair<A, B>(a: A, b: B) -> Text { ... }`. Type parameters are valid in parameter, return and `let` annotations and are erased to `Any` by the checker/runtime, so a call accepts any argument type. The checker infers a call result from the arguments when the return type is a type parameter (`id(5): Int`, `id("x"): Text`) and otherwise erases to `Any`; non-type-parameter positions keep normal arity/type checks. Duplicate type parameters and duplicate parameter names are rejected. Generic functions remain ordinary first-class named functions (recursion, defaults, higher-order use, and IR compilation with erasure all work). Limits: no bounds and no generic lambdas; the IR backend supports named-function-as-value for plain and generic functions (type erasure applies to the latter)
 - explicit call type arguments on local generic functions: `id<Int>(5)`, `pair<Int, Text>(...)`; the checker validates type-argument count and names, argument compatibility uses the explicit bindings, and the runtime/IR ignore them (erasure). Imported/namespaced generic calls and nested type arguments are not recognized; formatter round-trips explicit arguments.
 - generic records with type erasure: `record Box<T> { value: T }`, `record Pair<A, B> { first: A, second: B }`, constructors `Box(5)` / `Pair("x", 2)`, annotations `Box<Int>` / `Pair<Text, Int>` (arity checked) and explicit constructor arguments `Box<Int>(5)`. Type parameters are usable in field types and method signatures (`fn get(self: Box<T>) -> T`); they erase to `Any`, while concrete fields keep their type. A `let` annotation binds type parameters for the constructor check (`let b: Box<Int> = Box("x")` is rejected, while erased `Box("x")` is accepted), nested refs (`Box<Box<Int>>`) erase to the nominal base, duplicate type parameters/field names are rejected, namespaced records work (`geo.Box<Int>`, `geo.Box(5)`), and formatter/IR erase explicitly (IR still rejects method-bearing records). Limits: no bounds, no method-level type parameters (methods use only the record's parameters), and no explicit type arguments on namespaced constructors (`geo.Box<Int>(5)`; annotate the binding instead)
 - first-class functions and lambdas: `fn(x: Int) -> Int { ... }`, `let f = ...`, `f(41)`, passing functions as values, named functions as values after definition, IIFE `(fn...)(41)`, and recursive lambdas
