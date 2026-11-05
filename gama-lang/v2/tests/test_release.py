@@ -127,6 +127,13 @@ class ReleaseTests(unittest.TestCase):
         for module in release.WHEEL_MODULES:
             self.assertTrue(any(n == module or n.endswith("/" + module) for n in names), module)
 
+    def test_10_wheel_contains_all_modules(self):
+        import zipfile
+        with zipfile.ZipFile(str(self.out / self.result["wheel"])) as archive:
+            names = archive.namelist()
+        for module in release.WHEEL_MODULES:
+            self.assertIn(module, names, module)
+
     def test_09_verify_requires_sums(self):
         with tempfile.TemporaryDirectory() as td:
             copy = pathlib.Path(td) / "dist"

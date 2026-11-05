@@ -9,7 +9,7 @@ Our **polymorphic programming paradigm** where **AI is built into the language**
 machines into AI-native terminals of our network.
 
 ```
-gama-lang/    GAMA-L: v0.1 transpiler + v2/ executable 2.0 core (parser/checker/interpreter)
+gama-lang/    GAMA-L: v2/ implemented 2.0 core; v0.1 transpiler is reference only
 gama-os/      GAMA-OS: branded Linux appliance line (v0.1 scaffold, 2.0 roadmap in gama-os/ROADMAP_2.0.md)
 REPORT_*.md   THE "what is where" REPORT (start here!)
 ```

@@ -1,7 +1,8 @@
 # GAMA-L 2.0 — language specification (draft, implementable)
 
-Status: **design target**, not the current runtime. Current `gama-lang/` is v0.1
-(transpiler). This document defines what must be true before calling anything 2.0.
+Status: **implemented** in `gama-lang/v2/` (3,469+ tests; T1–T10 PASS, see
+`gama-lang/v2/CONFORMANCE.md`). This document remains the normative spec; the old
+`gama-lang/` v0.1 transpiler is kept only as a reference.
 
 ## One sentence
 
@@ -98,6 +99,6 @@ conformance suite independent of the backend.
 
 ## Honest status
 
-- v0.1 exists and can transpile a narrow subset.
-- 2.0 does **not** exist yet.
+- v0.1 exists as a reference transpiler.
+- 2.0 exists in `gama-lang/v2/` and passes T1–T10.
 - The first milestone is `gamal check` + typed AST + T1–T5, not a marketing release.

@@ -46,10 +46,13 @@ SOURCE_FILES = (
     "gama_registry.py",
     "gama_registry_server.py",
     "gama_ai.py",
+    "gama_ir.py",
+    "gama_ledger.py",
     "release.py",
     "pyproject.toml",
     "README.md",
     "MANIFEST.in",
+    "LICENSE",
 )
 
 #: Modules the wheel must expose (kept in sync with ``pyproject.toml``).

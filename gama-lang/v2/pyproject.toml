@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gama-l"
-version = "0.2.0"
+version = "2.0.0"
 description = "GAMA-L 2.0 core language: parser, type/effect checker, interpreter and LSP."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = { file = "LICENSE" }
 
 [project.scripts]
 gama-l = "gama_cli:main"
@@ -18,4 +18,4 @@ gama-registry = "gama_registry_server:main"
 gama-release = "release:main"
 
 [tool.setuptools]
-py-modules = ["gamal2", "gama_lsp", "gama_cli", "gama_fmt", "gama_doctor", "gama_mail", "gama_registry", "gama_registry_server", "gama_ai", "release"]
+py-modules = ["gamal2", "gama_lsp", "gama_cli", "gama_fmt", "gama_doctor", "gama_mail", "gama_registry", "gama_registry_server", "gama_ai", "gama_ir", "gama_ledger", "release"]
