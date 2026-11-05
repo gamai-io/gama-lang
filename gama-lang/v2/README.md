@@ -288,7 +288,7 @@ samples.
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 1647/1647
+python3 -m unittest discover -s tests -v   # 1694/1694
 python3 gamal2.py doctor --json                # 8/8 checks
 ../../scripts/ci_local.sh                      # py_compile + tests + doctor + VS Code JSON/smoke
 ```
