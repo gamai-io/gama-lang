@@ -182,8 +182,13 @@ class IRRejectsUnsupported(unittest.TestCase):
     # Dotted calls (``mod.fn()``) are supported now; their IR-vs-interpreter
     # parity lives in ``test_ir_namespaces.py``.
 
-    def test_pipe(self):
-        self.assert_unsupported('print xs | count\n')
+    def test_pipe_unknown_stage(self):
+        # Pipes themselves are supported now; a hand-built AST with a stage
+        # outside the documented set must still raise IRUnsupported.
+        node = G.Pipe(G.Literal([1, 2], 1, 1), [("explode", [])], 1, 1)
+        with self.assertRaises(IR.IRUnsupported) as ctx:
+            IR.compile_program([G.ExprStmt(node, 1, 1)])
+        self.assertIn("IR does not support pipe stage", str(ctx.exception))
 
     def test_prove_statement(self):
         self.assert_unsupported('prove p = { a: 1 }\n')

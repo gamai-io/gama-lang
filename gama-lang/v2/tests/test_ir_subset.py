@@ -200,8 +200,13 @@ class IRSubsetStillRejectsUnsupported(unittest.TestCase):
             IR.compile_program(G.parse(src))
         self.assertIn("IR does not support", str(ctx.exception))
 
-    def test_pipe(self):
-        self.assert_unsupported('print xs | count\n')
+    def test_pipe_unknown_stage(self):
+        # Pipes themselves are supported now; a hand-built AST with a stage
+        # outside the documented set must still fail loudly.
+        node = G.Pipe(G.Literal([1, 2], 1, 1), [("explode", [])], 1, 1)
+        with self.assertRaises(IR.IRUnsupported) as ctx:
+            IR.compile_program([G.ExprStmt(node, 1, 1)])
+        self.assertIn("IR does not support pipe stage", str(ctx.exception))
 
     def test_prove_statement(self):
         self.assert_unsupported('prove p = { a: 1 }\n')

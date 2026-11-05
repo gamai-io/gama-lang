@@ -36,8 +36,11 @@ Python-style negative indices); calls to *named, user-defined* functions
 (including recursion and default parameters); the Result propagation operator
 ``expr?`` (inside a function whose declared return type is ``Result`` or
 ``Any``: ``Ok`` yields its payload, ``Err`` returns that ``Err`` from the
-enclosing function); and the core builtins ``len``, ``text``, ``number``,
-``round`` and ``Ok``/``Err``.
+enclosing function); pipe expressions ``base | filter <expr> | select a, b |
+sum a | limit <expr> | count | map a`` over list/text/table values (stages
+execute left to right with the interpreter's row scoping and error messages);
+and the core builtins ``len``, ``text``, ``number``, ``round`` and
+``Ok``/``Err``.
 
 Records and enums follow the reference runtime exactly: record values are
 nominal (type name plus declaration-ordered fields, value-based equality),
@@ -90,8 +93,11 @@ Limitations (raise ``IRUnsupported`` / documented runtime errors)
   messages. Named record construction with a dotted type name
   (``geo.Point { ... }``) is not accepted by the parser; positional
   construction ``geo.Point(1, 2)`` works.
-* Pipes and first-class function values (including reading a namespaced
-  function as a value) are unsupported.
+* First-class function values (including reading a namespaced function as a
+  value) are unsupported.  Pipe expressions *are* supported for the six
+  documented stages; a hand-built AST with an unknown stage keyword (or a
+  stage missing its required argument) is rejected with :class:`IRUnsupported`
+  rather than silently ignored.
 * ``?`` is accepted only inside a named function whose declared return type is
   ``Result`` or ``Any``. Using it at the top level, in a function returning a
   concrete non-``Result`` type, or inside a default-parameter expression is
@@ -853,6 +859,9 @@ class _Compiler:
                 self.compile_expr(value)
             self.emit("BUILD_MAP", tuple(expr.items.keys()))
             return
+        if isinstance(expr, g2.Pipe):
+            self.compile_pipe(expr)
+            return
         if isinstance(expr, g2.Index):
             self.compile_expr(expr.base)
             self.compile_expr(expr.index)
@@ -919,6 +928,56 @@ class _Compiler:
             self.emit("CALL", len(expr.args))
             return
         _unsupported(expr)
+
+    def _stage_code(self, expr: Any) -> Code:
+        """Compile one pipe-stage sub-expression into its own ``Code``.
+
+        The code ends with ``RETURN`` so ``_VM._exec`` yields the value; the
+        stage is evaluated with the row bound (filter/limit) exactly like
+        ``Interpreter.expr(..., env, row)``.  Stage code is a pure expression,
+        so ``?``/``break``/``continue``/``return`` cannot appear; ``?`` is
+        rejected by the throwaway compiler's ``in_function=False`` default.
+        """
+        sub = _Compiler(records=dict(self.records), enums=dict(self.enums))
+        sub.compile_expr(expr)
+        sub.emit("RETURN")
+        return sub.code
+
+    def compile_pipe(self, expr: g2.Pipe) -> None:
+        # Validate every stage before emitting the base so an unsupported
+        # program fails loudly at compile time, never silently miscompiled.
+        compiled: list[Any] = []
+        for stage, args in expr.stages:
+            if stage in ("filter", "limit"):
+                if not args:
+                    raise IRUnsupported(
+                        f"IR does not support pipe stage {stage!r} without an "
+                        f"expression (line {expr.line}, col {expr.col})")
+                compiled.append((stage, self._stage_code(args[0])))
+            elif stage in ("sum", "map"):
+                if not args or not isinstance(args[0], str):
+                    raise IRUnsupported(
+                        f"IR does not support pipe stage {stage!r} without a "
+                        f"column name (line {expr.line}, col {expr.col})")
+                compiled.append((stage, args[0]))
+            elif stage == "select":
+                if not args or not all(isinstance(a, str) for a in args):
+                    raise IRUnsupported(
+                        f"IR does not support pipe stage 'select' without "
+                        f"column names (line {expr.line}, col {expr.col})")
+                compiled.append(("select", tuple(args)))
+            elif stage == "count":
+                if args:
+                    raise IRUnsupported(
+                        f"IR does not support pipe stage 'count' with arguments "
+                        f"(line {expr.line}, col {expr.col})")
+                compiled.append(("count",))
+            else:
+                raise IRUnsupported(
+                    f"IR does not support pipe stage {stage!r} "
+                    f"(line {expr.line}, col {expr.col})")
+        self.compile_expr(expr.base)
+        self.emit("PIPE", (tuple(compiled), expr.line, expr.col))
 
     def compile_logical(self, expr: g2.Binary) -> None:
         # Match `truth(l) and truth(r)` / `truth(l) or truth(r)`: the result is
@@ -1026,13 +1085,16 @@ class _VM:
             return g2.EnumVal(enum_name, variant)
         return None
 
-    def _load_name(self, frame: Frame, arg) -> Any:
+    def _load_name(self, frame: Frame, arg, row: Any = None) -> Any:
         """Resolve a dotted name exactly like ``gamal2.Interpreter.expr``.
 
-        Order: an exact binding, then an enum variant (``Enum.Variant``), then
-        the longest bound prefix walked through record fields / map keys.
+        Order: an exact row key (pipe stages), then an exact binding, then an
+        enum variant (``Enum.Variant``), then the longest bound prefix walked
+        through record fields / map keys.
         """
         name, line, col = arg
+        if row is not None and name in row:
+            return row[name]
         try:
             return frame.get(name)
         except IRRuntimeError:
@@ -1175,7 +1237,7 @@ class _VM:
         obj.fields[parts[-1]] = value
 
     # -- interpreter loop ------------------------------------------------
-    def _exec(self, code: Code, frame: Frame) -> Any:
+    def _exec(self, code: Code, frame: Frame, row: Any = None) -> Any:
         instrs = code.instrs
         ip = 0
         stack: list[Any] = []
@@ -1189,9 +1251,14 @@ class _VM:
             if op == "CONST":
                 stack.append(arg)
             elif op == "LOAD":
-                stack.append(frames[-1].get(arg))
+                # A pipe stage binds its current row; the reference evaluator
+                # checks the row *before* the environment for bare names.
+                if row is not None and arg in row:
+                    stack.append(row[arg])
+                else:
+                    stack.append(frames[-1].get(arg))
             elif op == "LOAD_NAME":
-                stack.append(self._load_name(frames[-1], arg))
+                stack.append(self._load_name(frames[-1], arg, row))
             elif op == "LET":
                 frames[-1].define(arg, stack.pop())
             elif op == "ASSIGN":
@@ -1220,6 +1287,57 @@ class _VM:
                 stack.append(stack[-1])
             elif op == "POP":
                 stack.pop()
+            elif op == "PIPE":
+                # Stages run left to right on the same value, exactly like
+                # ``Interpreter.expr``: filter/limit evaluate their compiled
+                # expression with the active environment and (for filter) the
+                # current row; select/sum/map/count use the interpreter's
+                # runtime operations and error wording.  Runtime errors carry
+                # the pipe node's line/col, matching the reference backend.
+                stages, line, col = arg
+                value = stack.pop()
+                for stage in stages:
+                    kind = stage[0]
+                    if kind == "filter":
+                        stage_code = stage[1]
+                        value = [
+                            r for r in value
+                            if _truth(self._exec(
+                                stage_code, frames[-1], row=r))
+                        ]
+                    elif kind == "select":
+                        names = stage[1]
+                        value = [{f: r[f] for f in names} for r in value]
+                    elif kind == "sum":
+                        column = stage[1]
+                        try:
+                            value = sum(
+                                (Decimal(str(r[column])) for r in value),
+                                Decimal(0),
+                            )
+                        except (KeyError, TypeError, ValueError) as ex:
+                            raise IRRuntimeError(
+                                "sum: %s" % ex, line, col) from None
+                    elif kind == "limit":
+                        n = int(self._exec(stage[1], frames[-1], row=row))
+                        if n < 0:
+                            raise IRRuntimeError(
+                                "limit must be >= 0", line, col)
+                        value = value[:n]
+                    elif kind == "count":
+                        value = len(value)
+                    elif kind == "map":
+                        column = stage[1]
+                        try:
+                            value = [r[column] for r in value]
+                        except KeyError as ex:
+                            raise IRRuntimeError(
+                                "map: unknown column %s" % ex,
+                                line, col) from None
+                    else:  # pragma: no cover - compiler rejects unknown stages
+                        raise IRRuntimeError(
+                            f"bad pipe stage {kind!r}", line, col)
+                stack.append(value)
             elif op == "BUILD_LIST":
                 count = arg or 0
                 items = stack[-count:] if count else []
