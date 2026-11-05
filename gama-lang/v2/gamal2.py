@@ -2141,6 +2141,7 @@ class Checker:
         # source (and the formatter keeps emitting no effects clause).
         self.inferred_fn_effects: dict[str, set[str]] = {}
         self.inferred_method_effects: dict[tuple[str, str], set[str]] = {}
+        self.lambda_effects: dict[str, set[str]] = {}
     def push(self):
         self.scope.append({})
         self.lambda_scopes.append({})
@@ -2755,6 +2756,10 @@ class Checker:
         elif isinstance(s, (Let, Assign)):
             self._collect_expr_effects(s.expr, env, out)
             if isinstance(s, Let):
+                if isinstance(s.expr, Var) and s.expr.name in self.funcs:
+                    out |= self._effective_fn_effects(self.funcs[s.expr.name])
+                elif isinstance(s.expr, Lambda):
+                    self.lambda_effects[s.name] = set(s.expr.effects or ())
                 rt = self._expr_record_type(s.expr, env)
                 if rt is None and s.type_name:
                     base, _args = _type_ref_parts(s.type_name)
@@ -2803,6 +2808,8 @@ class Checker:
     def _expr_record_type(self, e, env):
         if isinstance(e, RecordLit):
             return e.name if e.name in self.records else None
+        if isinstance(e, Call) and e.name in self.records:
+            return e.name
         if isinstance(e, RecordUpdate):
             return self._expr_record_type(e.base, env)
         if isinstance(e, Var):
@@ -2828,8 +2835,10 @@ class Checker:
             self._collect_expr_effects(e.callee, env, out)
             if isinstance(e.callee, Lambda):
                 out |= set(e.callee.effects or ())
-            elif isinstance(e.callee, Var) and e.callee.name in self.funcs:
-                out |= self._effective_fn_effects(self.funcs[e.callee.name])
+            elif isinstance(e.callee, Var):
+                if e.callee.name in self.funcs:
+                    out |= self._effective_fn_effects(self.funcs[e.callee.name])
+                out |= self.lambda_effects.get(e.callee.name, set())
             for a in e.args:
                 self._collect_expr_effects(a, env, out)
             return
@@ -3331,7 +3340,10 @@ class Checker:
                 self._check_annotated_record_call(resolved_ann, s.expr)
             # Bind the name before checking a lambda body so recursive
             # lambdas can refer to themselves.
+            if isinstance(s.expr, Var) and s.expr.name in self.funcs:
+                self.effects |= self._effective_fn_effects(self.funcs[s.expr.name])
             if isinstance(s.expr, Lambda):
+                self.effects |= set(s.expr.effects or ())
                 self.set(s.name, tn or "Function")
                 self._set_lambda(s.name, s.expr)
                 t = self.expr(s.expr)
@@ -4203,6 +4215,8 @@ class Checker:
                     # type; annotated lambdas keep the historical Any result
                     # here, so existing annotated code is unchanged.
                     bl = self._get_lambda(e.name)
+                    if bl is not None:
+                        self.effects |= set(bl.effects or ())
                     if (bl is not None
                             and getattr(bl, "_inferred_ret", None) is not None):
                         return bl._inferred_ret
@@ -4337,6 +4351,8 @@ class Checker:
                 return self._lambda_call(callee, e.args, e, row)
             bound_lambda = (self._get_lambda(callee.name)
                             if isinstance(callee, Var) else None)
+            if bound_lambda is not None:
+                self.effects |= set(bound_lambda.effects or ())
             if (bound_lambda is not None
                     and self.get(callee.name) in (None, "Function")
                     and getattr(bound_lambda, "type_params", None)):

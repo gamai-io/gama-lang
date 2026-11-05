@@ -1490,26 +1490,22 @@ class PatternSurfaceProbeTests(unittest.TestCase):
             "print f(Ok(5))\nprint f(Err(\"e\"))\n",
             ["5", "-1"], "probe-result-patterns")
 
-    def test_record_destructuring_is_rejected(self):
-        with _env():
-            with self.assertRaises(G.GamaError):
-                G.check("record P { x: Int }\n"
-                        "fn f(p: P) -> Int { match p { "
-                        "P(x) => { return x } } }\nprint f(P(1))\n")
+    def test_record_destructuring_is_supported(self):
+        src = ("record P { x: Int }\n"
+               "fn f(p: P) -> Int { match p { P(x) => { return x } } }\n"
+               "print f(P(1))\n")
+        self.assertEqual(G.run(src).out, ["1"])
 
-    def test_list_literal_pattern_is_rejected(self):
-        with _env():
-            with self.assertRaises(G.GamaError):
-                G.check("fn f(xs: List) -> Int { match xs { "
-                        "[] => { return 0 } _ => { return 1 } } }\n"
-                        "print f([])\n")
+    def test_list_literal_pattern_is_supported(self):
+        src = ("fn f(xs: List) -> Int { match xs { "
+               "[] => { return 0 } _ => { return 1 } } }\nprint f([])\n")
+        self.assertEqual(G.run(src).out, ["0"])
 
-    def test_match_guard_is_rejected(self):
-        with _env():
-            with self.assertRaises(G.GamaError):
-                G.check("fn f(x: Int) -> Int { match x { "
-                        "y if y > 0 => { return 1 } _ => { return 0 } } }\n"
-                        "print f(1)\n")
+    def test_match_guard_is_supported(self):
+        src = ("fn f(x: Int) -> Int { match x { "
+               "y if y > 0 => { return 1 } _ => { return 0 } } }\n"
+               "print f(1)\n")
+        self.assertEqual(G.run(src).out, ["1"])
 
 
 class FeatureProbeTests(unittest.TestCase):
@@ -1565,7 +1561,6 @@ class Fuzz9EffectRegressionPins(unittest.TestCase):
     ``expectedFailure``; an unexpected success means the gap was fixed.
     """
 
-    @unittest.expectedFailure
     def test_named_function_value_effect_contract_is_enforced(self):
         src = ("fn g(x: Int) -> Int effects { io.print } "
                "{ print x\n return x }\n"
@@ -1574,7 +1569,6 @@ class Fuzz9EffectRegressionPins(unittest.TestCase):
         with self.assertRaises(G.GamaEffectError):
             G.check(src)
 
-    @unittest.expectedFailure
     def test_lambda_value_effect_contract_is_enforced(self):
         src = ("let g = fn(x: Int) -> Int effects { io.print } "
                "{ print x\n return x }\n"
@@ -1583,7 +1577,6 @@ class Fuzz9EffectRegressionPins(unittest.TestCase):
         with self.assertRaises(G.GamaEffectError):
             G.check(src)
 
-    @unittest.expectedFailure
     def test_pure_method_on_constructor_local_is_not_over_approximated(self):
         src = ("record A { v: Int\n"
                "  fn get(self: A) -> Int { print self.v\n return self.v }\n}\n"
@@ -1606,7 +1599,6 @@ class Fuzz9FormatterRegressionPins(unittest.TestCase):
     formatter is broken.
     """
 
-    @unittest.expectedFailure
     def test_formatter_inlines_multi_payload_match_arm(self):
         src = ("enum E { P(Int, Text), Q }\n"
                "fn f(e: E) -> Text { match e { P(x, y) => { return y } "
