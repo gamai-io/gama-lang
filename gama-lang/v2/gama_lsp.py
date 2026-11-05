@@ -329,6 +329,13 @@ MEMBER_CHAIN_RE = re.compile(
 # before `<`, so ordinary comparisons such as `a < b` never match).
 TYPE_ARG_CTX_RE = re.compile(
     r"([A-Za-z_][A-Za-z0-9_]*)<([A-Za-z0-9_,\s]*)$")
+# Type alias target: ``type Name = `` or ``export type Name = ``.
+TYPE_ALIAS_TARGET_CTX_RE = re.compile(
+    r"\b(?:export\s+)?type\s+[A-Za-z_][A-Za-z0-9_]*"
+    r"(?:\s*<[^<>]*>)?\s*=\s*([A-Za-z0-9_,\.\s<>]*)$")
+# Annotation position: ``let x: `` / ``fn f(a: `` / ``-> ``.
+TYPE_ANNOTATION_CTX_RE = re.compile(
+    r"(?::|->)\s*([A-Za-z0-9_,\.\s<>]*)$")
 # Type-parameter declaration position: `fn id<` or `fn id<A, `.
 TYPE_PARAM_DECL_CTX_RE = re.compile(
     r"\bfn\s+[A-Za-z_][A-Za-z0-9_]*\s*<([A-Za-z0-9_,\s]*)$")
@@ -607,9 +614,27 @@ def _resolve_module(uri: str, path: str):
 
 
 _DECL_HEAD_RE = re.compile(
-    r"(?m)^[ \t]*(export[ \t]+)?(fn|let|record|enum)[ \t]+"
+    r"(?m)^[ \t]*(export[ \t]+)?(fn|let|record|enum|type)[ \t]+"
     r"([A-Za-z_][A-Za-z0-9_]*)")
 _RENAME_RE = re.compile(r"\bas\s+([A-Za-z_][A-Za-z0-9_]*)")
+_SELECTIVE_EXPORT_RE = re.compile(r"(?m)^[ \t]*export[ \t]*\{")
+
+
+@dataclasses.dataclass
+class _TypeAliasDecl:
+    """Structural ``type Name = Target`` declaration.
+
+    Core GAMA-L has no type-alias syntax yet (neither parser nor checker), so
+    the LSP keeps aliases in this lightweight node for completion, hover and
+    definition only. Nothing is evaluated.
+    """
+    name: str
+    target: str
+    line: int
+    col: int
+    offset: int = 0
+    exported: bool = False
+    export_name: str | None = None
 
 
 def _brace_depths(masked: str):
@@ -789,12 +814,89 @@ def _module_export_info(text: str):
             "col": col,
             "exported": bool(match.group(1)),
             "keyword_pos": match.start(2),
+            "name_offset": match.start(3),
             "end": end,
             "rename": rename[2] if rename else None,
             "rename_span": (rename[0], rename[1]) if rename else None,
             "export_span": match.span(1) if match.group(1) else None,
         })
     return out
+
+
+def _type_alias_decls(text: str, info=None):
+    """Map ``type Name = Target`` declarations (structural, parse-free)."""
+    body = text or ""
+    masked = _masked_text(body)
+    entries = info if info is not None else _module_export_info(body)
+    depths = _brace_depths(masked)
+    out = {}
+    for entry in entries:
+        if entry.get("kind") != "type":
+            continue
+        start = entry["keyword_pos"]
+        end = entry["end"]
+        if start < 0 or start >= len(depths) or depths[start] != 0:
+            continue
+        eq = masked.find("=", start, end)
+        if eq < 0:
+            continue
+        target_end = end
+        rename_span = entry.get("rename_span")
+        if rename_span and eq < rename_span[0]:
+            target_end = rename_span[0]
+        target = masked[eq + 1:target_end]
+        target = target.split(";", 1)[0].strip()
+        if not target:
+            target = "Any"
+        name = entry["name"]
+        if name in out:
+            continue
+        out[name] = _TypeAliasDecl(
+            name=name,
+            target=target,
+            line=entry["line"],
+            col=entry["col"],
+            offset=entry.get("name_offset", start),
+            exported=bool(entry.get("exported")),
+            export_name=entry.get("rename"),
+        )
+    return out
+
+
+def _selective_exports(text: str):
+    """Best-effort ``export { a, b as c }`` list, or ``None`` if absent.
+
+    Core GAMA-L rejects selective re-exports, so this is a structural reader
+    used only by the LSP. Each entry is ``{original, exposed, span}``; the
+    span covers the whole ``export { ... }`` statement so callers can blank it
+    before a tolerant re-parse. Malformed lists are ignored quietly.
+    """
+    body = text or ""
+    masked = _masked_text(body)
+    depths = _brace_depths(masked)
+    out = []
+    found = False
+    for match in _SELECTIVE_EXPORT_RE.finditer(masked):
+        open_idx = match.end() - 1
+        if depths[match.start()] != 0:
+            continue
+        close = _matching_delim(masked, open_idx)
+        if close is None:
+            continue
+        found = True
+        raw = masked[open_idx + 1:close]
+        for item in _split_top_level(raw):
+            part = re.match(
+                r"([A-Za-z_][A-Za-z0-9_]*)"
+                r"(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?$", item)
+            if part is None:
+                continue
+            out.append({
+                "original": part.group(1),
+                "exposed": part.group(2) or part.group(1),
+                "span": (match.start(), close + 1),
+            })
+    return out if found else None
 
 
 def _blank_spans(text: str, spans):
@@ -813,6 +915,8 @@ def _export_view_text(text: str, info):
     for entry in info:
         spans.append(entry.get("export_span"))
         spans.append(entry.get("rename_span"))
+    for item in _selective_exports(text) or ():
+        spans.append(item.get("span"))
     return _blank_spans(text, spans)
 
 
@@ -828,6 +932,8 @@ def _module_has_side_effects(text: str, info):
     for match in re.finditer(
             r"(?m)^[ \t]*(?:import|use)\b[^\n]*", masked):
         spans.append(match.span())
+    for item in _selective_exports(body) or ():
+        spans.append(item.get("span"))
     for span in spans:
         if not span:
             continue
@@ -920,10 +1026,31 @@ def _structural_module_nodes(text: str, info):
     return nodes
 
 
-def _export_view(nodes, info):
-    """Filter private declarations and apply ``as`` re-export names."""
+def _export_view(nodes, info, selective=None):
+    """Filter private declarations and apply ``as`` re-export names.
+
+    A selective ``export { ... }`` list (parsed structurally because the core
+    rejects it) narrows the module surface to exactly the listed names and
+    applies their renames. Without such a list the legacy per-declaration
+    ``export`` rules apply.
+    """
     if not nodes:
         return nodes
+    if selective is not None:
+        wanted = {}
+        for item in selective:
+            wanted.setdefault(item["original"], item)
+        out = []
+        for node in nodes:
+            original = _original_name(node)
+            item = wanted.get(original) or wanted.get(node.name)
+            if item is None:
+                continue
+            exposed = item.get("exposed")
+            if exposed and exposed != node.name:
+                node = _clone_exported(node, exposed)
+            out.append(node)
+        return out
     by_name = {}
     for entry in info or []:
         by_name.setdefault(entry["name"], entry)
@@ -933,7 +1060,8 @@ def _export_view(nodes, info):
         entry = by_name.get(node.name)
         exported = bool(getattr(node, "exported", False)
                         or (entry and entry["exported"]))
-        if explicit and isinstance(node, (G.Fn, G.Let, G.RecordDecl)) \
+        if explicit and isinstance(
+                node, (G.Fn, G.Let, G.RecordDecl, _TypeAliasDecl)) \
                 and not exported:
             continue
         exposed = entry.get("rename") if entry else None
@@ -948,15 +1076,16 @@ def _module_declarations(uri: str, path: str):
 
     Mirrors the core alias-import rules: the module (including plain imports
     it inlines) may only contain declarations, plain imports and ``use`` at
-    the top level. Enums are accepted as an LSP navigation extension even
-    though core alias imports still reject their evaluation. Modules using
-    ``export enum`` or ``export ... as`` (which the core parser rejects) are
-    parsed structurally so completion/hover/definition stay useful; nested
-    plain imports are not expanded in that best-effort mode. Malformed,
-    missing or side-effect modules are treated as unavailable so completion
-    and hover stay quiet instead of advertising members the runtime would
-    reject. ``None`` means unavailable, while an empty list means nothing
-    exportable.
+    the top level. Enums, ``type Name = Target`` aliases and selective
+    ``export { ... }`` lists are accepted as LSP navigation extensions even
+    though core alias imports reject their evaluation. Modules using
+    ``export enum``/``export ... as``/``type``/selective exports (which the
+    core parser rejects) are parsed structurally so completion/hover/
+    definition stay useful; nested plain imports are not expanded in that
+    best-effort mode. Malformed, missing or side-effect modules are treated as
+    unavailable so completion and hover stay quiet instead of advertising
+    members the runtime would reject. ``None`` means unavailable, while an
+    empty list means nothing exportable.
     """
     target = _resolve_module(uri, path)
     root = _doc_root(uri)
@@ -967,6 +1096,8 @@ def _module_declarations(uri: str, path: str):
     except (OSError, UnicodeError):
         return None
     info = _module_export_info(body)
+    selective = _selective_exports(body)
+    aliases = _type_alias_decls(body, info)
     try:
         flat_fn = getattr(G, "_flatten", None)
         if flat_fn is not None:
@@ -983,18 +1114,22 @@ def _module_declarations(uri: str, path: str):
     if stmts is not None:
         nodes = [st for st in stmts
                  if isinstance(st, (G.Fn, G.Let, G.RecordDecl, G.EnumDecl))]
-        return _export_view(nodes, info)
+        nodes.extend(aliases.values())
+        return _export_view(nodes, info, selective)
     # Structural mode is only justified when core failed for a LSP-known
     # reason; side-effect or malformed modules must stay quiet.
-    needs_structural = "extends" in body or any(
-        entry.get("rename")
-        or (entry["kind"] == "enum" and entry["exported"])
-        for entry in info)
+    needs_structural = ("extends" in body or selective is not None
+                        or bool(aliases) or any(
+                            entry.get("rename")
+                            or (entry["kind"] == "enum" and entry["exported"])
+                            for entry in info))
     if not needs_structural:
         return None
     if _module_has_side_effects(body, info):
         return None
-    return _export_view(_structural_module_nodes(body, info), info)
+    nodes = _structural_module_nodes(body, info)
+    nodes.extend(aliases.values())
+    return _export_view(nodes, info, selective)
 
 
 def _module_functions(uri: str, path: str):
@@ -1720,6 +1855,12 @@ def _structural_hover(text, name, uri=None):
     enums = _enum_decls(text)
     if name in enums:
         return _enum_hover_text(enums[name])
+    aliases = _type_alias_decls(text)
+    if name in aliases:
+        decl = aliases[name]
+        return ("`type %s = %s`\n\nGAMA-L type alias `%s` for `%s`."
+                % (decl.name, decl.target or "Any", decl.name,
+                   decl.target or "Any"))
     return None
 
 
@@ -2038,8 +2179,44 @@ def _type_completion_items(node=None, in_scope=None):
     return items
 
 
+def _annotation_type_items(text: str):
+    """Type completions for an annotation or a ``type Name =`` target.
+
+    Offers built-in types plus structural records, enums and ``type`` aliases
+    visible in the current document. Imported names still complete through
+    their namespace (``alias.``) via the member branch.
+    """
+    items = _type_completion_items()
+    seen = {item["label"] for item in items}
+    for name in sorted(_record_decls(text)):
+        if name in seen:
+            continue
+        seen.add(name)
+        items.append({"label": name, "kind": KIND_CLASS,
+                      "detail": "record %s" % name,
+                      "documentation": "GAMA-L record `%s`." % name})
+    for name in sorted(_enum_decls(text)):
+        if name in seen:
+            continue
+        seen.add(name)
+        items.append({"label": name, "kind": KIND_ENUM,
+                      "detail": "enum %s" % name,
+                      "documentation": "GAMA-L enum `%s`." % name})
+    for name, decl in sorted(_type_alias_decls(text).items()):
+        if name in seen:
+            continue
+        seen.add(name)
+        target = decl.target or "Any"
+        items.append({"label": name, "kind": KIND_TYPE,
+                      "detail": "type %s = %s" % (name, target),
+                      "documentation": "GAMA-L type alias `%s` for `%s`."
+                                       % (name, target)})
+    return items
+
+
 def completion(uri: str, text: str, line: int = 0, character: int = 0):
     prefix = _line_prefix(text, line, character)
+    masked_prefix = _masked_text(prefix)
 
     # Alias position: ``import "lib.gm" as <cursor>``. Only a name derived
     # from the module filename is inferable; arbitrary aliases are not.
@@ -2111,6 +2288,17 @@ def completion(uri: str, text: str, line: int = 0, character: int = 0):
                                          "`%s`).%s"
                                          % (imp["path"], alias, renamed),
                     })
+                elif isinstance(node, _TypeAliasDecl):
+                    items.append({
+                        "label": node.name,
+                        "kind": KIND_TYPE,
+                        "detail": "type %s = %s"
+                                  % (node.name, node.target or "Any"),
+                        "documentation": "Type alias from `%s` (imported as "
+                                         "`%s`); target `%s`.%s"
+                                         % (imp["path"], alias,
+                                            node.target or "Any", renamed),
+                    })
                 else:
                     type_name = _const_type(node)
                     detail = ("let %s: %s" % (node.name, type_name)
@@ -2154,11 +2342,19 @@ def completion(uri: str, text: str, line: int = 0, character: int = 0):
                     "items": _type_completion_items(
                         node, _enclosing_type_params(text, line, character))}
 
+    # Type alias target and ordinary type annotations: offer built-in types
+    # plus local records/enums/aliases. Strings/comments are masked first so
+    # a stray colon inside a literal never turns into a type position.
+    if (TYPE_ALIAS_TARGET_CTX_RE.search(masked_prefix)
+            or TYPE_ANNOTATION_CTX_RE.search(masked_prefix)):
+        return {"isIncomplete": False,
+                "items": _annotation_type_items(text)}
+
     items = []
     seen = set()
     # ``as`` is an import keyword lexed as an identifier by the core parser;
     # ``record`` is contextual and also lexed as an identifier.
-    for kw in sorted(set(G.KEYWORDS) | {"as", "record"}):
+    for kw in sorted(set(G.KEYWORDS) | {"as", "record", "type"}):
         if kw in seen:
             continue
         seen.add(kw)
@@ -2187,6 +2383,15 @@ def completion(uri: str, text: str, line: int = 0, character: int = 0):
         items.append({"label": name, "kind": KIND_ENUM,
                       "detail": "enum %s" % name,
                       "documentation": "GAMA-L enum `%s`." % name})
+    for name, decl in sorted(_type_alias_decls(text).items()):
+        if name in seen:
+            continue
+        seen.add(name)
+        items.append({"label": name, "kind": KIND_TYPE,
+                      "detail": "type %s = %s"
+                                % (name, decl.target or "Any"),
+                      "documentation": "GAMA-L type alias `%s` for `%s`."
+                                       % (name, decl.target or "Any")})
     for name in sorted(G.BUILTINS):
         if name in seen:
             continue
@@ -3057,6 +3262,12 @@ def _symbol_at(uri: str, text: str, line: int, character: int):
                 return {"kind": "let_external", "name": member,
                         "decl_name": _original_name(other),
                         "decl": other, "path": target, "import": imp}
+            alias_decl = _module_type_alias(uri, imp.get("path"), member)
+            if alias_decl is not None:
+                target = _resolve_module(uri, imp.get("path") or "")
+                return {"kind": "type_alias_external", "name": member,
+                        "decl_name": _original_name(alias_decl),
+                        "decl": alias_decl, "path": target, "import": imp}
             return None
         if len(parts) == 2 and parts[0] in aliases:
             imp = aliases[parts[0]]
@@ -3137,14 +3348,24 @@ def _symbol_at(uri: str, text: str, line: int, character: int):
                 return {"kind": "let_external", "name": member_name,
                         "decl_name": _original_name(other),
                         "decl": other, "path": target, "import": imp}
+            alias_decl = _module_type_alias(uri, imp.get("path"), member_name)
+            if alias_decl is not None:
+                target = _resolve_module(uri, imp.get("path") or "")
+                return {"kind": "type_alias_external", "name": member_name,
+                        "decl_name": _original_name(alias_decl),
+                        "decl": alias_decl, "path": target, "import": imp}
             return None
 
     records = _record_decls(text)
     enums = _enum_decls(text)
+    aliases_local = _type_alias_decls(text)
     if name in records:
         return {"kind": "record", "name": name, "decl": records[name]}
     if name in enums:
         return {"kind": "enum", "name": name, "decl": enums[name]}
+    if name in aliases_local:
+        return {"kind": "type_alias", "name": name,
+                "decl": aliases_local[name]}
 
     for owner, decl in records.items():
         for field, off in _record_field_spans(text, decl).items():
@@ -3188,6 +3409,16 @@ def _module_enum(uri: str, path, name: str):
         return None
     for node in _module_declarations(uri, path) or []:
         if isinstance(node, G.EnumDecl) and (
+                node.name == name or _original_name(node) == name):
+            return node
+    return None
+
+
+def _module_type_alias(uri: str, path, name: str):
+    if not path:
+        return None
+    for node in _module_declarations(uri, path) or []:
+        if isinstance(node, _TypeAliasDecl) and (
                 node.name == name or _original_name(node) == name):
             return node
     return None
@@ -3384,7 +3615,25 @@ def _structural_definition(uri: str, text: str, line: int, character: int):
         decl_name = sym.get("decl_name") or sym["name"]
         return _decl_start(target.as_uri(), target_text, sym["decl"],
                            decl_name)
-    if kind == "record":
+    if kind == "type_alias_external":
+        target = sym.get("path")
+        if target is None:
+            return None
+        try:
+            target_text = target.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        decl_name = sym.get("decl_name") or sym["name"]
+        off = getattr(sym.get("decl"), "offset", None)
+        span = _linecol_at(target_text, off) if off is not None else None
+        if span is None:
+            return None
+        return _location(target.as_uri(), target_text, span[0], span[1],
+                         len(decl_name))
+    if kind == "type_alias":
+        off = getattr(sym.get("decl"), "offset", None)
+        span = _linecol_at(text, off) if off is not None else None
+    elif kind == "record":
         span = _decl_name_span(text, sym["decl"], "record", sym["name"])
     elif kind == "enum":
         span = _decl_name_span(text, sym["decl"], "enum", sym["name"])
@@ -3927,6 +4176,14 @@ def _member_hover(uri: str, text: str, line: int, character: int):
         if isinstance(node, G.EnumDecl):
             return ("%s\n\nGAMA-L enum from `%s` (imported as `%s`).%s"
                     % (_enum_hover_text(node), imp["path"], alias, renamed))
+        if isinstance(node, _TypeAliasDecl):
+            original = _original_name(node)
+            target = node.target or "Any"
+            extra = ("" if original == node.name
+                     else "\n\nExported from `%s`." % original)
+            return ("`type %s = %s`\n\nGAMA-L type alias from `%s` "
+                    "(imported as `%s`); the alias target is `%s`.%s"
+                    % (node.name, target, imp["path"], alias, target, extra))
         type_name = _const_type(node)
         value = _const_value(node)
         facts = []
