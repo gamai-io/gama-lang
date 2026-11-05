@@ -20,9 +20,9 @@ Semantics under test:
 * Namespaced declarations (``geo.Dog extends geo.Animal``) work unchanged.
 * The AST formatter round-trips ``extends`` headers.
 
-Limits (documented, intentionally narrow): a parent may not be generic, and
-the IR backend rejects inheritance loudly with ``IRUnsupported`` rather than
-erasing it (only the tree-walking interpreter executes inheritance).
+Limits (documented, intentionally narrow): a parent may not be generic.  The
+IR backend implements the same nominal inheritance semantics as the
+tree-walking interpreter (see ``test_ir_record_inheritance.py``).
 """
 import pathlib
 import sys
@@ -213,11 +213,6 @@ class RecordInheritanceTests(unittest.TestCase):
         self.assertEqual(out, gama_fmt.format_source(out, width=40))
 
     # -- IR --------------------------------------------------------------
-    def test_ir_rejects_inheritance_loudly(self):
-        with self.assertRaises(IR.IRUnsupported) as ctx:
-            IR.compile_program(G.check(BASE))
-        self.assertIn("record inheritance", str(ctx.exception))
-
     def test_ir_still_runs_plain_records(self):
         out = IR.run_program(G.check(
             'record Point { x: Int, y: Int }\n'

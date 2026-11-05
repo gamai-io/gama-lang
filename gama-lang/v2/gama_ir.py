@@ -115,8 +115,15 @@ Limitations (raise ``IRUnsupported`` / documented runtime errors)
   receiver with the named fields replaced (declaration order preserved), and
   the original value is left untouched.
 * Nominal record inheritance (``record Dog extends Animal { ... }``) is
-  **rejected loudly** by this backend with :class:`IRUnsupported`; only the
-  tree-walking interpreter executes inheritance.
+  supported.  Fields flatten parent-first (so positional construction takes
+  inherited fields first and named construction accepts the whole set), the
+  runtime value keeps its actual nominal type, field access sees inherited
+  fields, and methods are inherited with child overrides taking precedence.
+  Dispatch follows the reference runtime: a value statically typed as an
+  ancestor still dispatches to the actual type's override.  Namespaced records
+  (``geo.Dog extends geo.Animal``) work unchanged.  The checker rejects
+  unknown parents, cycles and incompatible overrides; an unchecked AST with
+  an unresolvable parent is rejected with :class:`IRUnsupported`.
 * Enum payload variants are supported for declarations, constructors and
   ``match`` bindings, including aliased imports: the core loader namespaces
   declarations and references (``geo.Color`` / ``geo.Color.Red`` /
@@ -274,6 +281,11 @@ class Program:
     # with at least one payload stores ``{variant: (type, ...)}`` (nullary
     # variants map to ``()``).  Helpers below normalise both forms.
     enums: dict[str, Any] = field(default_factory=dict)
+    # ``record -> parent record`` for nominal inheritance.  ``records`` above
+    # already stores the flattened field list (inherited fields first); this
+    # table is what lets the VM walk the chain for method dispatch and detect
+    # an invalid runtime chain.
+    record_parents: dict[str, str] = field(default_factory=dict)
 
     def disassemble(self) -> str:
         """Return a readable listing of the main instruction stream."""
@@ -384,6 +396,49 @@ def _unsupported(node: Any, why: str | None = None) -> None:
     if why:
         msg += f": {why}"
     raise IRUnsupported(f"{msg} (line {line}, col {col})")
+
+
+class _RecordChainError(Exception):
+    """A record inheritance graph that cannot be flattened."""
+
+
+def _flatten_record_fields(own_fields: dict[str, tuple[str, ...]],
+                           parents: dict[str, str],
+                           name: str) -> tuple[str, ...]:
+    """Return ``name``'s fields root-first: ancestors then own fields.
+
+    ``own_fields`` maps a record name to only the fields declared on that
+    record; ``parents`` is the ``record -> parent`` table.  Raises
+    :class:`_RecordChainError` with an interpreter-aligned message for an
+    unknown record, an unknown parent or a cycle.  This mirrors
+    ``gamal2._record_all_fields`` but works from flat field names (the IR does
+    not need field types).
+    """
+    chain: list[str] = []
+    seen: set[str] = set()
+    cur: str | None = name
+    while cur is not None:
+        if cur in seen:
+            raise _RecordChainError(
+                f"record {name}: inheritance cycle")
+        seen.add(cur)
+        if cur not in own_fields:
+            if not chain:
+                raise _RecordChainError(f"unknown record {cur}")
+            raise _RecordChainError(
+                f"record {name}: unknown parent {cur}")
+        chain.append(cur)
+        cur = parents.get(cur)
+    fields: list[str] = []
+    seen_fields: set[str] = set()
+    for rec in reversed(chain):
+        for fn in own_fields[rec]:
+            if fn in seen_fields:
+                raise _RecordChainError(
+                    f"record {name}: duplicate field {fn}")
+            seen_fields.add(fn)
+            fields.append(fn)
+    return tuple(fields)
 
 
 class _ForState:
@@ -835,7 +890,8 @@ class _Compiler:
     tracked so ``break``/``continue`` can unwind them precisely."""
 
     def __init__(self, in_function: bool = False, records=None, enums=None,
-                 ret_type: str | None = None, methods=None):
+                 ret_type: str | None = None, methods=None,
+                 record_parents=None):
         self.code = Code()
         self.frame_depth = 0
         self.loops: list[dict] = []
@@ -846,9 +902,13 @@ class _Compiler:
         self.match_seq = 0
         # Nominal type tables used only to decide, at compile time, whether a
         # ``Call`` is a positional record constructor.  Dotted names and
-        # ``RecordLit`` are resolved dynamically at run time.
+        # ``RecordLit`` are resolved dynamically at run time.  ``records`` holds
+        # the flattened field lists (inherited fields first) while
+        # ``record_parents`` keeps the chain for ``extends``.
         self.records: dict[str, tuple[str, ...]] = records if records is not None else {}
         self.enums: dict[str, Any] = enums if enums is not None else {}
+        self.record_parents: dict[str, str] = (
+            record_parents if record_parents is not None else {})
         # Compiled methods per nominal record.  Only the main compiler's table
         # is copied into ``Program.methods`` (top-level declarations); body
         # compilers keep their own copies so nested declarations do not leak.
@@ -892,20 +952,43 @@ class _Compiler:
             self.emit("NOP")
             return
         if isinstance(stmt, g2.RecordDecl):
-            if getattr(stmt, "parent", None):
-                _unsupported(stmt, "record inheritance")
-            fields = tuple(fn for fn, _ft in stmt.fields)
+            parent = getattr(stmt, "parent", None)
+            own_fields = tuple(fn for fn, _ft in stmt.fields)
+            # Flatten inherited fields parent-first.  Top-level records were
+            # pre-flattened in ``_top_level_decls`` (so a parent declared later
+            # still resolves); nested declarations resolve against the records
+            # already compiled, exactly like the interpreter's runtime table.
+            if parent:
+                parent_fields = self.records.get(parent)
+                if parent_fields is None:
+                    _unsupported(stmt, f"record inheritance: unknown parent {parent}")
+                fields = tuple(parent_fields) + own_fields
+                seen: set[str] = set()
+                for fn in fields:
+                    if fn in seen:
+                        _unsupported(
+                            stmt, f"record inheritance: duplicate field {fn}")
+                    seen.add(fn)
+            else:
+                fields = own_fields
             # Methods compile exactly like named functions; the first
             # parameter (``self``) is bound by the call path, not passed by
             # the caller, so it is dropped from the prototype's params just
-            # like ``Interpreter.method_call`` uses ``m.params[1:]``.
+            # like ``Interpreter.method_call`` uses ``m.params[1:]``.  Only the
+            # record's own methods live here; the VM walks the parent chain for
+            # inherited methods and overrides.
             methods: dict[str, FunctionProto] = {}
             for m in getattr(stmt, "methods", None) or []:
                 methods[m.name] = self._compile_proto(
                     f"{stmt.name}.{m.name}", m.params[1:], m.body, m.ret)
             self.records[stmt.name] = fields
+            if parent:
+                self.record_parents[stmt.name] = parent
+            else:
+                self.record_parents.pop(stmt.name, None)
             self.methods[stmt.name] = methods
-            self.emit("DEF_RECORD", (stmt.name, fields, methods))
+            self.emit("DEF_RECORD", (
+                stmt.name, own_fields, methods, parent, stmt.line, stmt.col))
             return
         if isinstance(stmt, g2.EnumDecl):
             spec = _enum_spec(stmt.variants)
@@ -1137,6 +1220,7 @@ class _Compiler:
             enums=dict(self.enums),
             ret_type=(ret or "Any"),
             methods=dict(self.methods),
+            record_parents=dict(self.record_parents),
         )
         body.compile_statements(body_stmts)
         body.emit("CONST", None)
@@ -1147,7 +1231,8 @@ class _Compiler:
             default: Code | None = None
             if param.default is not None:
                 default_compiler = _Compiler(
-                    records=dict(self.records), enums=dict(self.enums))
+                    records=dict(self.records), enums=dict(self.enums),
+                    record_parents=dict(self.record_parents))
                 default_compiler.compile_expr(param.default)
                 default_compiler.emit("RETURN")
                 default = default_compiler.code
@@ -1296,7 +1381,8 @@ class _Compiler:
         so ``?``/``break``/``continue``/``return`` cannot appear; ``?`` is
         rejected by the throwaway compiler's ``in_function=False`` default.
         """
-        sub = _Compiler(records=dict(self.records), enums=dict(self.enums))
+        sub = _Compiler(records=dict(self.records), enums=dict(self.enums),
+                        record_parents=dict(self.record_parents))
         sub.compile_expr(expr)
         sub.emit("RETURN")
         return sub.code
@@ -1412,7 +1498,7 @@ class _MethodTarget:
 
 class _VM:
     def __init__(self, initial: Any = None, records=None, enums=None,
-                 methods=None):
+                 methods=None, record_parents=None):
         if initial is None:
             self.root = Frame()
         elif isinstance(initial, Frame):
@@ -1426,8 +1512,11 @@ class _VM:
         self.out: list[str] = []
         self.call_depth = 0
         # Nominal type registries.  Copies so a reused ``Program`` is unaffected
-        # by declarations that activate only at run time.
+        # by declarations that activate only at run time.  ``records`` maps a
+        # record to its flattened field list (inherited fields first);
+        # ``record_parents`` is its ``extends`` chain.
         self.records: dict[str, tuple[str, ...]] = dict(records or {})
+        self.record_parents: dict[str, str] = dict(record_parents or {})
         self.enums: dict[str, Any] = dict(enums or {})
         # Record methods and their declaration frames.  Top-level records are
         # callable before their declaration statement because the reference
@@ -1579,27 +1668,98 @@ class _VM:
             return None
         if receiver.type_name not in self.records:
             return None
-        rec_name = (dispatch_record
-                    if dispatch_record in self.records
-                    else receiver.type_name)
-        table = self.methods.get(rec_name)
-        proto = table.get(method_name) if table else None
-        if proto is None:
+        if dispatch_record in self.records:
+            chain, ok = self._record_chain(receiver.type_name)
+            nominal = ok and (
+                receiver.type_name == dispatch_record
+                or dispatch_record in chain[1:])
+            rec_name = receiver.type_name if nominal else dispatch_record
+        else:
+            rec_name = receiver.type_name
+        found = self._find_record_method(rec_name, method_name)
+        if found is None:
             raise IRRuntimeError(
                 f"unknown method {method_name!r} on {rec_name}",
                 line, col)
+        decl, proto = found
         required = sum(1 for p in proto.params if p.default is None)
         if not (required <= argc <= len(proto.params)):
             raise IRRuntimeError(
                 f"{rec_name}.{method_name} expects {required}.."
                 f"{len(proto.params)} args, got {argc}", line, col)
-        closure = self.record_env.get(rec_name, self.root)
+        closure = self.record_env.get(decl, self.root)
         return _MethodTarget(proto, closure, receiver)
 
-    def _define_record(self, name: str, fields: tuple[str, ...],
+    def _record_chain(self, name: str) -> tuple[list[str], bool]:
+        """Return ``([child, parent, ...], ok)`` for ``name``.
+
+        ``ok`` is False for an unknown record or a cyclic chain.  Mirrors
+        ``gamal2._record_chain``; the fields themselves are already flattened
+        in :attr:`records`, so only the parent names are needed here.
+        """
+        chain: list[str] = []
+        seen: set[str] = set()
+        cur: str | None = name
+        while cur is not None:
+            if cur in seen:
+                return chain, False
+            seen.add(cur)
+            if cur not in self.records:
+                return chain, False
+            chain.append(cur)
+            cur = self.record_parents.get(cur)
+        return chain, True
+
+    def _find_record_method(self, rec_name: str, method_name: str):
+        """Return ``(declaring record, proto)`` walking the parent chain.
+
+        The child's own method wins (override); otherwise the nearest
+        ancestor method is used, matching ``gamal2._find_record_method``.  The
+        declaring record is returned so an inherited nested method runs in its
+        own declaration frame.
+        """
+        chain, ok = self._record_chain(rec_name)
+        if not ok:
+            raise IRRuntimeError(
+                f"record {rec_name}: invalid inheritance chain")
+        for name in chain:
+            table = self.methods.get(name)
+            proto = table.get(method_name) if table else None
+            if proto is not None:
+                return name, proto
+        return None
+
+    def _define_record(self, name: str, own_fields: tuple[str, ...],
                        methods: dict[str, FunctionProto] | None,
-                       frame: Frame) -> None:
-        self.records[name] = tuple(fields)
+                       parent: str | None, frame: Frame,
+                       line: int = 0, col: int = 0) -> None:
+        """Activate a record declaration at run time.
+
+        The VM seeds top-level records (flattened, parent-first) before
+        ``main``, so a top-level ``DEF_RECORD`` simply re-installs the same
+        flattened list.  A nested declaration is flattened against the parent
+        that is already active.  The child's own methods are stored; inherited
+        methods are found by walking the chain at call time.
+        """
+        if parent:
+            parent_fields = self.records.get(parent)
+            if parent_fields is None:
+                raise IRRuntimeError(
+                    f"record {name}: unknown parent {parent}", line, col)
+            fields = tuple(parent_fields) + tuple(own_fields)
+            seen: set[str] = set()
+            for fn in fields:
+                if fn in seen:
+                    raise IRRuntimeError(
+                        f"record {name}: duplicate field {fn}", line, col)
+                seen.add(fn)
+        else:
+            fields = tuple(own_fields)
+        self.records[name] = fields
+        if parent:
+            self.record_parents[name] = parent
+        else:
+            self.record_parents.pop(name, None)
         self.methods[name] = dict(methods or {})
         # A nested record captures the frame where its declaration executed;
         # top-level records were already seeded with the root frame.
@@ -2111,8 +2271,9 @@ class _VM:
             elif op == "DEF":
                 self.functions[arg.name] = (arg, frames[-1])
             elif op == "DEF_RECORD":
-                name, fields, methods = arg
-                self._define_record(name, fields, methods, frames[-1])
+                name, own_fields, methods, parent, line, col = arg
+                self._define_record(
+                    name, own_fields, methods, parent, frames[-1], line, col)
             elif op == "DEF_ENUM":
                 name, variants = arg
                 self._define_enum(name, variants)
@@ -2128,24 +2289,36 @@ class _VM:
 
 
 # ------------------------------------------------------------------ public API
-def _top_level_decls(stmts: list) -> tuple[dict, dict]:
+def _top_level_decls(stmts: list) -> tuple[dict, dict, dict]:
     """Collect top-level record/enum declarations before compiling.
 
     Mirrors ``gamal2.Interpreter.run``: these are registered up front, so a
-    function declared before a ``record``/``enum`` can still refer to it.
-    Nested declarations are *not* included; they activate via ``DEF_RECORD`` /
-    ``DEF_ENUM`` when execution reaches them.
+    function declared before a ``record``/``enum`` can still refer to it, and
+    a parent record may be declared later in the file.  Records are returned
+    with their *flattened* field list (inherited fields first); the third value
+    is the ``record -> parent`` chain.  Nested declarations are *not* included;
+    they activate via ``DEF_RECORD`` / ``DEF_ENUM`` when execution reaches them.
     """
-    records: dict[str, tuple[str, ...]] = {}
+    own_fields: dict[str, tuple[str, ...]] = {}
+    parents: dict[str, str] = {}
+    stmts_by_name: dict[str, Any] = {}
     enums: dict[str, Any] = {}
     for stmt in stmts:
         if isinstance(stmt, g2.RecordDecl):
-            if getattr(stmt, "parent", None):
-                _unsupported(stmt, "record inheritance")
-            records[stmt.name] = tuple(fn for fn, _ft in stmt.fields)
+            own_fields[stmt.name] = tuple(fn for fn, _ft in stmt.fields)
+            parent = getattr(stmt, "parent", None)
+            if parent:
+                parents[stmt.name] = parent
+            stmts_by_name[stmt.name] = stmt
         elif isinstance(stmt, g2.EnumDecl):
             enums[stmt.name] = _enum_spec(stmt.variants)
-    return records, enums
+    records: dict[str, tuple[str, ...]] = {}
+    for name in own_fields:
+        try:
+            records[name] = _flatten_record_fields(own_fields, parents, name)
+        except _RecordChainError as exc:
+            _unsupported(stmts_by_name[name], f"record inheritance: {exc}")
+    return records, enums, parents
 
 
 def compile_program(ast: Any) -> Program:
@@ -2165,8 +2338,9 @@ def compile_program(ast: Any) -> Program:
     if not isinstance(ast, (list, tuple)):
         raise TypeError("compile_program expects a statement list, Program or source string")
     stmts = list(ast)
-    top_records, top_enums = _top_level_decls(stmts)
-    compiler = _Compiler(records=dict(top_records), enums=dict(top_enums))
+    top_records, top_enums, top_parents = _top_level_decls(stmts)
+    compiler = _Compiler(records=dict(top_records), enums=dict(top_enums),
+                         record_parents=dict(top_parents))
     compiler.compile_statements(stmts)
     # Only declarations that are top-level *statements* are registered up
     # front; a record inside an ``if``/function installs its methods via
@@ -2175,7 +2349,7 @@ def compile_program(ast: Any) -> Program:
         name: table for name, table in compiler.methods.items()
         if name in top_records}
     return Program(compiler.code, records=top_records, enums=top_enums,
-                   methods=top_methods)
+                   methods=top_methods, record_parents=top_parents)
 
 
 def compile_file(path: Any) -> Program:
@@ -2205,7 +2379,8 @@ def run_program(ast: Any, env: Any = None) -> RunResult:
     :class:`Frame`, or ``None``.
     """
     program = ast if isinstance(ast, Program) else compile_program(ast)
-    vm = _VM(env, program.records, program.enums, program.methods)
+    vm = _VM(env, program.records, program.enums, program.methods,
+             record_parents=program.record_parents)
     vm._exec(program.main, vm.root)
     return RunResult(list(vm.out), dict(vm.root.outermost().vars))
 
