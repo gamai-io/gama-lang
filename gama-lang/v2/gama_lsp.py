@@ -2708,6 +2708,21 @@ def _call_context(prefix: str):
     j = open_idx - 1
     while j >= 0 and prefix[j] in " \t":
         j -= 1
+    # Explicit call type arguments: ``id<Int>(`` or ``pair<A, B>(``.  Skip a
+    # balanced ``<...>`` clause so the callee name is still found.
+    if j >= 0 and prefix[j] == ">":
+        depth = 0
+        while j >= 0:
+            if prefix[j] == ">":
+                depth += 1
+            elif prefix[j] == "<":
+                depth -= 1
+                if depth == 0:
+                    j -= 1
+                    break
+            j -= 1
+        while j >= 0 and prefix[j] in " \t":
+            j -= 1
     end = j
     while j >= 0 and (prefix[j].isalnum() or prefix[j] in "_."):
         j -= 1

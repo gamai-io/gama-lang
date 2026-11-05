@@ -256,9 +256,9 @@ class Unary: op: str; right: Any; line: int; col: int
 @dataclass
 class Binary: left: Any; op: str; right: Any; line: int; col: int
 @dataclass
-class Call: name: str; args: list; line: int; col: int; type_args: list = field(default_factory=list)
+class Call: name: str; args: list; line: int; col: int; type_args: list | None = None
 @dataclass
-class CallExpr: callee: Any; args: list; line: int; col: int
+class CallExpr: callee: Any; args: list; line: int; col: int; type_args: list | None = None
 @dataclass
 class Pipe: base: Any; stages: list; line: int; col: int
 @dataclass
@@ -346,6 +346,15 @@ class Parser:
             if (k < len(toks) and toks[k].kind == "OP"
                     and toks[k].val == "{"):
                 self.record_names.add(toks[j + 1].val)
+        # Names of locally declared generic functions (``fn id<T>(...)``).
+        # Explicit call type arguments (``id<Int>(5)``) are accepted only for
+        # these names; every other ``a < b`` stays a comparison operator.
+        self.generic_fn_names: set[str] = set()
+        for j in range(len(toks) - 2):
+            if (toks[j].kind == "KW" and toks[j].val in ("fn", "make")
+                    and toks[j + 1].kind == "IDENT"
+                    and toks[j + 2].kind == "OP" and toks[j + 2].val == "<"):
+                self.generic_fn_names.add(toks[j + 1].val)
     def peek(self, k=0): return self.t[min(self.i+k, len(self.t)-1)]
     def at(self, kind, val=None):
         x = self.peek()
@@ -601,6 +610,41 @@ class Parser:
         if not args:
             return base
         return base + "<" + ", ".join(args) + ">"
+    def _is_generic_name(self, name: str) -> bool:
+        """True when ``name`` (possibly dotted) is a local generic function."""
+        if name in self.generic_fn_names:
+            return True
+        return "." in name and name.rsplit(".", 1)[-1] in self.generic_fn_names
+    def try_call_type_args(self):
+        """Try to parse explicit call type arguments: ``<A, B>`` before ``(``.
+
+        Only called for names that are locally declared generic functions.
+        Uses backtracking: anything that is not a complete type-argument list
+        immediately followed by ``(`` rewinds and stays a comparison operator,
+        so ``a < b`` / ``a < b > c`` keep their normal meaning.
+        Returns the list of type names, or ``None`` when this was not a call.
+        """
+        save = self.i
+        try:
+            self.expect("OP", "<"); self.skip_nl()
+            names = []
+            if not self.at("OP", ">"):
+                while True:
+                    tok = self.peek()
+                    if tok.kind != "IDENT":
+                        raise GamaError("type argument expected", tok.line, tok.col)
+                    names.append(self.take().val)
+                    self.skip_nl()
+                    if not self.at("OP", ","):
+                        break
+                    self.take(); self.skip_nl()
+            self.expect("OP", ">")
+            if not self.at("OP", "("):
+                raise GamaError("not a call", self.peek().line, self.peek().col)
+            return names
+        except GamaError:
+            self.i = save
+            return None
     def lambda_expr(self):
         x = self.take(); self.expect("OP", "("); self.skip_nl()
         params = []
@@ -822,10 +866,7 @@ class Parser:
             return Call("recall", [Literal(name, x.line, x.col)], x.line, x.col)
         if x.kind == "IDENT":
             self.take(); name = x.val
-            type_args = []
-            # Explicit record type arguments: ``Box<Int>(5)``.  Restricting the
-            # lookahead to pre-scanned local record names keeps ordinary
-            # comparison expressions (``a < b > (c)``) unambiguous.
+            type_args = None
             if name in self.record_names and self.at("OP", "<"):
                 save = self.i
                 try:
@@ -842,7 +883,10 @@ class Parser:
                     type_args = cand
                 except GamaError:
                     self.i = save
-                    type_args = []
+                    type_args = None
+            elif self.at("OP", "<") and self._is_generic_name(name):
+                type_args = self.try_call_type_args()
+
             if self.at("OP", "("):
                 self.take(); self.skip_nl(); args = []
                 if not self.at("OP", ")"):
@@ -960,6 +1004,11 @@ def _rename_type_ref(t, mapping):
 
 # ------------------------------------------------------------------ types / checker
 NUM = {"Int", "Decimal"}
+# Names that may appear as a concrete call type argument. Record and enum
+# names are added dynamically by the checker; generic type parameters are
+# accepted from the enclosing function scope.
+BASE_TYPE_NAMES = {"Int", "Decimal", "Text", "Bool", "Null", "Any",
+                   "List", "Table", "Json", "Result", "Function"}
 def tname(v) -> str:
     if isinstance(v, RecordVal): return v.type_name
     if isinstance(v, ResultVal): return "Result"
@@ -1934,6 +1983,10 @@ class Checker:
             if not self.compat(at, want):
                 raise GamaTypeError(
                     f"{base}.{fn}: {at} != {want}", call.line, call.col)
+    def is_type_name(self, t):
+        """True when ``t`` names a concrete type or an in-scope type param."""
+        return (t in BASE_TYPE_NAMES or t in self._type_param_names()
+                or t in self.records or t in self.enums)
     def check_field_assign(self, s, value_type):
         """Validate a dotted assignment target ``base.field[.field...]``.
 
@@ -2210,7 +2263,38 @@ class Checker:
             required = sum(1 for p in f.params if p.default is None)
             if not (required <= len(e.args) <= len(f.params)):
                 raise GamaTypeError(f"{e.name} expects {required}..{len(f.params)} args", e.line, e.col)
-            if getattr(f, "type_params", None):
+            tparams = list(getattr(f, "type_params", None) or [])
+            explicit = getattr(e, "type_args", None)
+            if explicit is not None:
+                # Explicit call type arguments: validate count and names, then
+                # use them for argument checks and the call result type.
+                if not tparams:
+                    raise GamaTypeError(
+                        f"{e.name} is not generic; it takes no type arguments",
+                        e.line, e.col)
+                if len(explicit) != len(tparams):
+                    raise GamaTypeError(
+                        f"{e.name} expects {len(tparams)} type argument"
+                        f"{'s' if len(tparams) != 1 else ''}, got {len(explicit)}",
+                        e.line, e.col)
+                for t in explicit:
+                    if not self.is_type_name(t):
+                        raise GamaTypeError(
+                            f"unknown type argument {t!r} for {e.name}",
+                            e.line, e.col)
+                bindings = dict(zip(tparams, explicit))
+                for p, a in zip(f.params, e.args):
+                    at = self.expr(a)
+                    want = self.erase_type(bindings.get(p.type_name, p.type_name))
+                    if not self.compat(at, want):
+                        raise GamaTypeError(
+                            f"{e.name}: {p.name} {at} != {want}", e.line, e.col)
+                self.effects |= (f.effects or set())
+                rt = f.ret or "Any"
+                if rt in bindings:
+                    rt = bindings[rt]
+                return self.erase_type(rt)
+            if tparams:
                 # Generic call: infer type parameters from argument types and
                 # erase them to Any. Non-type-parameter positions still get a
                 # normal compatibility check.
@@ -2377,11 +2461,13 @@ def _rename_refs(node, mapping):
     if isinstance(node, dict):
         return {k: _rename_refs(v, mapping) for k, v in node.items()}
     if isinstance(node, Call):
+        type_args = getattr(node, "type_args", None)
         return replace(node, name=_rename_qualified(node.name, mapping),
                        args=[_rename_refs(a, mapping) for a in node.args],
                        type_args=[_rename_type_ref(t, mapping)
                                   for t in (getattr(node, "type_args", None)
                                             or [])])
+
     if isinstance(node, Var):
         return replace(node, name=_rename_qualified(node.name, mapping))
     if isinstance(node, Match):

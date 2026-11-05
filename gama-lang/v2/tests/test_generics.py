@@ -9,8 +9,9 @@ Type parameters are erased to ``Any`` at runtime.  They are accepted in
 parameter and return annotations (and in ``let`` annotations inside the body),
 but the checker never instantiates them: calls accept any argument type and
 the call result is inferred from the argument where possible, otherwise
-``Any``.  Not supported (and intentionally rejected/ignored): generic records or
-enums, bounds, explicit call type arguments, and generic lambdas.
+``Any``.  Explicit call type arguments (``id<Int>(5)``) are supported and
+covered in ``test_type_args.py``.  Not supported (and intentionally
+rejected/ignored): generic records or enums, bounds, and generic lambdas.
 """
 import pathlib
 import sys
@@ -198,9 +199,11 @@ class GenericFunctionTests(unittest.TestCase):
         with self.assertRaises(G.GamaError):
             G.check('let f = fn<T>(x: T) -> T { return x }\n')
 
-    def test_explicit_call_type_arguments_are_not_supported(self):
-        with self.assertRaises(G.GamaError):
-            G.check('fn id<T>(x: T) -> T { return x }\nprint id<Int>(1)\n')
+    def test_explicit_call_type_arguments_are_supported(self):
+        it = G.run('fn id<T>(x: T) -> T { return x }\nprint id<Int>(1)\n')
+        self.assertEqual(it.out, ["1"])
+        self.assertIn("id<Int>(1)", gama_fmt.format_source(
+            'fn id<T>(x: T) -> T { return x }\nprint id<Int>(1)\n'))
 
 
 if __name__ == "__main__":
