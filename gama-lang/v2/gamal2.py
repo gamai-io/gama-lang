@@ -604,7 +604,13 @@ class Parser:
                     raise GamaError(
                         "type parameter bounds are only supported on functions",
                         e.line, e.col)
-                bounds[name] = self.type_ref()
+                alts = [self.type_ref()]
+                self.skip_nl()
+                while self.at("OP", "|"):
+                    self.take(); self.skip_nl()
+                    alts.append(self.type_ref())
+                    self.skip_nl()
+                bounds[name] = " | ".join(alts)
                 self.skip_nl()
             if not self.at("OP", ","):
                 break
@@ -1051,10 +1057,37 @@ def _subst_type_ref(t, bindings):
     return _render_type_ref(bindings.get(base, base),
                             [_subst_type_ref(a, bindings) for a in args])
 
+def _split_bound(t):
+    """Split a bound into alternatives on top-level ``|``.
+
+    ``Int | Decimal`` -> ``["Int", "Decimal"]`` and a single bound yields a
+    one-element list.  A ``|`` nested inside ``<...>`` is ignored.
+    """
+    if not isinstance(t, str):
+        return [t]
+    parts = []
+    cur = []
+    depth = 0
+    for ch in t:
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth = max(0, depth - 1)
+        if ch == "|" and depth == 0:
+            parts.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    parts.append("".join(cur).strip())
+    return [p for p in parts if p]
+
 def _rename_type_ref(t, mapping):
     """Rename the base of a type ref through an aliased-import mapping."""
     if not isinstance(t, str):
         return t
+    alts = _split_bound(t)
+    if len(alts) > 1:
+        return " | ".join(_rename_type_ref(a, mapping) for a in alts)
     base, args = _type_ref_parts(t)
     nb = _rename_qualified(base, mapping)
     if not args:
@@ -2120,17 +2153,24 @@ class Checker:
                 raise GamaTypeError(f"duplicate type parameter {tp}", f.line, f.col)
             seen_tp.add(tp)
             if tp in bounds:
-                base, args = _type_ref_parts(bounds[tp])
-                if args:
-                    raise GamaTypeError(
-                        f"type parameter {tp} bound must be a simple type, "
-                        f"got {bounds[tp]}", f.line, f.col)
-                if base in seen_tp or not (base in BOUND_BASE_TYPES
-                                           or base in self.records
-                                           or base in self.enums):
-                    raise GamaTypeError(
-                        f"unknown bound {bounds[tp]} for type parameter {tp}",
-                        f.line, f.col)
+                seen_alts = set()
+                for alt in _split_bound(bounds[tp]):
+                    base, args = _type_ref_parts(alt)
+                    if args:
+                        raise GamaTypeError(
+                            f"type parameter {tp} bound must be a simple type, "
+                            f"got {alt}", f.line, f.col)
+                    if base in seen_alts:
+                        raise GamaTypeError(
+                            f"duplicate bound {alt} for type parameter {tp}",
+                            f.line, f.col)
+                    seen_alts.add(base)
+                    if base in seen_tp or not (base in BOUND_BASE_TYPES
+                                               or base in self.records
+                                               or base in self.enums):
+                        raise GamaTypeError(
+                            f"unknown bound {alt} for type parameter {tp}",
+                            f.line, f.col)
         seen_params = set()
         for p in f.params:
             if p.name in seen_params:
@@ -2235,7 +2275,7 @@ class Checker:
         bound = bounds.get(tp)
         if not bound or got == "Any":
             return
-        if not self.compat(got, bound):
+        if not any(self.compat(got, alt) for alt in _split_bound(bound)):
             raise GamaTypeError(
                 f"{fname}: type parameter {tp} {got} != bound {bound}",
                 line, col)
@@ -2243,7 +2283,7 @@ class Checker:
         bound = bounds.get(tp)
         if not bound or t in self._type_param_names():
             return
-        if not self.compat(t, bound):
+        if not any(self.compat(t, alt) for alt in _split_bound(bound)):
             raise GamaTypeError(
                 f"{fname}: type argument {t} != bound {bound} for {tp}",
                 line, col)
