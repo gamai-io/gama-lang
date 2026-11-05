@@ -972,7 +972,8 @@ class _AstFormatter:
             entries = [(self._expr_start_pos(v), self._expr_end_pos(v),
                         update_renderer(k, v)) for k, v in node.fields]
         elif isinstance(node, G.Call):
-            open_text, close_text = node.name + "(", ")"
+            open_text = node.name + self._type_args_text(node) + "("
+            close_text = ")"
             entries = [(self._expr_start_pos(a), self._expr_end_pos(a),
                         lit_renderer(a)) for a in node.args]
         else:  # CallExpr
@@ -1344,6 +1345,34 @@ class _AstFormatter:
     def _type_params_text(self, s) -> str:
         names = getattr(s, "type_params", None) or []
         return ("<" + ", ".join(names) + ">") if names else ""
+
+    def _type_args_text(self, s) -> str:
+        args = getattr(s, "type_args", None) or []
+        return ("<" + ", ".join(args) + ">") if args else ""
+
+    def _type_tok_end(self, toks, k):
+        """End position and next index for a type ref starting at ``toks[k]``.
+
+        Consumes a trailing ``<...>`` (nested) so field/parameter spans cover
+        generic annotations instead of stopping at the base name.
+        """
+        t = toks[k]
+        end = (t.line, t.col + len(t.val))
+        j = k + 1
+        if j < len(toks) and toks[j].kind == "OP" and toks[j].val == "<":
+            depth = 0
+            while j < len(toks):
+                tj = toks[j]
+                if tj.kind == "OP" and tj.val == "<":
+                    depth += 1
+                elif tj.kind == "OP" and tj.val == ">":
+                    depth -= 1
+                    if depth == 0:
+                        end = (tj.line, tj.col + len(tj.val))
+                        j += 1
+                        break
+                j += 1
+        return end, j
 
     def _params_text(self, params) -> str:
         parts = []
@@ -1896,9 +1925,7 @@ class _AstFormatter:
                 i += 1
             if not (i < len(toks) and toks[i].kind == "IDENT"):
                 return out
-            type_tok = toks[i]
-            i += 1
-            end = (type_tok.line, type_tok.col + len(type_tok.val))
+            end, i = self._type_tok_end(toks, i)
             if p.default is not None:
                 end = self._expr_end_pos(p.default)
                 while (i < len(toks)
@@ -2036,9 +2063,10 @@ class _AstFormatter:
         parts = [fn + ": " + ft for fn, ft in s.fields]
         for m in getattr(s, "methods", []):
             parts.append(self._method_inline_text(m))
+        name = s.name + self._type_params_text(s)
         if not parts:
-            return prefix + "record " + s.name + " { }"
-        return prefix + "record " + s.name + " { " + ", ".join(parts) + " }"
+            return prefix + "record " + name + " { }"
+        return prefix + "record " + name + " { " + ", ".join(parts) + " }"
 
     def _method_inline_text(self, m) -> str:
         header = self._fn_header(m, "fn")
@@ -2133,11 +2161,9 @@ class _AstFormatter:
                     while k < len(toks) and toks[k].kind == "NL":
                         k += 1
                     if k < len(toks) and toks[k].kind == "IDENT":
-                        ft = toks[k]
-                        out.append(((t.line, t.col),
-                                    (ft.line,
-                                     ft.col + len(ft.val))))
-                        i = k + 1
+                        end, nxt = self._type_tok_end(toks, k)
+                        out.append(((t.line, t.col), end))
+                        i = nxt
                         continue
             i += 1
         return out
@@ -2195,7 +2221,8 @@ class _AstFormatter:
         ind = _UNIT * indent
         if getattr(s, "methods", []):
             prefix = "export " if getattr(s, "exported", False) else ""
-            self._emit(ind + prefix + "record " + s.name + " {", [s.line])
+            self._emit(ind + prefix + "record " + s.name
+                       + self._type_params_text(s) + " {", [s.line])
             for fn, ft in s.fields:
                 self._emit(_UNIT * (indent + 1) + fn + ": " + ft)
             for m in s.methods:
@@ -2210,7 +2237,7 @@ class _AstFormatter:
             return
         prefix = "export " if getattr(s, "exported", False) else ""
         inner = len(ind) + 2
-        lines = [prefix + "record " + s.name + " {"]
+        lines = [prefix + "record " + s.name + self._type_params_text(s) + " {"]
         self._render_decl_body(
             s, s.fields, self._record_field_positions(s),
             [fn + ": " + ft for fn, ft in s.fields],
@@ -2565,7 +2592,7 @@ class _AstFormatter:
                     self._expr(node.right, prec + 1))
             return "(" + text + ")" if prec < minp else text
         if isinstance(node, G.Call):
-            return node.name + "(" + \
+            return node.name + self._type_args_text(node) + "(" + \
                 ", ".join(self._expr(a) for a in node.args) + ")"
         if isinstance(node, G.CallExpr):
             callee = self._expr(node.callee, _POSTFIX_PREC)

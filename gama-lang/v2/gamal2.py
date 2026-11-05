@@ -256,7 +256,7 @@ class Unary: op: str; right: Any; line: int; col: int
 @dataclass
 class Binary: left: Any; op: str; right: Any; line: int; col: int
 @dataclass
-class Call: name: str; args: list; line: int; col: int
+class Call: name: str; args: list; line: int; col: int; type_args: list = field(default_factory=list)
 @dataclass
 class CallExpr: callee: Any; args: list; line: int; col: int
 @dataclass
@@ -302,7 +302,7 @@ class Try: expr: Any; line: int; col: int
 @dataclass
 class Method: name: str; params: list; ret: str | None; effects: set | None; body: list; line: int; col: int; end_line: int = 0; end_col: int = 0
 @dataclass
-class RecordDecl: name: str; fields: list; line: int; col: int; exported: bool = False; methods: list = field(default_factory=list)
+class RecordDecl: name: str; fields: list; line: int; col: int; exported: bool = False; methods: list = field(default_factory=list); type_params: list = field(default_factory=list)
 @dataclass
 class RecordLit: name: str; fields: list; line: int; col: int
 @dataclass
@@ -326,9 +326,25 @@ class Parser:
         # an if/while/for block header. Only locally declared records qualify.
         self.record_names: set[str] = set()
         for j in range(len(toks) - 2):
-            if (toks[j].kind == "IDENT" and toks[j].val == "record"
-                    and toks[j + 1].kind == "IDENT"
-                    and toks[j + 2].kind == "OP" and toks[j + 2].val == "{"):
+            if not (toks[j].kind == "IDENT" and toks[j].val == "record"
+                    and toks[j + 1].kind == "IDENT"):
+                continue
+            k = j + 2
+            # Generic declarations put ``<T, ...>`` between the name and ``{``.
+            if (k < len(toks) and toks[k].kind == "OP"
+                    and toks[k].val == "<"):
+                depth = 0
+                while k < len(toks):
+                    if toks[k].kind == "OP" and toks[k].val == "<":
+                        depth += 1
+                    elif toks[k].kind == "OP" and toks[k].val == ">":
+                        depth -= 1
+                        if depth == 0:
+                            k += 1
+                            break
+                    k += 1
+            if (k < len(toks) and toks[k].kind == "OP"
+                    and toks[k].val == "{"):
                 self.record_names.add(toks[j + 1].val)
     def peek(self, k=0): return self.t[min(self.i+k, len(self.t)-1)]
     def at(self, kind, val=None):
@@ -399,7 +415,8 @@ class Parser:
             return replace(inner, exported=True)
         if (x.kind == "IDENT" and x.val == "record"
                 and self.peek(1).kind == "IDENT"
-                and self.peek(2).kind == "OP" and self.peek(2).val == "{"):
+                and self.peek(2).kind == "OP"
+                and self.peek(2).val in ("{", "<")):
             return self.record_decl()
         if x.kind == "KW" and x.val == "import":
             self.take(); path = self.expect("STRING").val
@@ -425,7 +442,7 @@ class Parser:
             return self.enum_decl()
         if x.kind == "KW" and x.val == "let":
             self.take(); name = self.expect("IDENT").val; tn = None
-            if self.at("OP", ":"): self.take(); tn = self.expect("IDENT").val
+            if self.at("OP", ":"): self.take(); tn = self.type_ref()
             self.expect("OP", "="); self.skip_nl(); return Let(name, tn, self.expr(), x.line, x.col)
         if x.kind == "KW" and x.val in ("fn", "make"): return self.fn()
         if x.kind == "KW" and x.val == "match": return self.match_stmt()
@@ -454,6 +471,7 @@ class Parser:
     def record_decl(self):
         x = self.take()  # `record`
         name = self.expect("IDENT").val
+        type_params = self.type_params()
         self.skip_nl()
         self.expect("OP", "{")
         self.skip_seps()
@@ -469,13 +487,14 @@ class Parser:
                 continue
             fn = self.expect("IDENT").val
             self.expect("OP", ":")
-            ft = self.expect("IDENT").val
+            ft = self.type_ref()
             fields.append((fn, ft))
             self.skip_seps()
             if self.at("OP", ","):
                 self.take(); self.skip_seps()
         self.expect("OP", "}")
-        return RecordDecl(name, fields, x.line, x.col, methods=methods)
+        return RecordDecl(name, fields, x.line, x.col, methods=methods,
+                          type_params=type_params)
     def method(self):
         x = self.take()  # `fn`
         name_tok = self.peek()
@@ -486,11 +505,16 @@ class Parser:
         if "." in name:
             raise GamaError(
                 "method name must be a simple identifier", name_tok.line, name_tok.col)
+        if self.at("OP", "<"):
+            e = self.peek()
+            raise GamaError(
+                "record methods cannot declare their own type parameters "
+                "(use the record's type parameters)", e.line, e.col)
         self.expect("OP", "("); self.skip_nl()
         params = []
         if not self.at("OP", ")"):
             while True:
-                pn = self.expect("IDENT").val; self.expect("OP", ":"); pt = self.expect("IDENT").val
+                pn = self.expect("IDENT").val; self.expect("OP", ":"); pt = self.type_ref()
                 default = None
                 if self.at("OP", "="):
                     self.take(); self.skip_nl(); default = self.expr()
@@ -498,7 +522,7 @@ class Parser:
                 if not self.at("OP", ","): break
                 self.take(); self.skip_nl()
         self.expect("OP", ")"); ret = None
-        if self.at("OP", "->"): self.take(); self.skip_nl(); ret = self.expect("IDENT").val
+        if self.at("OP", "->"): self.take(); self.skip_nl(); ret = self.type_ref()
         effects = None
         if self.at("KW", "effects"):
             self.take(); self.expect("OP", "{"); self.skip_nl(); effects = set()
@@ -517,7 +541,7 @@ class Parser:
         params = []
         if not self.at("OP", ")"):
             while True:
-                pn = self.expect("IDENT").val; self.expect("OP", ":"); pt = self.expect("IDENT").val
+                pn = self.expect("IDENT").val; self.expect("OP", ":"); pt = self.type_ref()
                 default = None
                 if self.at("OP", "="):
                     self.take(); self.skip_nl(); default = self.expr()
@@ -525,7 +549,7 @@ class Parser:
                 if not self.at("OP", ","): break
                 self.take(); self.skip_nl()
         self.expect("OP", ")"); ret = None
-        if self.at("OP", "->"): self.take(); self.skip_nl(); ret = self.expect("IDENT").val
+        if self.at("OP", "->"): self.take(); self.skip_nl(); ret = self.type_ref()
         effects = None
         if self.at("KW", "effects"):
             self.take(); self.expect("OP", "{"); self.skip_nl(); effects = set()
@@ -553,12 +577,36 @@ class Parser:
             self.take(); self.skip_nl()
         self.expect("OP", ">")
         return names
+    def type_ref(self):
+        """Parse a type annotation: ``Name`` or ``Name<Type, ...>``.
+
+        Generic arguments nest (``Box<Box<Int>>``) and names may be dotted
+        (``geo.Box``). The canonical spelling uses a single space after each
+        comma so the formatter round-trips deterministically.
+        """
+        tok = self.peek()
+        if tok.kind != "IDENT":
+            raise GamaError("type name expected", tok.line, tok.col)
+        self.take()
+        base = tok.val
+        args = []
+        if self.at("OP", "<"):
+            self.take(); self.skip_nl()
+            while True:
+                args.append(self.type_ref()); self.skip_nl()
+                if not self.at("OP", ","):
+                    break
+                self.take(); self.skip_nl()
+            self.expect("OP", ">")
+        if not args:
+            return base
+        return base + "<" + ", ".join(args) + ">"
     def lambda_expr(self):
         x = self.take(); self.expect("OP", "("); self.skip_nl()
         params = []
         if not self.at("OP", ")"):
             while True:
-                pn = self.expect("IDENT").val; self.expect("OP", ":"); pt = self.expect("IDENT").val
+                pn = self.expect("IDENT").val; self.expect("OP", ":"); pt = self.type_ref()
                 default = None
                 if self.at("OP", "="):
                     self.take(); self.skip_nl(); default = self.expr()
@@ -566,7 +614,7 @@ class Parser:
                 if not self.at("OP", ","): break
                 self.take(); self.skip_nl()
         self.expect("OP", ")"); ret = None
-        if self.at("OP", "->"): self.take(); self.skip_nl(); ret = self.expect("IDENT").val
+        if self.at("OP", "->"): self.take(); self.skip_nl(); ret = self.type_ref()
         effects = None
         if self.at("KW", "effects"):
             self.take(); self.expect("OP", "{"); self.skip_nl(); effects = set()
@@ -774,6 +822,27 @@ class Parser:
             return Call("recall", [Literal(name, x.line, x.col)], x.line, x.col)
         if x.kind == "IDENT":
             self.take(); name = x.val
+            type_args = []
+            # Explicit record type arguments: ``Box<Int>(5)``.  Restricting the
+            # lookahead to pre-scanned local record names keeps ordinary
+            # comparison expressions (``a < b > (c)``) unambiguous.
+            if name in self.record_names and self.at("OP", "<"):
+                save = self.i
+                try:
+                    self.take(); self.skip_nl()
+                    cand = []
+                    while True:
+                        cand.append(self.type_ref()); self.skip_nl()
+                        if not self.at("OP", ","):
+                            break
+                        self.take(); self.skip_nl()
+                    self.expect("OP", ">")
+                    if not self.at("OP", "("):
+                        raise GamaError("not a type-argument call", x.line, x.col)
+                    type_args = cand
+                except GamaError:
+                    self.i = save
+                    type_args = []
             if self.at("OP", "("):
                 self.take(); self.skip_nl(); args = []
                 if not self.at("OP", ")"):
@@ -781,7 +850,8 @@ class Parser:
                         args.append(self.expr()); self.skip_nl()
                         if not self.at("OP", ","): break
                         self.take(); self.skip_nl()
-                self.expect("OP", ")"); return Call(name, args, x.line, x.col)
+                self.expect("OP", ")")
+                return Call(name, args, x.line, x.col, type_args=type_args)
             if name in self.record_names and self.at("OP", "{"):
                 # Named record literal: Point { x: 3, y: 4 }
                 self.take(); self.skip_nl(); pairs = []
@@ -821,6 +891,72 @@ class Parser:
 
 def parse(src: str):
     return Parser(lex(src)).program()
+
+def _type_ref_parts(t):
+    """Split a canonical type reference into ``(base, args)``.
+
+    ``Box<Int>`` -> ``("Box", ["Int"])``; ``Box<Box<Int>>`` nests; a plain
+    ``T`` or ``geo.Point`` yields ``(T, [])`` / ``(geo.Point, [])``.
+    """
+    if not isinstance(t, str):
+        return t, []
+    s = t.strip()
+    i = s.find("<")
+    if i < 0 or not s.endswith(">"):
+        return s, []
+    base = s[:i].strip()
+    inner = s[i + 1:-1]
+    args = []
+    depth = 0
+    start = 0
+    for idx, ch in enumerate(inner):
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            args.append(inner[start:idx].strip())
+            start = idx + 1
+    args.append(inner[start:].strip())
+    return base, [a for a in args if a]
+
+def _render_type_ref(base, args):
+    if not args:
+        return base
+    return base + "<" + ", ".join(args) + ">"
+
+def _erase_type_ref(t, params):
+    """Type erasure: a record/function type parameter becomes ``Any``.
+
+    Generic type arguments are erased too: the runtime type of ``Box<Int>`` is
+    the nominal record ``Box``, so annotations lower to the base name.
+    """
+    if t is None:
+        return None
+    base, args = _type_ref_parts(t)
+    if base in params:
+        return "Any"
+    return base
+
+def _subst_type_ref(t, bindings):
+    """Replace type parameters by their bound refs (recursively)."""
+    if not bindings:
+        return t
+    base, args = _type_ref_parts(t)
+    if not args:
+        return bindings.get(base, base)
+    return _render_type_ref(bindings.get(base, base),
+                            [_subst_type_ref(a, bindings) for a in args])
+
+def _rename_type_ref(t, mapping):
+    """Rename the base of a type ref through an aliased-import mapping."""
+    if not isinstance(t, str):
+        return t
+    base, args = _type_ref_parts(t)
+    nb = _rename_qualified(base, mapping)
+    if not args:
+        return nb
+    return _render_type_ref(nb, [_rename_type_ref(a, mapping) for a in args])
 
 # ------------------------------------------------------------------ types / checker
 NUM = {"Int", "Decimal"}
@@ -1353,10 +1489,48 @@ class Checker:
             out |= scope
         return out
     def erase_type(self, t):
-        """Map a generic type parameter to ``Any`` (type erasure)."""
+        """Map generic type parameters to ``Any`` and generic refs to their base."""
         if t is None:
             return None
-        return "Any" if t in self._type_param_names() else t
+        return _erase_type_ref(t, self._type_param_names())
+    def record_params(self, name):
+        rec = self.records.get(name)
+        return set(getattr(rec, "type_params", None) or [])
+    def resolve_field_type(self, rec_name, ft, bindings=None):
+        """Static type of a record field after erasure.
+
+        ``T`` erases to ``Any``; nested generic refs erase to their nominal
+        base (``Box<Int>`` -> ``Box``). Concrete fields keep their type.
+        """
+        rec = self.records.get(rec_name)
+        params = set(getattr(rec, "type_params", None) or [])
+        t = _subst_type_ref(ft, bindings) if bindings else ft
+        return _erase_type_ref(t, params)
+    def _check_type_annotation(self, t, line, col, params=None):
+        """Validate generic type-ref arity; unknown simple names stay lenient."""
+        if t is None:
+            return
+        params = self._type_param_names() if params is None else set(params)
+        base, args = _type_ref_parts(t)
+        if base in params:
+            if args:
+                raise GamaTypeError(
+                    f"type parameter {base} cannot take type arguments",
+                    line, col)
+            return
+        rec = self.records.get(base)
+        if rec is not None:
+            want = len(getattr(rec, "type_params", None) or [])
+            if len(args) != want:
+                raise GamaTypeError(
+                    f"{base} expects {want} type argument"
+                    f"{'s' if want != 1 else ''}, got {len(args)}",
+                    line, col)
+            for a in args:
+                self._check_type_annotation(a, line, col, params)
+            return
+        if args:
+            raise GamaTypeError(f"type {base} is not generic", line, col)
     def get(self, n):
         for s in reversed(self.scope):
             if n in s: return s[n]
@@ -1383,6 +1557,15 @@ class Checker:
                         e.src = getattr(s, "_src", None)
                         raise e
                     seen.add(fn)
+                tseen = set()
+                for tp in getattr(s, "type_params", None) or []:
+                    if tp in tseen:
+                        e = GamaTypeError(
+                            f"record {s.name}: duplicate type parameter {tp}",
+                            s.line, s.col)
+                        e.src = getattr(s, "_src", None)
+                        raise e
+                    tseen.add(tp)
                 method_names = set()
                 for m in s.methods:
                     if m.name in method_names:
@@ -1404,10 +1587,21 @@ class Checker:
                             f"first parameter", m.line, m.col)
                         e.src = getattr(s, "_src", None)
                         raise e
-                    if m.params[0].type_name != s.name:
+                    st = m.params[0].type_name
+                    sbase, sargs = _type_ref_parts(st)
+                    if sbase != s.name:
                         e = GamaTypeError(
                             f"method {s.name}.{m.name}: self type "
-                            f"{m.params[0].type_name} != {s.name}", m.line, m.col)
+                            f"{st} != {s.name}", m.line, m.col)
+                        e.src = getattr(s, "_src", None)
+                        raise e
+                    want_tp = len(getattr(s, "type_params", None) or [])
+                    if sargs and len(sargs) != want_tp:
+                        e = GamaTypeError(
+                            f"method {s.name}.{m.name}: self type {st} expects "
+                            f"{want_tp} type argument"
+                            f"{'s' if want_tp != 1 else ''}, got {len(sargs)}",
+                            m.line, m.col)
                         e.src = getattr(s, "_src", None)
                         raise e
                     for p in m.params[1:]:
@@ -1418,6 +1612,19 @@ class Checker:
                             e.src = getattr(s, "_src", None)
                             raise e
                 self.records[s.name] = s
+        # Field annotations may refer to records declared later in the file, so
+        # generic-reference arity is validated after every record is known.
+        for s in stmts:
+            if isinstance(s, RecordDecl):
+                params = set(getattr(s, "type_params", None) or [])
+                for _fn, ft in s.fields:
+                    try:
+                        self._check_type_annotation(ft, s.line, s.col,
+                                                    params=params)
+                    except GamaTypeError as e:
+                        if e.src is None:
+                            e.src = getattr(s, "_src", None)
+                        raise
         for s in stmts:
             if isinstance(s, Fn):
                 if s.name in self.funcs:
@@ -1550,7 +1757,12 @@ class Checker:
             if self.loop_depth <= 0: raise GamaTypeError("break/continue outside loop", s.line, s.col)
             return
         if isinstance(s, Let):
+            self._check_type_annotation(s.type_name, s.line, s.col)
             tn = self.erase_type(s.type_name)
+            if (isinstance(s.expr, Call)
+                    and not getattr(s.expr, "type_args", None)
+                    and s.type_name and "<" in s.type_name):
+                self._check_annotated_record_call(s.type_name, s.expr)
             # Bind the name before checking a lambda body so recursive
             # lambdas can refer to themselves.
             if isinstance(s.expr, Lambda):
@@ -1607,6 +1819,9 @@ class Checker:
             if p.name in seen_params:
                 raise GamaTypeError(f"duplicate parameter {p.name}", f.line, f.col)
             seen_params.add(p.name)
+        for p in f.params:
+            self._check_type_annotation(p.type_name, f.line, f.col, seen_tp)
+        self._check_type_annotation(f.ret, f.line, f.col, seen_tp)
         self.push()
         self.type_params.append(seen_tp)
         try:
@@ -1623,19 +1838,32 @@ class Checker:
             self.type_params.pop()
             self.pop()
     def check_method(self, record_name, m):
-        """Check one record method body with ``self`` bound to the record."""
+        """Check one record method body with ``self`` bound to the record.
+
+        The record's type parameters are in scope and erased to ``Any`` for the
+        method signature and body; ``self: Box<T>`` binds ``self`` to ``Box``.
+        """
+        rec = self.records[record_name]
+        params = set(getattr(rec, "type_params", None) or [])
         self.push()
-        for p in m.params: self.set(p.name, p.type_name)
-        old = self.effects; self.effects = set()
-        old_ret = self.ret_type; self.ret_type = m.ret or "Any"
-        for s in m.body: self.stmt(s, m.effects or set())
-        used = set(self.effects); self.effects = old; self.ret_type = old_ret
-        bad = used - (m.effects or set())
-        if bad:
-            raise GamaEffectError(
-                f"method {record_name}.{m.name} uses undeclared effects: "
-                f"{','.join(sorted(bad))}", m.line, m.col)
-        self.pop()
+        self.type_params.append(params)
+        try:
+            for p in m.params:
+                self._check_type_annotation(p.type_name, m.line, m.col, params)
+                self.set(p.name, self.erase_type(p.type_name))
+            self._check_type_annotation(m.ret, m.line, m.col, params)
+            old = self.effects; self.effects = set()
+            old_ret = self.ret_type; self.ret_type = self.erase_type(m.ret or "Any")
+            for s in m.body: self.stmt(s, m.effects or set())
+            used = set(self.effects); self.effects = old; self.ret_type = old_ret
+            bad = used - (m.effects or set())
+            if bad:
+                raise GamaEffectError(
+                    f"method {record_name}.{m.name} uses undeclared effects: "
+                    f"{','.join(sorted(bad))}", m.line, m.col)
+        finally:
+            self.type_params.pop()
+            self.pop()
     def method_call(self, e, row=None):
         """Resolve a dotted method call, or return None if it is not one.
 
@@ -1669,15 +1897,43 @@ class Checker:
                 f"got {len(e.args)}", e.line, e.col)
         for p, a in zip(params, e.args):
             at = self.expr(a, row)
-            if not self.compat(at, p.type_name):
+            want = self.resolve_field_type(rt, p.type_name)
+            if not self.compat(at, want):
                 raise GamaTypeError(
-                    f"{rt}.{method_name}: {p.name} {at} != {p.type_name}",
+                    f"{rt}.{method_name}: {p.name} {at} != {want}",
                     e.line, e.col)
         self.effects |= (m.effects or set())
-        return m.ret or "Any"
+        if not m.ret:
+            return "Any"
+        return self.resolve_field_type(rt, m.ret)
 
     def compat(self, got, want):
         return want in ("Any", got) or (want in NUM and got in NUM) or (want == "List" and got in ("List", "Table"))
+    def _check_annotated_record_call(self, tn, call):
+        """Check a record constructor against a generic ``let`` annotation.
+
+        ``let b: Box<Int> = Box("x")`` binds ``T=Int`` from the annotation and
+        rejects the argument; without a generic annotation the field stays
+        erased and accepts any value.
+        """
+        base, targs = _type_ref_parts(tn)
+        rec = self.records.get(base)
+        if rec is None or base != call.name:
+            return
+        params = list(getattr(rec, "type_params", None) or [])
+        if len(targs) != len(params):
+            return  # annotation arity is reported by _check_type_annotation
+        for a in targs:
+            self._check_type_annotation(a, call.line, call.col)
+        if len(call.args) != len(rec.fields):
+            return  # arity error is reported by the constructor path
+        bindings = dict(zip(params, targs))
+        for (fn, ft), a in zip(rec.fields, call.args):
+            want = self.resolve_field_type(base, ft, bindings)
+            at = self.expr(a)
+            if not self.compat(at, want):
+                raise GamaTypeError(
+                    f"{base}.{fn}: {at} != {want}", call.line, call.col)
     def check_field_assign(self, s, value_type):
         """Validate a dotted assignment target ``base.field[.field...]``.
 
@@ -1712,10 +1968,13 @@ class Checker:
         if field not in fmap:
             raise GamaTypeError(f"unknown field {field!r} on {t}",
                                 s.line, s.col)
-        return fmap[field]
+        return self.resolve_field_type(t, fmap[field])
     def expr(self, e, row=None) -> str:
         if isinstance(e, Literal): return tname(e.value)
         if isinstance(e, Lambda):
+            for p in e.params:
+                self._check_type_annotation(p.type_name, e.line, e.col)
+            self._check_type_annotation(e.ret, e.line, e.col)
             self.push()
             for p in e.params: self.set(p.name, self.erase_type(p.type_name))
             old = self.effects; self.effects = set()
@@ -1752,7 +2011,8 @@ class Checker:
             rec = self.records.get(e.name)
             if rec is None:
                 raise GamaTypeError(f"unknown record {e.name}", e.line, e.col)
-            decl = dict(rec.fields)
+            decl = {fn: self.resolve_field_type(e.name, ft)
+                    for fn, ft in rec.fields}
             seen = set()
             for k, val in e.fields:
                 if k in seen:
@@ -1778,7 +2038,8 @@ class Checker:
                 raise GamaTypeError(
                     f"with expects a record receiver, got {bt}",
                     e.line, e.col)
-            decl = dict(self.records[bt].fields)
+            decl = {fn: self.resolve_field_type(bt, ft)
+                    for fn, ft in self.records[bt].fields}
             seen = set()
             for k, val in e.fields:
                 if k in seen:
@@ -1823,7 +2084,8 @@ class Checker:
                     t = base
                     for part in parts[i:]:
                         if t in self.records:
-                            fmap = dict(self.records[t].fields)
+                            fmap = {fn: self.resolve_field_type(t, ft)
+                                    for fn, ft in self.records[t].fields}
                             if part not in fmap:
                                 raise GamaTypeError(
                                     f"unknown field {part!r} on {t}",
@@ -1866,11 +2128,25 @@ class Checker:
                     raise GamaTypeError(
                         f"{e.name} expects {len(rec.fields)} fields, got "
                         f"{len(e.args)}", e.line, e.col)
-                for (fn, ft), a in zip(rec.fields, e.args):
-                    at = self.expr(a, row)
-                    if not self.compat(at, ft):
+                rec_args = getattr(e, "type_args", None) or []
+                if rec_args:
+                    want_tp = len(getattr(rec, "type_params", None) or [])
+                    if len(rec_args) != want_tp:
                         raise GamaTypeError(
-                            f"{e.name}.{fn}: {at} != {ft}", e.line, e.col)
+                            f"{e.name} expects {want_tp} type argument"
+                            f"{'s' if want_tp != 1 else ''}, got "
+                            f"{len(rec_args)}", e.line, e.col)
+                    for targ in rec_args:
+                        self._check_type_annotation(targ, e.line, e.col)
+                    bindings = dict(zip(rec.type_params, rec_args))
+                else:
+                    bindings = None
+                for (fn, ft), a in zip(rec.fields, e.args):
+                    want = self.resolve_field_type(e.name, ft, bindings)
+                    at = self.expr(a, row)
+                    if not self.compat(at, want):
+                        raise GamaTypeError(
+                            f"{e.name}.{fn}: {at} != {want}", e.line, e.col)
                 return e.name
             if e.name in BUILTINS:
                 eff, rt = BUILTINS[e.name]
@@ -2102,7 +2378,10 @@ def _rename_refs(node, mapping):
         return {k: _rename_refs(v, mapping) for k, v in node.items()}
     if isinstance(node, Call):
         return replace(node, name=_rename_qualified(node.name, mapping),
-                       args=[_rename_refs(a, mapping) for a in node.args])
+                       args=[_rename_refs(a, mapping) for a in node.args],
+                       type_args=[_rename_type_ref(t, mapping)
+                                  for t in (getattr(node, "type_args", None)
+                                            or [])])
     if isinstance(node, Var):
         return replace(node, name=_rename_qualified(node.name, mapping))
     if isinstance(node, Match):
@@ -2125,12 +2404,13 @@ def _rename_refs(node, mapping):
     if isinstance(node, RecordDecl):
         return replace(
             node, name=mapping.get(node.name, node.name),
-            fields=[(fn, mapping.get(ft, ft)) for fn, ft in node.fields],
+            fields=[(fn, _rename_type_ref(ft, mapping))
+                    for fn, ft in node.fields],
             methods=[_rename_refs(m, mapping) for m in node.methods])
     if isinstance(node, Method):
         return replace(
             node,
-            ret=(mapping.get(node.ret, node.ret) if node.ret else node.ret),
+            ret=(_rename_type_ref(node.ret, mapping) if node.ret else node.ret),
             params=[_rename_refs(p, mapping) for p in node.params],
             body=_rename_refs(node.body, mapping))
     if isinstance(node, RecordLit):
@@ -2140,7 +2420,7 @@ def _rename_refs(node, mapping):
     if isinstance(node, Let):
         return replace(
             node, name=mapping.get(node.name, node.name),
-            type_name=(mapping.get(node.type_name, node.type_name)
+            type_name=(_rename_type_ref(node.type_name, mapping)
                        if node.type_name else node.type_name),
             expr=_rename_refs(node.expr, mapping))
     if isinstance(node, Assign):
@@ -2148,19 +2428,19 @@ def _rename_refs(node, mapping):
                        expr=_rename_refs(node.expr, mapping))
     if isinstance(node, Param):
         return replace(
-            node, type_name=mapping.get(node.type_name, node.type_name),
+            node, type_name=_rename_type_ref(node.type_name, mapping),
             default=(_rename_refs(node.default, mapping)
                      if node.default is not None else None))
     if isinstance(node, Fn):
         return replace(
             node, name=mapping.get(node.name, node.name),
-            ret=(mapping.get(node.ret, node.ret) if node.ret else node.ret),
+            ret=(_rename_type_ref(node.ret, mapping) if node.ret else node.ret),
             params=[_rename_refs(p, mapping) for p in node.params],
             body=_rename_refs(node.body, mapping))
     if isinstance(node, Lambda):
         return replace(
             node,
-            ret=(mapping.get(node.ret, node.ret) if node.ret else node.ret),
+            ret=(_rename_type_ref(node.ret, mapping) if node.ret else node.ret),
             params=[_rename_refs(p, mapping) for p in node.params],
             body=_rename_refs(node.body, mapping))
     if is_dataclass(node):
