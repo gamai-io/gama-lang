@@ -620,13 +620,139 @@ class LambdaBodyCommentTests(WrapBase):
         self.assertIn("  return y", out)
 
 
+class InlineLambdaWidthTests(WrapBase):
+    """Inline lambdas without comments are width-wrapped like any expression.
+
+    The header wraps its parameter list and effects set at legal newline
+    points; the body becomes a one-statement-per-line block.  Wrapping adds no
+    tokens (commas between parameters already exist) and never reloads the
+    comments of a *commented* lambda onto a different attachment point.
+    """
+
+    def test_long_inline_lambda_body_wraps(self):
+        src = ("let f = fn(x: Int) -> Int { return x + 100000000 + "
+               "200000000 + 300000000 + 400000000 + 500000000 }\n"
+               "print f(1)\n")
+        out = self.roundtrip(src)
+        lines = out.splitlines()
+        self.assertEqual(lines[0], "let f = fn(x: Int) -> Int {")
+        self.assertIn("  return x + 100000000 +", out)
+        self.assertEqual(lines[-2], "}")
+        for line in lines:
+            self.assertLessEqual(len(line), 88, line)
+
+    def test_long_inline_lambda_parameters_wrap(self):
+        src = ("let f = fn(alpha_one: Int, beta_two: Int, gamma_three: Int, "
+               "delta_four: Int, epsilon_five: Int) -> Int effects {io, net} "
+               "{ return alpha_one }\n"
+               "print f(1, 2, 3, 4, 5)\n")
+        out = self.roundtrip(src)
+        lines = out.splitlines()
+        self.assertEqual(lines[0], "let f = fn(")
+        self.assertIn("  alpha_one: Int,", out)
+        self.assertIn("  epsilon_five: Int", out)
+        self.assertIn(") -> Int effects {io, net} {", out)
+        self.assertEqual(lines[-2], "}")
+
+    def test_long_inline_lambda_effects_wrap(self):
+        src = ("let f = fn(a: Int) -> Int effects {alpha_effect, beta_effect, "
+               "delta_effect, epsilon_effect, gamma_effect} { return a }\n"
+               "print f(1)\n")
+        out = self.roundtrip(src)
+        self.assertIn("effects {", out)
+        self.assertIn("  alpha_effect,", out)
+        self.assertIn("  gamma_effect\n} {", out)
+
+    def test_inline_lambda_inside_list_wraps(self):
+        src = ("let fs = [fn(x: Int) -> Int { return x + 100000000 + "
+               "200000000 + 300000000 + 400000000 + 500000000 }, "
+               "fn(y: Int) -> Int { return y }]\n"
+               "print 1\n")
+        out = self.roundtrip(src)
+        self.assertEqual(out.splitlines()[0], "let fs = [")
+        self.assertIn("  fn(x: Int) -> Int {", out)
+        self.assertIn("    return x +", out)
+        self.assertIn("  },", out)
+        self.assertIn("  fn(y: Int) -> Int { return y }", out)
+        self.assertEqual(out.splitlines()[-2], "]")
+
+    def test_inline_lambda_inside_call_wraps(self):
+        src = ("fn apply(f: Function, x: Int) -> Int { return f(x) }\n"
+               "print apply(fn(x: Int) -> Int { return x + 100000000 + "
+               "200000000 + 300000000 + 400000000 + 500000000 }, 21)\n")
+        out = self.roundtrip(src)
+        self.assertIn("print apply(", out)
+        self.assertIn("  fn(x: Int) -> Int {", out)
+        self.assertIn("    return x +", out)
+        self.assertIn("  },", out)
+        self.assertIn("\n  21\n)", out)
+
+    def test_inline_lambda_inside_map_wraps(self):
+        src = ("let m = {handler: fn(x: Int) -> Int { return x + 100000000 + "
+               "200000000 + 300000000 + 400000000 + 500000000 }}\n"
+               "print m\n")
+        out = self.roundtrip(src)
+        self.assertIn("let m = {", out)
+        self.assertIn("  handler: fn(x: Int) -> Int {", out)
+        self.assertIn("  }\n}", out)
+
+    def test_nested_inline_lambdas_wrap(self):
+        src = ("let f = fn(x: Int) -> Int {\n"
+               "let g = fn(y: Int) -> Int { return y + 100000000 + "
+               "200000000 + 300000000 + 400000000 + 500000000 }\n"
+               "return g(x)\n"
+               "}\n"
+               "print f(1)\n")
+        out = self.roundtrip(src)
+        self.assertIn("let f = fn(x: Int) -> Int {", out)
+        self.assertIn("  let g = fn(y: Int) -> Int {", out)
+        self.assertIn("    return y +", out)
+
+    def test_lambda_parameter_comment_stays_on_parameter(self):
+        src = ("let f = fn(\n"
+               " alpha: Int, # p\n"
+               " beta: Int\n"
+               ") -> Int { return alpha + beta + 100000000 + 200000000 + "
+               "300000000 + 400000000 }\n"
+               "print f(1, 2)\n")
+        out = self.roundtrip(src)
+        self.assertIn("let f = fn(", out)
+        self.assertIn("  alpha: Int, # p", out)
+        self.assertIn("  beta: Int", out)
+        self.assertIn(") -> Int {", out)
+
+    def test_lambda_own_line_parameter_comment_stays_own_line(self):
+        src = ("let f = fn(\n"
+               " # before alpha\n"
+               " alpha: Int,\n"
+               " beta: Int\n"
+               ") -> Int { return alpha + beta + 100000000 + 200000000 + "
+               "300000000 + 400000000 }\n"
+               "print f(1, 2)\n")
+        out = self.roundtrip(src)
+        self.assertIn("  # before alpha\n  alpha: Int,", out)
+
+    def test_inline_lambda_width_is_configurable(self):
+        src = ("let f = fn(x: Int) -> Int { return x + 100000000 + "
+               "200000000 + 300000000 + 400000000 + 500000000 }\n"
+               "print f(1)\n")
+        wide = gama_fmt.format_source(src, width=200)
+        narrow = gama_fmt.format_source(src, width=40)
+        self.assertNotIn("\n  ", wide)
+        self.assertIn("fn(x: Int) -> Int {\n", narrow)
+        self.assertEqual(wide, gama_fmt.format_source(wide, width=200))
+        self.assertEqual(narrow, gama_fmt.format_source(narrow, width=40))
+        self.assertEqual(shape(G.parse(src)), shape(G.parse(narrow)))
+        self.assertEqual(tokens(src), tokens(narrow))
+
+
 class BeforeBinaryOperatorCommentTests(unittest.TestCase):
     """A comment before a binary operator has no legal source position.
 
     The grammar only skips newlines *after* an operator, so a comment cannot
     be written between an operand and its operator in valid source.  The
-    renderer still has a deterministic rule (keep it on the operator line,
-    after the operator) for robustness; the tests document both facts.
+    renderer still has a deterministic rule (emit it immediately after the
+    operator, never before it) for robustness; the tests document both facts.
     """
 
     def test_source_before_operator_is_not_valid(self):
@@ -643,6 +769,15 @@ class BeforeBinaryOperatorCommentTests(unittest.TestCase):
     def test_operator_rule_places_comment_after_operator(self):
         self.assertEqual(self._operator_rule(True), "1 +\n  # c\n  2")
         self.assertEqual(self._operator_rule(False), "1 +\n  # c\n  2")
+
+    def test_operator_rule_places_comment_after_later_operator(self):
+        f = gama_fmt._AstFormatter("let x = 1 + 2 + 3\n")
+        node = dataclasses.replace(f.ast[0].expr, line=2, col=1)
+        expected = "1 +\n  2 +\n  # c\n  3"
+        for own_line in (True, False):
+            f.comments = [gama_fmt._Comment(1, 15, "# c", own_line)]
+            f.used = set()
+            self.assertEqual(f._wrap_binary(node, 0, 0, 0), expected)
 
 
 class ShortExpressionCommentTests(WrapBase):

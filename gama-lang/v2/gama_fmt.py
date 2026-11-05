@@ -80,16 +80,30 @@ Line wrapping (added in this revision):
     first line, body one statement per line, closing ``}`` at the base indent)
     instead of moving the comments out of the lambda.  Body statements use the
     normal statement renderer, so pipe/``let =``/nested comments keep their
-    usual attachment rules inside the lambda.
+    usual attachment rules inside the lambda.  Comments inside the lambda
+    parameter list (which is legal because the parser skips newlines after
+    ``(``, after a comma and after the last parameter) stay on their parameter
+    or on their own continuation line; a commented parameter list is expanded
+    so the comments keep that attachment instead of being moved out.
+  * Inline lambdas without comments are width-wrapped like any other
+    expression: a long parameter list goes one parameter per line, a long
+    ``effects`` set goes one name per line, and the body goes one statement per
+    line with the closing ``}`` at the lambda's base indent.  Short lambdas are
+    emitted exactly as before (one line).
   * Comments on the closing delimiter line stay with the statement (trailing
     comment), as before.
 
 Known limitations (documented, not hidden):
   * A comment physically *before* a binary operator cannot occur in valid
-    source: the parser only accepts a newline *after* an operator.  The
-    renderer's defensive rule is to keep such a comment on the operator line,
-    after the operator, so it is never dropped or duplicated.
-  * Inline lambdas without comments are still not width-wrapped.
+    source: the parser only accepts a newline *after* an operator, so valid
+    source can only place a comment *after* the operator.  The renderer still
+    has a deterministic defensive rule for a comment found before an operator:
+    emit it immediately after the operator (on its own continuation line at the
+    operator's continuation indent) and never before the operator, so it is
+    never dropped, duplicated or allowed to break the parse.
+  * A comment inside a lambda *return type* position has no legal line-break
+    point (``) ->`` must stay on one line); it uses the same deterministic
+    safe-position fallback as other unplaceable short-expression comments.
   * Indivisible tokens (a single identifier or string longer than ``width``)
     still overflow.
   * Map keys are re-rendered from their decoded string value: a quoted
@@ -920,7 +934,7 @@ class _AstFormatter:
         if isinstance(node, G.Pipe):
             return self._wrap_pipe(node, close_indent, base_col, minp)
         if isinstance(node, G.Lambda):
-            return self._wrap_lambda(node, close_indent)
+            return self._wrap_lambda(node, close_indent, base_col, minp)
         return text
 
     def _wrap_container(self, node, close_indent) -> str:
@@ -962,9 +976,9 @@ class _AstFormatter:
             entries = [(self._expr_start_pos(a), self._expr_end_pos(a),
                         lit_renderer(a)) for a in node.args]
         else:  # CallExpr
-            if isinstance(node.callee, G.Lambda) \
-                    and self._lambda_has_comment(node.callee):
-                open_text = self._wrap_lambda(node.callee, close_indent) + "("
+            if isinstance(node.callee, G.Lambda):
+                open_text = self._wrap_lambda(
+                    node.callee, close_indent, close_indent) + "("
             else:
                 open_text = self._expr(node.callee, _POSTFIX_PREC) + "("
             close_text = ")"
@@ -1575,11 +1589,85 @@ class _AstFormatter:
             i += 1
         return None
 
+    def _lambda_param_span(self, node):
+        """Return ``(positions, open_pos, close_pos)`` for lambda parameters.
+
+        ``positions`` is one ``(start, end)`` token span per parameter, used to
+        keep comments inside the parameter list attached to their parameter.
+        """
+        i = self._sig_index_at_or_after((node.line, node.col))
+        if i >= len(self.sig) or self.sig[i].val != "fn":
+            return None
+        while i < len(self.sig) and not (self.sig[i].kind == "OP"
+                                         and self.sig[i].val == "("):
+            i += 1
+        if i >= len(self.sig):
+            return None
+        open_tok = self.sig[i]
+        open_idx = i
+        depth = 0
+        close_tok = None
+        j = i
+        while j < len(self.sig):
+            t = self.sig[j]
+            if t.kind == "OP" and t.val == "(":
+                depth += 1
+            elif t.kind == "OP" and t.val == ")":
+                depth -= 1
+                if depth == 0:
+                    close_tok = t
+                    break
+            j += 1
+        if close_tok is None:
+            return None
+        positions = []
+        k = open_idx + 1
+        for p in node.params:
+            while k < j and not (self.sig[k].kind == "IDENT"
+                                 and self.sig[k].val == p.name):
+                k += 1
+            if k >= j:
+                break
+            start = (self.sig[k].line, self.sig[k].col)
+            k += 1
+            while k < j and not (self.sig[k].kind == "OP"
+                                 and self.sig[k].val == ":"):
+                k += 1
+            k += 1
+            if k >= j or self.sig[k].kind != "IDENT":
+                break
+            ttype = self.sig[k]
+            k += 1
+            end = (ttype.line, ttype.col + len(ttype.val))
+            if p.default is not None:
+                end = self._expr_end_pos(p.default)
+                while k < j and not self._pos_lt(
+                        end, (self.sig[k].line, self.sig[k].col)):
+                    k += 1
+            positions.append((start, end))
+        return positions, (open_tok.line, open_tok.col), (close_tok.line,
+                                                          close_tok.col)
+
+    def _lambda_params_have_comment(self, node) -> bool:
+        pspan = self._lambda_param_span(node)
+        if pspan is None:
+            return False
+        _positions, open_pos, close_pos = pspan
+        return bool(self._interior_comments(
+            (open_pos[0], open_pos[1], close_pos[0], close_pos[1])))
+
     def _lambda_has_comment(self, node) -> bool:
+        """True if a comment lives anywhere inside this lambda expression.
+
+        This covers the parameter list, the effects set and the body, so a
+        parameter comment expands the lambda (and is rendered on its parameter
+        line) instead of falling through to a safe-position move outside it.
+        """
         span = self._lambda_body_span(node)
-        if span and self._interior_comments(span):
-            return True
-        return self._effects_has_comment(node)
+        if span is None:
+            return self._effects_has_comment(node)
+        return bool(self._interior_comments(
+            (node.line, node.col, span[2], span[3])))
 
     def _render_stmt_lines(self, stmt, indent_level: int, ceiling=None):
         """Render one statement to lines without touching the main output."""
@@ -1594,20 +1682,140 @@ class _AstFormatter:
             self.out = saved
             self.comment_ceiling = saved_ceiling
 
-    def _wrap_lambda(self, node, close_indent: int) -> str:
-        if not self._lambda_has_comment(node):
-            return self._inline_lambda(node)
+    def _lambda_header_text(self, node, close_indent: int, base_col: int,
+                            wrap_params: bool) -> str:
+        """Render a lambda header, optionally wrapping params/effects.
+
+        The returned text has no body ``{`` yet (the caller appends it).  The
+        ``) -> Ret effects {...}`` tail stays on one line because the parser
+        requires ``->`` and ``effects`` directly after ``)``; only the parameter
+        list inside ``(...)`` and the effects names inside ``{...}`` may break
+        (both are legal newline points in ``gamal2``).
+        """
         ret = (" -> " + node.ret) if node.ret else ""
-        head = "fn(" + self._params_text(node.params) + ")" + ret
-        if self._effects_has_comment(node):
-            header = self._effects_block_text(node, close_indent, head)
+        inner = close_indent + 2
+        lines = None
+        if wrap_params and node.params:
+            lines = ["fn("]
+            inline_lines: set[int] = set()
+            pspan = self._lambda_param_span(node)
+            if pspan is not None:
+                positions, open_pos, close_pos = pspan
+                cursor = open_pos
+                prev_line = 0
+                prev_src = node.line
+                for i, p in enumerate(node.params):
+                    text = p.name + ": " + p.type_name
+                    if p.default is not None:
+                        text += " = " + self._wrap(
+                            p.default, inner, inner + len(text) + 3)
+                    parts = text.split("\n")
+                    parts[0] = " " * inner + parts[0]
+                    if i < len(positions):
+                        start, end = positions[i]
+                        self._flush_comment_range(
+                            cursor, start, inner, lines, inline_lines,
+                            attach_line=prev_line, attach_src_line=prev_src)
+                    lines.extend(parts)
+                    if i < len(node.params) - 1:
+                        lines[-1] += ","
+                    if i < len(positions):
+                        nxt = (positions[i + 1][0] if i + 1 < len(positions)
+                               else close_pos)
+                        self._flush_comment_range(
+                            end, nxt, inner, lines, inline_lines,
+                            attach_line=len(lines) - 1,
+                            attach_src_line=end[0])
+                        cursor = nxt
+                        prev_line = len(lines) - 1
+                        prev_src = nxt[0]
+                self._flush_comment_range(
+                    cursor, close_pos, inner, lines, inline_lines,
+                    attach_line=prev_line, attach_src_line=prev_src)
+            else:
+                for i, p in enumerate(node.params):
+                    text = p.name + ": " + p.type_name
+                    if p.default is not None:
+                        text += " = " + self._wrap(
+                            p.default, inner, inner + len(text) + 3)
+                    parts = text.split("\n")
+                    parts[0] = " " * inner + parts[0]
+                    lines.extend(parts)
+                    if i < len(node.params) - 1:
+                        lines[-1] += ","
+            close = " " * close_indent + ")" + ret
         else:
-            header = head + self._effects_text(node.effects)
+            close = "fn(" + self._params_text(node.params) + ")" + ret
+        check_col = base_col if lines is None else 0
+
+        effects = node.effects
+        if effects is None:
+            if lines is None:
+                return close
+            lines.append(close)
+            return "\n".join(lines)
+        if not effects:
+            if self._effects_has_comment(node):
+                block = self._effects_block_text(node, close_indent, close)
+                if lines is None:
+                    return block
+                lines.extend(block.split("\n"))
+                return "\n".join(lines)
+            if lines is None:
+                return close + " effects {}"
+            lines.append(close + " effects {}")
+            return "\n".join(lines)
+        if self._effects_has_comment(node):
+            block = self._effects_block_text(node, close_indent, close)
+            if lines is None:
+                return block
+            lines.extend(block.split("\n"))
+            return "\n".join(lines)
+        names = sorted(effects)
+        one = " effects {" + ", ".join(names) + "}"
+        if check_col + len(close + one) + 2 <= self.width:
+            if lines is None:
+                return close + one
+            lines.append(close + one)
+            return "\n".join(lines)
+        if lines is None:
+            lines = [close + " effects {"]
+        else:
+            lines.append(close + " effects {")
+        for i, nm in enumerate(names):
+            lines.append(" " * inner + nm +
+                         ("," if i < len(names) - 1 else ""))
+        lines.append(" " * close_indent + "}")
+        return "\n".join(lines)
+
+    def _wrap_lambda(self, node, close_indent: int, base_col: int = 0,
+                     minp: int = 0) -> str:
+        """Render an inline lambda, widening only when it does not fit.
+
+        A comment-free lambda that fits stays one line.  Otherwise the header
+        wraps its parameter list / effects set and the body becomes a normal
+        one-statement-per-line block.  A lambda with comments anywhere inside
+        it always takes the expanded form so the comments keep an attachment
+        point inside the lambda (see ``_lambda_has_comment``).
+        """
+        single = self._inline_lambda(node)
+        has_comments = self._lambda_has_comment(node)
+        if not has_comments and self._fits(single, base_col):
+            return single
+
+        ret = (" -> " + node.ret) if node.ret else ""
+        head_inline = "fn(" + self._params_text(node.params) + ")" + ret
+        opener = " effects {" if node.effects else " {"
+        wrap_params = bool(node.params) and (
+            self._lambda_params_have_comment(node)
+            or base_col + len(head_inline + opener) > self.width)
+        header = self._lambda_header_text(node, close_indent, base_col,
+                                          wrap_params)
         lines = header.split("\n")
         lines[-1] += " {"
         span = self._lambda_body_span(node)
         if span is None:
-            return self._inline_lambda(node)
+            return single
         inner = close_indent + 2
         open_pos = (span[0], span[1])
         close_pos = (span[2], span[3])
