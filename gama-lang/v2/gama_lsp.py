@@ -332,10 +332,10 @@ TYPE_ARG_CTX_RE = re.compile(
 # Type alias target: ``type Name = `` or ``export type Name = ``.
 TYPE_ALIAS_TARGET_CTX_RE = re.compile(
     r"\b(?:export\s+)?type\s+[A-Za-z_][A-Za-z0-9_]*"
-    r"(?:\s*<[^<>]*>)?\s*=\s*([A-Za-z0-9_,\.\s<>]*)$")
+    r"(?:\s*<[^<>]*>)?\s*=\s*([A-Za-z0-9_,\.\s<>|()]*)$")
 # Annotation position: ``let x: `` / ``fn f(a: `` / ``-> ``.
 TYPE_ANNOTATION_CTX_RE = re.compile(
-    r"(?::|->)\s*([A-Za-z0-9_,\.\s<>]*)$")
+    r"(?::|->)\s*([A-Za-z0-9_,\.\s<>|()]*)$")
 # Type-parameter declaration position: `fn id<` or `fn id<A, `.
 TYPE_PARAM_DECL_CTX_RE = re.compile(
     r"\bfn\s+[A-Za-z_][A-Za-z0-9_]*\s*<([A-Za-z0-9_,\s]*)$")
@@ -632,6 +632,7 @@ class _TypeAliasDecl:
     target: str
     line: int
     col: int
+    type_params: tuple = ()
     offset: int = 0
     exported: bool = False
     export_name: str | None = None
@@ -823,6 +824,120 @@ def _module_export_info(text: str):
     return out
 
 
+def _type_alias_params(header: str):
+    """Type-parameter names from the ``<...>`` between alias name and ``=``.
+
+    Core GAMA-L rejects generic aliases, so this is an LSP-only structural
+    reader. Malformed headers quietly yield no parameters.
+    """
+    match = re.match(r"^\s*<([^<>]*)>\s*$", header or "")
+    if match is None:
+        return ()
+    out = []
+    for part in match.group(1).split(","):
+        name = part.strip().split(":", 1)[0].strip()
+        name = name.split("=", 1)[0].strip()
+        if ALIAS_RE.match(name) and name not in out:
+            out.append(name)
+    return tuple(out)
+
+
+def _alias_signature(decl):
+    """``type Name<T> = Target`` signature for completion and hover."""
+    params = tuple(getattr(decl, "type_params", ()) or ())
+    suffix = "<%s>" % ", ".join(params) if params else ""
+    return "type %s%s = %s" % (decl.name, suffix, decl.target or "Any")
+
+
+def _split_union_target(target: str):
+    """Top-level ``|`` parts of a union alias target (``[]`` when not one)."""
+    text = target or ""
+    parts = []
+    depth = 0
+    start = 0
+    for i, ch in enumerate(text):
+        if ch in "([{<":
+            depth += 1
+        elif ch in ")]}>":
+            depth = max(0, depth - 1)
+        elif ch == "|" and depth == 0:
+            parts.append(text[start:i].strip())
+            start = i + 1
+    parts.append(text[start:].strip())
+    return [part for part in parts if part]
+
+
+_ALIAS_REF_RE = re.compile(
+    r"^\s*([A-Za-z_][A-Za-z0-9_]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)?)"
+    r"\s*(?:<([^<>]*)>)?\s*$")
+
+
+def _substitute_type_params(text: str, mapping):
+    """Replace whole-word type parameters in ``text`` using ``mapping``."""
+    if not text or not mapping:
+        return text
+    keys = sorted(mapping, key=len, reverse=True)
+    pattern = re.compile(r"\b(?:%s)\b" % "|".join(re.escape(k) for k in keys))
+    return pattern.sub(lambda match: mapping[match.group(0)], text)
+
+
+def _expand_alias_target(target, aliases, seen=None, depth=0):
+    """Recursively expand a local alias target without evaluating anything.
+
+    Generic applications substitute their arguments into the target; union
+    parts expand independently. Cycles, unknown names and dotted references
+    are left untouched so malformed documents stay quiet.
+    """
+    text = (target or "").strip()
+    if not text or depth > 8:
+        return text
+    parts = _split_union_target(text)
+    if len(parts) > 1:
+        return " | ".join(
+            _expand_alias_target(part, aliases, seen, depth + 1)
+            for part in parts)
+    match = _ALIAS_REF_RE.match(text)
+    if match is None:
+        return text
+    head = re.sub(r"\s+", "", match.group(1))
+    if "." in head:
+        return text
+    decl = (aliases or {}).get(head)
+    if decl is None:
+        return text
+    active = set(seen or ())
+    if head in active:
+        return text
+    args_text = match.group(2)
+    args = _split_top_level(args_text) if args_text else []
+    params = tuple(getattr(decl, "type_params", ()) or ())
+    if args and not params:
+        return text
+    active.add(head)
+    inner = decl.target or "Any"
+    if args and params:
+        inner = _substitute_type_params(
+            inner, {param: arg for param, arg in zip(params, args)})
+    return _expand_alias_target(inner, aliases, active, depth + 1)
+
+
+def _alias_detail_suffix(decl, aliases=None):
+    """Extra hover lines for type parameters, unions and alias expansion."""
+    out = ""
+    params = tuple(getattr(decl, "type_params", ()) or ())
+    if params:
+        out += "\n\nType parameters: `%s`." % "`, `".join(params)
+    target = decl.target or "Any"
+    union_parts = _split_union_target(target)
+    if len(union_parts) > 1:
+        out += "\n\nUnion of: `%s`." % "`, `".join(union_parts)
+    if aliases:
+        expanded = _expand_alias_target(target, aliases)
+        if expanded and expanded != target:
+            out += "\n\nExpanded target: `%s`." % expanded
+    return out
+
+
 def _type_alias_decls(text: str, info=None):
     """Map ``type Name = Target`` declarations (structural, parse-free)."""
     body = text or ""
@@ -849,6 +964,9 @@ def _type_alias_decls(text: str, info=None):
         if not target:
             target = "Any"
         name = entry["name"]
+        name_offset = entry.get("name_offset", start)
+        params = _type_alias_params(
+            masked[name_offset + len(name):eq])
         if name in out:
             continue
         out[name] = _TypeAliasDecl(
@@ -856,7 +974,8 @@ def _type_alias_decls(text: str, info=None):
             target=target,
             line=entry["line"],
             col=entry["col"],
-            offset=entry.get("name_offset", start),
+            type_params=params,
+            offset=name_offset,
             exported=bool(entry.get("exported")),
             export_name=entry.get("rename"),
         )
@@ -1858,9 +1977,9 @@ def _structural_hover(text, name, uri=None):
     aliases = _type_alias_decls(text)
     if name in aliases:
         decl = aliases[name]
-        return ("`type %s = %s`\n\nGAMA-L type alias `%s` for `%s`."
-                % (decl.name, decl.target or "Any", decl.name,
-                   decl.target or "Any"))
+        return ("`%s`\n\nGAMA-L type alias `%s` for `%s`.%s"
+                % (_alias_signature(decl), decl.name,
+                   decl.target or "Any", _alias_detail_suffix(decl, aliases)))
     return None
 
 
@@ -2202,15 +2321,18 @@ def _annotation_type_items(text: str):
         items.append({"label": name, "kind": KIND_ENUM,
                       "detail": "enum %s" % name,
                       "documentation": "GAMA-L enum `%s`." % name})
-    for name, decl in sorted(_type_alias_decls(text).items()):
+    local_aliases = _type_alias_decls(text)
+    for name, decl in sorted(local_aliases.items()):
         if name in seen:
             continue
         seen.add(name)
         target = decl.target or "Any"
         items.append({"label": name, "kind": KIND_TYPE,
-                      "detail": "type %s = %s" % (name, target),
-                      "documentation": "GAMA-L type alias `%s` for `%s`."
-                                       % (name, target)})
+                      "detail": _alias_signature(decl),
+                      "documentation":
+                          "GAMA-L type alias `%s` for `%s`.%s"
+                          % (name, target,
+                             _alias_detail_suffix(decl, local_aliases))})
     return items
 
 
@@ -2292,8 +2414,7 @@ def completion(uri: str, text: str, line: int = 0, character: int = 0):
                     items.append({
                         "label": node.name,
                         "kind": KIND_TYPE,
-                        "detail": "type %s = %s"
-                                  % (node.name, node.target or "Any"),
+                        "detail": _alias_signature(node),
                         "documentation": "Type alias from `%s` (imported as "
                                          "`%s`); target `%s`.%s"
                                          % (imp["path"], alias,
@@ -2383,15 +2504,17 @@ def completion(uri: str, text: str, line: int = 0, character: int = 0):
         items.append({"label": name, "kind": KIND_ENUM,
                       "detail": "enum %s" % name,
                       "documentation": "GAMA-L enum `%s`." % name})
-    for name, decl in sorted(_type_alias_decls(text).items()):
+    local_aliases = _type_alias_decls(text)
+    for name, decl in sorted(local_aliases.items()):
         if name in seen:
             continue
         seen.add(name)
         items.append({"label": name, "kind": KIND_TYPE,
-                      "detail": "type %s = %s"
-                                % (name, decl.target or "Any"),
-                      "documentation": "GAMA-L type alias `%s` for `%s`."
-                                       % (name, decl.target or "Any")})
+                      "detail": _alias_signature(decl),
+                      "documentation":
+                          "GAMA-L type alias `%s` for `%s`.%s"
+                          % (name, decl.target or "Any",
+                             _alias_detail_suffix(decl, local_aliases))})
     for name in sorted(G.BUILTINS):
         if name in seen:
             continue
@@ -3424,6 +3547,18 @@ def _module_type_alias(uri: str, path, name: str):
     return None
 
 
+def _module_alias_map(uri: str, path):
+    """All structurally parsed aliases in an imported module (for expansion)."""
+    target = _resolve_module(uri, path or "")
+    if target is None:
+        return {}
+    try:
+        body = target.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return {}
+    return _type_alias_decls(body)
+
+
 def _module_decl_by_name(uri: str, path, name: str):
     if not path:
         return None
@@ -4181,9 +4316,12 @@ def _member_hover(uri: str, text: str, line: int, character: int):
             target = node.target or "Any"
             extra = ("" if original == node.name
                      else "\n\nExported from `%s`." % original)
-            return ("`type %s = %s`\n\nGAMA-L type alias from `%s` "
-                    "(imported as `%s`); the alias target is `%s`.%s"
-                    % (node.name, target, imp["path"], alias, target, extra))
+            module_aliases = _module_alias_map(uri, imp["path"])
+            module_aliases.setdefault(original, node)
+            return ("`%s`\n\nGAMA-L type alias from `%s` "
+                    "(imported as `%s`); the alias target is `%s`.%s%s"
+                    % (_alias_signature(node), imp["path"], alias, target,
+                       extra, _alias_detail_suffix(node, module_aliases)))
         type_name = _const_type(node)
         value = _const_value(node)
         facts = []
