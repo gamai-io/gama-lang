@@ -312,6 +312,10 @@ class Import: path: str; line: int; col: int; alias: str | None = None
 @dataclass
 class Use: name: str; line: int; col: int
 @dataclass
+class ExportItem: name: str; alias: str | None; line: int; col: int
+@dataclass
+class ExportList: items: list; line: int; col: int
+@dataclass
 class For: name: str; iterable: Any; body: list; line: int; col: int
 @dataclass
 class While: cond: Any; body: list; line: int; col: int
@@ -446,26 +450,51 @@ class Parser:
         return out
     def _reject_duplicate_exports(self, stmts):
         declared = {}
+        exportable = {}
         for s in stmts:
             if isinstance(s, (Fn, Let, Assign, Use, RecordDecl, EnumDecl)):
                 declared.setdefault(s.name, s)
+            if isinstance(s, (Fn, Let, RecordDecl, EnumDecl)):
+                exportable.setdefault(s.name, s)
         seen = {}
+        exported_sources = set()
+
+        def _register(source, target, line, col, owner, entry=False):
+            if source in exported_sources:
+                if entry:
+                    raise GamaError(
+                        "duplicate export entry %r" % source, line, col)
+                raise GamaError(
+                    "duplicate export %r" % source, line, col)
+            if target in seen:
+                raise GamaError("duplicate export %r" % target, line, col)
+            if target != source:
+                other = declared.get(target)
+                if other is not None and other is not owner:
+                    raise GamaError(
+                        "export name %r collides with existing top-level name"
+                        % target, line, col)
+            seen[target] = owner
+            exported_sources.add(source)
+
         for s in stmts:
+            if isinstance(s, ExportList):
+                for item in s.items:
+                    if item.name not in exportable:
+                        raise GamaError(
+                            "unknown export name %r" % item.name,
+                            item.line, item.col)
+                    _register(item.name, item.alias or item.name,
+                              item.line, item.col, exportable[item.name],
+                              entry=True)
+                continue
             if not getattr(s, "exported", False):
                 continue
             name = getattr(s, "name", None)
             if name is None:
                 continue
             target = getattr(s, "export_name", None) or name
-            if target in seen:
-                raise GamaError("duplicate export %r" % target, s.line, s.col)
-            seen[target] = s
-            if target != name:
-                other = declared.get(target)
-                if other is not None and other is not s:
-                    raise GamaError(
-                        "export name %r collides with existing top-level name"
-                        % target, s.line, s.col)
+            _register(name, target, s.line, s.col, s)
     def block(self):
         self.expect("OP", "{"); self.skip_seps(); out = []
         while not self.at("OP", "}"):
@@ -481,6 +510,11 @@ class Parser:
         x = self.peek()
         if x.kind == "IDENT" and x.val == "export":
             nxt = self.peek(1)
+            if nxt.kind == "OP" and nxt.val == "{":
+                if not top:
+                    raise GamaError("export is only allowed at top level",
+                                    x.line, x.col)
+                return self.export_list()
             is_decl = (
                 (nxt.kind == "KW" and nxt.val in ("fn", "make", "let", "enum"))
                 or (nxt.kind == "IDENT" and nxt.val == "record"
@@ -568,6 +602,59 @@ class Parser:
         if x.kind == "IDENT" and self.peek(1).kind == "OP" and self.peek(1).val == ":=":
             name = self.take().val; self.take(); return Assign(name, self.expr(), x.line, x.col)
         return ExprStmt(self.expr(), x.line, x.col)
+    def export_list(self):
+        """Parse a top-level selective re-export list.
+
+        Syntax: ``export { name, other as Alias, ... }``.  Entries are
+        separated by commas or newlines; a trailing comma is allowed.  The
+        list may not be empty.  Only simple identifiers are accepted (module
+        aliases and dotted static-function names are not re-exportable).
+        Name resolution happens in ``_reject_duplicate_exports`` once every
+        top-level declaration is known.
+        """
+        x = self.take()  # `export`
+        self.expect("OP", "{")
+        self.skip_nl()
+        if self.at("OP", "}"):
+            e = self.peek()
+            raise GamaError("export list must not be empty", e.line, e.col)
+        items = []
+        while True:
+            if self.at("EOF"):
+                e = self.peek()
+                raise GamaError("unterminated export list", e.line, e.col)
+            name_tok = self.expect("IDENT")
+            if not _ALIAS_IDENT.match(name_tok.val):
+                raise GamaError(
+                    "export name must be a simple identifier",
+                    name_tok.line, name_tok.col)
+            alias = None
+            if self.at("IDENT", "as"):
+                self.take(); self.skip_nl()
+                alias_tok = self.expect("IDENT")
+                if not _ALIAS_IDENT.match(alias_tok.val):
+                    raise GamaError(
+                        "export name must be a simple identifier",
+                        alias_tok.line, alias_tok.col)
+                alias = alias_tok.val
+            items.append(ExportItem(name_tok.val, alias,
+                                    name_tok.line, name_tok.col))
+            if self.at("OP", ","):
+                self.take(); self.skip_nl()
+                if self.at("OP", "}"):
+                    break
+                continue
+            if self.at("OP", "}"):
+                break
+            if self.at("NL"):
+                self.skip_nl()
+                continue
+            e = self.peek()
+            raise GamaError("expected ',' or '}' in export list",
+                            e.line, e.col)
+        self.expect("OP", "}")
+        return ExportList(items, x.line, x.col)
+
     def record_decl(self):
         x = self.take()  # `record`
         name = self.expect("IDENT").val
@@ -3120,7 +3207,8 @@ _ALIAS_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # renamed binding. Enums are namespaced as `alias.Enum`; once a module declares
 # at least one explicit export, unexported enums are private like every other
 # unexported declaration. Renamed exports change only the alias-surface name.
-_ALIAS_ALLOWED_TOPLEVEL = (Fn, Let, Import, Use, RecordDecl, EnumDecl)
+_ALIAS_ALLOWED_TOPLEVEL = (Fn, Let, Import, Use, RecordDecl, EnumDecl,
+                           ExportList)
 _STMT_KIND = {Let: "let", Assign: "assignment", Print: "print",
               Prove: "prove", Verify: "verify",
               ExprStmt: "expression statement"}
@@ -3354,31 +3442,65 @@ def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
                 if ex.src is None:
                     ex.src = str(target)
                 raise
-            # Explicit exports filter the alias surface. A module with at least
-            # one `export` exposes only its exported fn/let/record/enum
-            # declarations; a module without any `export` keeps the legacy
-            # behaviour (every top-level declaration is visible through the
-            # alias). Export renames (`export fn f ... as g`) change only the
-            # name used on the alias surface.
-            def _export_target(st):
-                return getattr(st, "export_name", None) or st.name
-
-            exported = {st.name for st in sub
-                        if getattr(st, "exported", False)
-                        and isinstance(st, (Fn, Let, RecordDecl, EnumDecl))}
-            if exported:
-                names = {}
-                for st in sub:
-                    if (isinstance(st, (Fn, Let, RecordDecl, EnumDecl))
-                            and st.name in exported):
-                        target_name = _export_target(st)
-                        if target_name in names:
-                            raise GamaError(
-                                "duplicate export %r in imported module %r"
-                                % (target_name, s.path), st.line, st.col)
-                        names[target_name] = st
+            # Explicit exports filter the alias surface.  A module with at
+            # least one export (declaration export or selective list) exposes
+            # only its exported fn/let/record/enum declarations; a module
+            # without any export keeps the legacy behaviour (every top-level
+            # declaration is visible through the alias).  Declaration renames
+            # (`export fn f ... as g`) and selective renames
+            # (`export { f as g }`) change only the name used on the alias
+            # surface; the module keeps using the original name internally.
+            # Selective entries may only name top-level fn/let/record/enum
+            # declarations declared in this module: imported aliases are
+            # namespaced bindings and plain-imported names are not local
+            # declarations, so neither is re-exportable.
             sub_decls = [st for st in sub
                          if isinstance(st, (Fn, Let, RecordDecl, EnumDecl))]
+            export_map = {}
+            for st in sub_decls:
+                if not getattr(st, "exported", False):
+                    continue
+                target_name = getattr(st, "export_name", None) or st.name
+                if target_name in export_map.values():
+                    raise GamaError(
+                        "duplicate export %r in imported module %r"
+                        % (target_name, s.path), st.line, st.col)
+                export_map[st.name] = target_name
+            decl_names = {d.name for d in sub_decls}
+            target_resolved = pathlib.Path(target).resolve()
+            for lst in sub:
+                if not isinstance(lst, ExportList):
+                    continue
+                # Only the imported module's own list drives its surface; a
+                # plain-imported file's list is metadata for that file and is
+                # ignored here (plain imports keep flattening all names).
+                src = getattr(lst, "_src", None)
+                if src is not None:
+                    try:
+                        if pathlib.Path(src).resolve() != target_resolved:
+                            continue
+                    except OSError:
+                        continue
+                for item in lst.items:
+                    if item.name not in decl_names:
+                        raise GamaError(
+                            "unknown export name %r in imported module %r"
+                            % (item.name, s.path), item.line, item.col)
+                    target_name = item.alias or item.name
+                    if (item.name in export_map
+                            or target_name in export_map.values()):
+                        raise GamaError(
+                            "duplicate export %r in imported module %r"
+                            % (target_name, s.path), item.line, item.col)
+                    export_map[item.name] = target_name
+            exported = set(export_map)
+
+            def _export_target(st):
+                target_name = export_map.get(st.name)
+                if target_name is not None:
+                    return target_name
+                return getattr(st, "export_name", None) or st.name
+
             mapping = {}
             for st in sub_decls:
                 if exported and st.name not in exported:

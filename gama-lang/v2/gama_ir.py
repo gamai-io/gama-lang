@@ -1072,6 +1072,10 @@ class _Compiler:
             self.compile_expr(stmt.expr)
             self.emit("RETURN")
             return
+        if isinstance(stmt, getattr(g2, "ExportList", ())):
+            # Selective re-export lists are module metadata, not executable
+            # statements; the checker already resolved the export surface.
+            return
         _unsupported(stmt)
 
     def compile_if(self, stmt: g2.If) -> None:

@@ -1305,6 +1305,12 @@ class _AstFormatter:
         if isinstance(s, G.Use):
             self._emit(ind + "use " + s.name, [s.line], suffix=semi)
             return
+        if isinstance(s, G.ExportList):
+            parts = [it.name + ((" as " + it.alias) if it.alias else "")
+                     for it in s.items]
+            self._emit(ind + "export { " + ", ".join(parts) + " }",
+                       [s.line, self._stmt_end_line(s)], suffix=semi)
+            return
         if isinstance(s, G.Break):
             self._emit(ind + "break", [s.line], suffix=semi)
             return
