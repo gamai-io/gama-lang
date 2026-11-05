@@ -1617,6 +1617,21 @@ class Checker:
         params = set(getattr(rec, "type_params", None) or [])
         t = _subst_type_ref(ft, bindings) if bindings else ft
         return _erase_type_ref(t, params)
+    def static_target(self, name):
+        """Split a dotted static function name into ``(record, method)``.
+
+        The record is the longest dotted prefix naming a declared record, so
+        both ``Point.of`` and ``geo.Point.of`` resolve.  Returns ``None`` when
+        no dotted prefix is a record (a namespaced module function).
+        """
+        if "." not in name:
+            return None
+        parts = name.split(".")
+        for i in range(len(parts) - 1, 0, -1):
+            rec = ".".join(parts[:i])
+            if rec in self.records:
+                return rec, ".".join(parts[i:])
+        return None
     def _check_type_annotation(self, t, line, col, params=None):
         """Validate generic type-ref arity; unknown simple names stay lenient."""
         if t is None:
@@ -1757,6 +1772,41 @@ class Checker:
                     e = GamaTypeError(
                         f"function {s.name} collides with record {s.name}",
                         s.line, s.col)
+                    e.src = getattr(s, "_src", None)
+                    raise e
+                target = self.static_target(s.name)
+                if target is not None:
+                    rec_name, method_name = target
+                    if "." in method_name:
+                        e = GamaTypeError(
+                            f"static function {s.name}: method name must be a "
+                            f"simple identifier", s.line, s.col)
+                        e.src = getattr(s, "_src", None)
+                        raise e
+                    rec = self.records[rec_name]
+                    if any(m.name == method_name for m in rec.methods):
+                        e = GamaTypeError(
+                            f"static function {s.name} collides with method "
+                            f"{rec_name}.{method_name}", s.line, s.col)
+                        e.src = getattr(s, "_src", None)
+                        raise e
+                    if any(fn == method_name for fn, _ft in rec.fields):
+                        e = GamaTypeError(
+                            f"static function {s.name} collides with field "
+                            f"{rec_name}.{method_name}", s.line, s.col)
+                        e.src = getattr(s, "_src", None)
+                        raise e
+                    if any(p.name == "self" for p in s.params):
+                        e = GamaTypeError(
+                            f"static function {s.name} must not declare self",
+                            s.line, s.col)
+                        e.src = getattr(s, "_src", None)
+                        raise e
+                elif "." in s.name and not getattr(
+                        s, "_alias_plain_fn", False):
+                    e = GamaTypeError(
+                        f"static function {s.name}: unknown record "
+                        f"{s.name.rpartition('.')[0]}", s.line, s.col)
                     e.src = getattr(s, "_src", None)
                     raise e
                 self.funcs[s.name] = s
@@ -2849,6 +2899,31 @@ def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
                     mapping[st.name] = "%s::private::%s" % (s.alias, st.name)
                 else:
                     mapping[st.name] = s.alias + "." + st.name
+            # A static function must stay anchored on its record's mapped name
+            # (``Point.origin`` -> ``geo.Point.origin``), otherwise routing it
+            # through the generic private-name scheme would detach it from the
+            # record and the checker could no longer associate the two.
+            sub_records = {st.name for st in sub_decls
+                           if isinstance(st, RecordDecl)}
+            def _record_prefix(name):
+                parts = name.split(".")
+                for i in range(len(parts) - 1, 0, -1):
+                    prefix = ".".join(parts[:i])
+                    if prefix in sub_records:
+                        return prefix, ".".join(parts[i:])
+                return None
+            for st in sub_decls:
+                if not isinstance(st, Fn) or "." not in st.name:
+                    continue
+                target = _record_prefix(st.name)
+                if target is None or "." in target[1]:
+                    continue
+                rec_new, method = mapping[target[0]], target[1]
+                if (exported and st.name not in exported
+                        and "::private::" not in rec_new):
+                    mapping[st.name] = rec_new + "." + method + "::private"
+                else:
+                    mapping[st.name] = rec_new + "." + method
             for st in sub_decls:
                 new_name = mapping[st.name]
                 public = (isinstance(st, EnumDecl)
@@ -2861,6 +2936,17 @@ def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
                     declared.add(new_name)
                 renamed = replace(_rename_refs(st, mapping), name=new_name)
                 _mark_src(renamed, getattr(st, "_src", target))
+                if isinstance(renamed, Fn):
+                    # A plain module function becomes ``alias.name``.  Mark it
+                    # so the checker does not mistake it for a static function
+                    # on a record; nested aliases keep the mark.  Dotted module
+                    # functions are static functions and must be validated.
+                    if ("." not in st.name
+                            or getattr(st, "_alias_plain_fn", False)):
+                        try:
+                            renamed._alias_plain_fn = True
+                        except (AttributeError, TypeError):
+                            pass
                 out.append(renamed)
         else:
             if not _top:
