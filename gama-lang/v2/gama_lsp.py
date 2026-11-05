@@ -338,7 +338,7 @@ TYPE_ARGS_RE = re.compile(
 # Header of a generic named function, used to find type parameters that are
 # in scope at the cursor. Matches across line breaks inside `<...>`.
 FN_TYPE_PARAM_HEADER_RE = re.compile(
-    r"\bfn\s+[A-Za-z_][A-Za-z0-9_]*\s*<([A-Za-z0-9_,\s]*)>")
+    r"\bfn\s+[A-Za-z_][A-Za-z0-9_]*\s*<([A-Za-z0-9_:.,\s]*)>")
 # Tail of a line that is an incomplete member expression (`print p.x`).
 LINE_CHAIN_TAIL_RE = re.compile(
     r"([A-Za-z_][A-Za-z0-9_]*)(?:\s*\.\s*[A-Za-z0-9_]*)*"
@@ -446,7 +446,10 @@ def _param_label(param) -> str:
 
 def fn_signature(node) -> str:
     names = getattr(node, "type_params", None) or []
-    name = node.name + (("<" + ", ".join(names) + ">") if names else "")
+    bounds = getattr(node, "type_param_bounds", None) or {}
+    parts = [(str(n) + (": " + str(bounds[n]) if n in bounds else ""))
+             for n in names]
+    name = node.name + (("<" + ", ".join(parts) + ">") if parts else "")
     return signature_text(name, [_param_label(p) for p in node.params],
                           node.ret, node.effects)
 
@@ -1124,7 +1127,8 @@ def _enclosing_type_params(text: str, line: int,
         if end is None:
             end = len(text)
         if match.start() <= target <= end:
-            names = [name.strip() for name in match.group(1).split(",")
+            names = [name.split(":", 1)[0].strip()
+                     for name in match.group(1).split(",")
                      if name.strip()]
             best = (match.start(), names)
     return best[1] if best else []

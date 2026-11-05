@@ -1344,7 +1344,10 @@ class _AstFormatter:
 
     def _type_params_text(self, s) -> str:
         names = getattr(s, "type_params", None) or []
-        return ("<" + ", ".join(names) + ">") if names else ""
+        bounds = getattr(s, "type_param_bounds", None) or {}
+        parts = [(str(n) + (": " + str(bounds[n]) if n in bounds else ""))
+                 for n in names]
+        return ("<" + ", ".join(parts) + ">") if parts else ""
 
     def _type_args_text(self, s) -> str:
         args = getattr(s, "type_args", None) or []
