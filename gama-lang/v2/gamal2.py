@@ -30,7 +30,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 _NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect())
-from dataclasses import dataclass, fields, is_dataclass, replace
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -113,6 +113,7 @@ def _record_value_str(v) -> str:
     return str(v)
 
 _NO_PAYLOAD = object()
+_NO_METHOD = object()
 
 class EnumVal:
     """Runtime enum value: Enum.Variant or Enum.Variant(payload, ...).
@@ -299,7 +300,9 @@ class Verify: expr: Any; line: int; col: int
 @dataclass
 class Try: expr: Any; line: int; col: int
 @dataclass
-class RecordDecl: name: str; fields: list; line: int; col: int; exported: bool = False
+class Method: name: str; params: list; ret: str | None; effects: set | None; body: list; line: int; col: int; end_line: int = 0; end_col: int = 0
+@dataclass
+class RecordDecl: name: str; fields: list; line: int; col: int; exported: bool = False; methods: list = field(default_factory=list)
 @dataclass
 class RecordLit: name: str; fields: list; line: int; col: int
 @dataclass
@@ -454,10 +457,16 @@ class Parser:
         self.skip_nl()
         self.expect("OP", "{")
         self.skip_seps()
-        fields = []
+        fields = []; methods = []
         while not self.at("OP", "}"):
             if self.at("EOF"):
                 e = self.peek(); raise GamaError("unterminated record declaration", e.line, e.col)
+            if self.at("KW", "fn"):
+                methods.append(self.method())
+                self.skip_seps()
+                if self.at("OP", ","):
+                    self.take(); self.skip_seps()
+                continue
             fn = self.expect("IDENT").val
             self.expect("OP", ":")
             ft = self.expect("IDENT").val
@@ -466,7 +475,41 @@ class Parser:
             if self.at("OP", ","):
                 self.take(); self.skip_seps()
         self.expect("OP", "}")
-        return RecordDecl(name, fields, x.line, x.col)
+        return RecordDecl(name, fields, x.line, x.col, methods=methods)
+    def method(self):
+        x = self.take()  # `fn`
+        name_tok = self.peek()
+        if name_tok.kind not in ("IDENT", "KW"):
+            raise GamaError("method name expected", name_tok.line, name_tok.col)
+        self.take()
+        name = name_tok.val
+        if "." in name:
+            raise GamaError(
+                "method name must be a simple identifier", name_tok.line, name_tok.col)
+        self.expect("OP", "("); self.skip_nl()
+        params = []
+        if not self.at("OP", ")"):
+            while True:
+                pn = self.expect("IDENT").val; self.expect("OP", ":"); pt = self.expect("IDENT").val
+                default = None
+                if self.at("OP", "="):
+                    self.take(); self.skip_nl(); default = self.expr()
+                params.append(Param(pn, pt, default)); self.skip_nl()
+                if not self.at("OP", ","): break
+                self.take(); self.skip_nl()
+        self.expect("OP", ")"); ret = None
+        if self.at("OP", "->"): self.take(); self.skip_nl(); ret = self.expect("IDENT").val
+        effects = None
+        if self.at("KW", "effects"):
+            self.take(); self.expect("OP", "{"); self.skip_nl(); effects = set()
+            while not self.at("OP", "}"):
+                effects.add(self.expect("IDENT").val); self.skip_nl()
+                if self.at("OP", ","): self.take(); self.skip_nl()
+            self.expect("OP", "}")
+        body = self.block()
+        end = self.t[self.i - 1]
+        return Method(name, params, ret, effects, body, x.line, x.col,
+                      end.line, end.col)
     def fn(self):
         x = self.take(); name = self.expect("IDENT").val; self.expect("OP", "("); self.skip_nl()
         params = []
@@ -1306,6 +1349,40 @@ class Checker:
                         e.src = getattr(s, "_src", None)
                         raise e
                     seen.add(fn)
+                method_names = set()
+                for m in s.methods:
+                    if m.name in method_names:
+                        e = GamaTypeError(
+                            f"record {s.name}: duplicate method {m.name}",
+                            m.line, m.col)
+                        e.src = getattr(s, "_src", None)
+                        raise e
+                    if m.name in seen:
+                        e = GamaTypeError(
+                            f"record {s.name}: method {m.name} collides with a field",
+                            m.line, m.col)
+                        e.src = getattr(s, "_src", None)
+                        raise e
+                    method_names.add(m.name)
+                    if not m.params or m.params[0].name != "self":
+                        e = GamaTypeError(
+                            f"method {s.name}.{m.name} must declare self as its "
+                            f"first parameter", m.line, m.col)
+                        e.src = getattr(s, "_src", None)
+                        raise e
+                    if m.params[0].type_name != s.name:
+                        e = GamaTypeError(
+                            f"method {s.name}.{m.name}: self type "
+                            f"{m.params[0].type_name} != {s.name}", m.line, m.col)
+                        e.src = getattr(s, "_src", None)
+                        raise e
+                    for p in m.params[1:]:
+                        if p.name == "self":
+                            e = GamaTypeError(
+                                f"method {s.name}.{m.name}: self is only allowed "
+                                f"as the first parameter", m.line, m.col)
+                            e.src = getattr(s, "_src", None)
+                            raise e
                 self.records[s.name] = s
         for s in stmts:
             if isinstance(s, Fn):
@@ -1334,6 +1411,18 @@ class Checker:
                         raise e
                     seen.add(vn)
                 self.enums[s.name] = {vn: vp for vn, vp, _vl, _vc in s.variants}
+        # Method bodies are checked after every record, function and enum is
+        # registered so a method can call records/functions/enums declared
+        # later in the file (and other methods of the same record).
+        for s in stmts:
+            if isinstance(s, RecordDecl):
+                for m in s.methods:
+                    try:
+                        self.check_method(s.name, m)
+                    except GamaError as e:
+                        if e.src is None:
+                            e.src = getattr(s, "_src", None)
+                        raise
         for s in stmts:
             if isinstance(s, EnumDecl):
                 continue
@@ -1482,6 +1571,59 @@ class Checker:
         bad = used - allowed
         if bad: raise GamaEffectError(f"function {f.name} uses undeclared effects: {','.join(sorted(bad))}", f.line, f.col)
         self.pop()
+    def check_method(self, record_name, m):
+        """Check one record method body with ``self`` bound to the record."""
+        self.push()
+        for p in m.params: self.set(p.name, p.type_name)
+        old = self.effects; self.effects = set()
+        old_ret = self.ret_type; self.ret_type = m.ret or "Any"
+        for s in m.body: self.stmt(s, m.effects or set())
+        used = set(self.effects); self.effects = old; self.ret_type = old_ret
+        bad = used - (m.effects or set())
+        if bad:
+            raise GamaEffectError(
+                f"method {record_name}.{m.name} uses undeclared effects: "
+                f"{','.join(sorted(bad))}", m.line, m.col)
+        self.pop()
+    def method_call(self, e, row=None):
+        """Resolve a dotted method call, or return None if it is not one.
+
+        A dotted ``Call`` is either a namespaced function (already handled by
+        the caller) or ``receiver.method``.  The receiver is resolved with the
+        normal dotted-variable rules; only a receiver whose static type is a
+        declared record is treated as a method call.  Everything else is left
+        to the caller so unknown-function diagnostics are unchanged.
+        """
+        if "." not in e.name:
+            return None
+        receiver_name, _, method_name = e.name.rpartition(".")
+        if not receiver_name:
+            return None
+        try:
+            rt = self.expr(Var(receiver_name, e.line, e.col), row)
+        except GamaError:
+            return None
+        if rt not in self.records:
+            return None
+        rec = self.records[rt]
+        m = next((x for x in rec.methods if x.name == method_name), None)
+        if m is None:
+            raise GamaTypeError(
+                f"unknown method {method_name!r} on {rt}", e.line, e.col)
+        params = m.params[1:]
+        required = sum(1 for p in params if p.default is None)
+        if not (required <= len(e.args) <= len(params)):
+            raise GamaTypeError(
+                f"{rt}.{method_name} expects {required}..{len(params)} args, "
+                f"got {len(e.args)}", e.line, e.col)
+        for p, a in zip(params, e.args):
+            at = self.expr(a, row)
+            if not self.compat(at, p.type_name):
+                raise GamaTypeError(
+                    f"{rt}.{method_name}: {p.name} {at} != {p.type_name}",
+                    e.line, e.col)
+        self.effects |= (m.effects or set())
+        return m.ret or "Any"
     def compat(self, got, want):
         return want in ("Any", got) or (want in NUM and got in NUM) or (want == "List" and got in ("List", "Table"))
     def check_field_assign(self, s, value_type):
@@ -1733,6 +1875,9 @@ class Checker:
                                 f"{base}.{variant}: payload{where} {at} != {ptype}",
                                 e.line, e.col)
                     return base
+                mt = self.method_call(e, row)
+                if mt is not None:
+                    return mt
                 raise GamaTypeError(f"unknown function {e.name}", e.line, e.col)
             required = sum(1 for p in f.params if p.default is None)
             if not (required <= len(e.args) <= len(f.params)):
@@ -1902,7 +2047,14 @@ def _rename_refs(node, mapping):
     if isinstance(node, RecordDecl):
         return replace(
             node, name=mapping.get(node.name, node.name),
-            fields=[(fn, mapping.get(ft, ft)) for fn, ft in node.fields])
+            fields=[(fn, mapping.get(ft, ft)) for fn, ft in node.fields],
+            methods=[_rename_refs(m, mapping) for m in node.methods])
+    if isinstance(node, Method):
+        return replace(
+            node,
+            ret=(mapping.get(node.ret, node.ret) if node.ret else node.ret),
+            params=[_rename_refs(p, mapping) for p in node.params],
+            body=_rename_refs(node.body, mapping))
     if isinstance(node, RecordLit):
         return replace(
             node, name=mapping.get(node.name, node.name),
@@ -2249,7 +2401,7 @@ def _ledger_scan(data):
 
 class Interpreter:
     def __init__(self, interactive=False):
-        self.env = Env(); self.funcs = {}; self.records = {}; self.enums = {}; self.out = []; self.memory = {}
+        self.env = Env(); self.funcs = {}; self.records = {}; self.record_env = {}; self.enums = {}; self.out = []; self.memory = {}
         self.proofs = {}; self.proof_chain = []; self.prev_proof = "GENESIS"; self.interactive = interactive
         self._ledger_records = []; self._ledger_problems = []
         self.last_ask = None
@@ -2466,6 +2618,7 @@ class Interpreter:
             for s in stmts:
                 if isinstance(s, RecordDecl):
                     self.records[s.name] = s
+                    self.record_env[s.name] = self.env
             for s in stmts: self.stmt(s, self.env)
         except PropagateSignal:
             raise GamaRuntimeError("? outside function") from None
@@ -2480,7 +2633,9 @@ class Interpreter:
             else:
                 env.assign(s.name, value)
         elif isinstance(s, Use): pass
-        elif isinstance(s, RecordDecl): self.records[s.name] = s
+        elif isinstance(s, RecordDecl):
+            self.records[s.name] = s
+            self.record_env[s.name] = env
         elif isinstance(s, EnumDecl):
             self.enums.setdefault(s.name, {v[0]: v[1] for v in s.variants})
         elif isinstance(s, For):
@@ -2694,7 +2849,7 @@ class Interpreter:
             if env_lease is None:
                 errs.append("lease_not_configured")
         return {"ok": not errs, "expected": exp, "errors": errs}
-    def invoke(self, fv, args, env, row, line, col):
+    def invoke(self, fv, args, env, row, line, col, self_value=_NO_PAYLOAD):
         configured = self._env_int("GAMA_L_MAX_CALL_DEPTH", DEFAULT_CALL_DEPTH)
         # Even an explicit high value must not exceed what CPython can hold.
         depth_limit = min(configured, _call_depth_cap())
@@ -2712,6 +2867,8 @@ class Interpreter:
                     f"{fv.name} expects {required}..{len(fv.params)} args, got {len(args)}",
                     line, col)
             local = Env(fv.closure)
+            if self_value is not _NO_PAYLOAD:
+                local.set("self", self_value)
             for i, p in enumerate(fv.params):
                 if i < len(args):
                     value = self.expr(args[i], env, row)
@@ -2771,6 +2928,44 @@ class Interpreter:
         if parts[-1] not in obj.fields:
             raise GamaRuntimeError(f"unknown field {name}", line, col)
         obj.fields[parts[-1]] = value
+    def method_call(self, e, env, row=None):
+        """Run ``receiver.method(args)`` for a dotted call name, or return sentinel.
+
+        Only record receivers are treated as method calls.  A receiver that
+        cannot be evaluated (or is not a record) falls through to the caller so
+        namespaced-function and unknown-function diagnostics keep their old
+        behaviour.  A record receiver without the named method is an error.
+        """
+        if "." not in e.name:
+            return _NO_METHOD
+        receiver_name, _, method_name = e.name.rpartition(".")
+        if not receiver_name:
+            return _NO_METHOD
+        try:
+            receiver = self.expr(Var(receiver_name, e.line, e.col), env, row)
+        except GamaRuntimeError:
+            return _NO_METHOD
+        if not isinstance(receiver, RecordVal):
+            return _NO_METHOD
+        rec = self.records.get(receiver.type_name)
+        if rec is None:
+            return _NO_METHOD
+        m = next((x for x in rec.methods if x.name == method_name), None)
+        if m is None:
+            raise GamaRuntimeError(
+                f"unknown method {method_name!r} on {receiver.type_name}",
+                e.line, e.col)
+        params = m.params[1:]
+        required = sum(1 for p in params if p.default is None)
+        if not (required <= len(e.args) <= len(params)):
+            raise GamaRuntimeError(
+                f"{receiver.type_name}.{method_name} expects {required}.."
+                f"{len(params)} args, got {len(e.args)}", e.line, e.col)
+        closure = self.record_env.get(receiver.type_name, self.env)
+        fv = FunctionVal(params, m.ret, m.effects, m.body, closure,
+                         f"{receiver.type_name}.{m.name}")
+        return self.invoke(fv, e.args, env, row, e.line, e.col,
+                           self_value=receiver)
     def expr(self, e, env, row=None):
         """Evaluate one expression node and count it as one expression step.
 
@@ -3063,6 +3258,9 @@ class Interpreter:
                             f"got {len(e.args)}", e.line, e.col)
                     values = tuple(self.expr(a, env, row) for a in e.args)
                     return EnumVal(base, variant, payloads=values)
+            method_result = self.method_call(e, env, row)
+            if method_result is not _NO_METHOD:
+                return method_result
             if isinstance(fnval, FunctionVal):
                 return self.invoke(fnval, e.args, env, row, e.line, e.col)
             if fnval is not None:

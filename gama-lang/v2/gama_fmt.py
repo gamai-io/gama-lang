@@ -1817,13 +1817,60 @@ class _AstFormatter:
             return prefix + text
         return prefix + self._wrap(node, len(ind), base_col + 2, minp)
 
-    @staticmethod
-    def _record_text(s) -> str:
+    def _record_text(self, s) -> str:
         prefix = "export " if getattr(s, "exported", False) else ""
-        if not s.fields:
+        parts = [fn + ": " + ft for fn, ft in s.fields]
+        for m in getattr(s, "methods", []):
+            parts.append(self._method_inline_text(m))
+        if not parts:
             return prefix + "record " + s.name + " { }"
-        fields = [fn + ": " + ft for fn, ft in s.fields]
-        return prefix + "record " + s.name + " { " + ", ".join(fields) + " }"
+        return prefix + "record " + s.name + " { " + ", ".join(parts) + " }"
+
+    def _method_inline_text(self, m) -> str:
+        header = self._fn_header(m, "fn")
+        if not m.body:
+            return header + " { }"
+        return header + " { " + self._inline_block(m.body) + " }"
+
+    def _method_body_pair(self, m):
+        """Token pair ``(opener, closer)`` for a method body, from its end."""
+        end = (getattr(m, "end_line", 0), getattr(m, "end_col", 0))
+        if not end[0]:
+            return None
+        end_i = None
+        for i, t in enumerate(self.sig):
+            if (t.line, t.col) == end:
+                end_i = i
+                break
+        if end_i is None:
+            return None
+        depth = 0
+        for j in range(end_i, -1, -1):
+            t = self.sig[j]
+            if t.kind == "OP" and t.val == "}":
+                depth += 1
+            elif t.kind == "OP" and t.val == "{":
+                depth -= 1
+                if depth == 0:
+                    return (t, self.sig[end_i])
+        return None
+
+    def _render_method(self, m, indent: int):
+        ind = _UNIT * indent
+        header = self._fn_header(m, "fn")
+        pair = self._method_body_pair(m)
+        if (pair is not None and m.line == pair[0].line
+                and pair[0].line == pair[1].line):
+            inner = self._inline_block(m.body)
+            text = ind + header + (" { " + inner + " }" if m.body else " { }")
+            self._emit(text, [m.line, pair[1].line])
+            return
+        self._emit(ind + header + " {", [m.line])
+        if pair is not None:
+            self.render_block(m.body, indent + 1, pair[0].line, pair[1].line)
+            self._emit(ind + "}", [pair[1].line])
+        else:
+            self._emit(ind + "}", [m.line])
 
     @staticmethod
     def _enum_variant_text(v) -> str:
@@ -1932,6 +1979,15 @@ class _AstFormatter:
 
     def _render_record(self, s, indent: int, semi: str):
         ind = _UNIT * indent
+        if getattr(s, "methods", []):
+            prefix = "export " if getattr(s, "exported", False) else ""
+            self._emit(ind + prefix + "record " + s.name + " {", [s.line])
+            for fn, ft in s.fields:
+                self._emit(_UNIT * (indent + 1) + fn + ": " + ft)
+            for m in s.methods:
+                self._render_method(m, indent + 1)
+            self._emit(ind + "}", [self._stmt_end_line(s)], suffix=semi)
+            return
         text = self._record_text(s)
         has_comment = self._decl_has_comment(s)
         if (not has_comment and not s.fields) or (

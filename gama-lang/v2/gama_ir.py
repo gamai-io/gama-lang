@@ -569,6 +569,11 @@ class _Compiler:
             self.emit("NOP")
             return
         if isinstance(stmt, g2.RecordDecl):
+            if getattr(stmt, "methods", None):
+                # The IR value model has no method table or bound calls; reject
+                # explicitly instead of compiling a record that silently loses
+                # its methods (and would fail later on the call instead).
+                _unsupported(stmt, "record methods")
             fields = tuple(fn for fn, _ft in stmt.fields)
             self.records[stmt.name] = fields
             self.emit("DEF_RECORD", (stmt.name, fields))
