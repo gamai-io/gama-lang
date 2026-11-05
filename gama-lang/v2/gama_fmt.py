@@ -973,6 +973,7 @@ class _AstFormatter:
                         update_renderer(k, v)) for k, v in node.fields]
         elif isinstance(node, G.Call):
             open_text = node.name + self._type_args_text(node) + "("
+            close_text = ")"
             entries = [(self._expr_start_pos(a), self._expr_end_pos(a),
                         lit_renderer(a)) for a in node.args]
         else:  # CallExpr

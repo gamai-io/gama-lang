@@ -2464,9 +2464,9 @@ def _rename_refs(node, mapping):
         type_args = getattr(node, "type_args", None)
         return replace(node, name=_rename_qualified(node.name, mapping),
                        args=[_rename_refs(a, mapping) for a in node.args],
-                       type_args=[_rename_type_ref(t, mapping)
-                                  for t in (getattr(node, "type_args", None)
-                                            or [])])
+                       type_args=(None if type_args is None else
+                                  [_rename_type_ref(t, mapping)
+                                   for t in type_args]))
 
     if isinstance(node, Var):
         return replace(node, name=_rename_qualified(node.name, mapping))
