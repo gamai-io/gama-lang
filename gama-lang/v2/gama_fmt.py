@@ -98,14 +98,19 @@ Known limitations (documented, not hidden):
     source: the parser only accepts a newline *after* an operator, so valid
     source can only place a comment *after* the operator.  The renderer still
     has a deterministic defensive rule for a comment found before an operator:
-    emit it immediately after the operator (on its own continuation line at the
-    operator's continuation indent) and never before the operator, so it is
-    never dropped, duplicated or allowed to break the parse.
+    it forces the expanded form (even when the expression would otherwise fit)
+    and emits the comment immediately after the operator, on its own
+    continuation line at the operator's continuation indent, never before the
+    operator, so it is never dropped, duplicated or allowed to break the
+    parse.
   * A comment inside a lambda *return type* position has no legal line-break
     point (``) ->`` must stay on one line); it uses the same deterministic
     safe-position fallback as other unplaceable short-expression comments.
   * Indivisible tokens (a single identifier or string longer than ``width``)
-    still overflow.
+    still overflow.  This is intentional: the formatter never splits a token,
+    never loops trying to make it fit, and still emits syntactically valid,
+    idempotent output (the overlong token simply occupies one line).  A
+    container around such a token is still expanded normally.
   * Map keys are re-rendered from their decoded string value: a quoted
     identifier key (``"total"``) becomes a bare key (``total``).  The map entry
     and lookup semantics are identical.
@@ -113,6 +118,10 @@ Known limitations (documented, not hidden):
   * ``effects`` is stored as a ``set`` by the parser, so effect names are
     emitted in sorted order; a set that carries comments keeps its source
     order instead (to preserve comment pairing and the token stream).
+  * Duplicate effect names are already collapsed by the parser.  A commented
+    effects block that contains duplicates therefore cannot pair every comment
+    with a name: all comments are emitted in source order before the sorted
+    unique names (comment order and idempotence are still preserved).
   * Surface sugar that the parser lowers to a builtin call is emitted as a call:
     ``remember k = v`` -> ``remember("k", v)``, ``recall k`` -> ``recall("k")``,
     ``wait user x`` -> ``wait_user(x)``.  The AST is unchanged.
@@ -857,6 +866,7 @@ class _AstFormatter:
                 continue
             if c.own_line:
                 return True
+        prev_end = self._expr_end_pos(parts[0][1])
         for op, right, opnode in parts[1:]:
             if opnode is None:
                 continue
@@ -866,11 +876,19 @@ class _AstFormatter:
                 if idx in self.used:
                     continue
                 pos = (c.line, c.col)
+                # A comment *before* an operator is invalid source (the parser
+                # only skips newlines after an operator).  Detect it anyway so
+                # the formatter expands and applies the documented defensive
+                # placement (after the operator) instead of leaving the
+                # comment to a later, less precise fallback.
+                if self._pos_lt(prev_end, pos) and self._pos_lt(pos, op_pos):
+                    return True
                 if not self._pos_lt(op_pos, pos):
                     continue
                 if (c.line == rs[0] and self._pos_lt(pos, rs)) or \
                         c.line < rs[0]:
                     return True
+            prev_end = self._expr_end_pos(right)
         return False
 
     def _expr_has_comment(self, node) -> bool:
@@ -1477,13 +1495,20 @@ class _AstFormatter:
     def _effects_block_text(self, node, base_indent: int, head: str) -> str:
         """Expanded ``effects`` set with comments kept deterministic.
 
-        The parser stores effects in a ``set`` and the formatter always emits
-        them sorted.  When the source order already matches that sorted order
-        each comment stays on the entry it annotates (trailing comments on the
-        name line, own-line comments before the next name).  When sorting
-        would reorder the names, comment order is preserved by emitting the
-        comments in source order immediately inside the brace, before the
-        sorted names.  Either way the comment sequence is unchanged.
+        The parser stores effects in a ``set``.  A commented set is emitted in
+        *source* order so each comment stays on the entry it annotates
+        (trailing comments on the name line, own-line comments before the next
+        name) and the source token order is preserved.  Uncommented sets stay
+        sorted (they never reach this method).
+
+        If the source contains duplicate effect names the parser has already
+        collapsed them into the set, so the names can no longer be paired with
+        every comment.  In that case all comments are emitted in source order
+        immediately inside the brace, before the sorted unique names: comment
+        order and idempotence are preserved, but a comment that annotated a
+        dropped duplicate is no longer adjacent to a name, and the token
+        stream cannot match the source because the parser already removed the
+        duplicate name token.  The fallback is deterministic.
         """
         inner = base_indent + 2
         names = sorted(node.effects)

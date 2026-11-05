@@ -831,6 +831,229 @@ class ShortExpressionCommentTests(WrapBase):
         self.assertEqual(out.count("# before value"), 1)
 
 
+class BeforeBinaryOperatorDeterminismTests(unittest.TestCase):
+    """The defensive before-operator rule is applied on every expansion.
+
+    The source form itself is invalid (see
+    :class:`BeforeBinaryOperatorCommentTests`); these tests pin the internal
+    fallback so a synthetic/defensive AST can never drop, duplicate or move a
+    comment to the wrong side of the operator.
+    """
+
+    def test_forced_expansion_places_comment_after_operator(self):
+        for own_line in (True, False):
+            f = gama_fmt._AstFormatter("let x = 1 + 2\nprint x\n")
+            node = dataclasses.replace(f.ast[0].expr, line=2, col=1)
+            f.comments = [gama_fmt._Comment(1, 11, "# c", own_line)]
+            f.used = set()
+            self.assertEqual(f._wrap(node, 0, 0), "1 +\n  # c\n  2")
+            self.assertEqual(len(f.used), 1)
+
+    def test_before_and_after_operator_comments_are_each_emitted_once(self):
+        f = gama_fmt._AstFormatter("let x = 1  + 2\n")
+        node = f.ast[0].expr
+        f.comments = [
+            gama_fmt._Comment(1, 11, "# before", True),
+            gama_fmt._Comment(1, 13, "# after", True),
+        ]
+        f.used = set()
+        out = f._wrap_binary(node, 0, 0, 0)
+        self.assertEqual(out, "1 +\n  # before\n  # after\n  2")
+        self.assertEqual(out.count("# before"), 1)
+        self.assertEqual(out.count("# after"), 1)
+        self.assertEqual(f.used, {0, 1})
+
+    def test_before_operator_comment_in_nested_right_operand(self):
+        f = gama_fmt._AstFormatter("let x = 1 + (2  + 3)\nprint x\n")
+        node = f.ast[0].expr
+        f.comments = [gama_fmt._Comment(1, 16, "# c", True)]
+        f.used = set()
+        out = f._wrap(node, 0, 0)
+        self.assertEqual(out.count("# c"), 1)
+        self.assertEqual(len(f.used), 1)
+        lines = out.splitlines()
+        self.assertEqual(lines[0], "1 +")
+        self.assertIn("  2 +", out)
+        # The comment follows the inner operator, never precedes it.
+        self.assertLess(out.index("2 +"), out.index("# c"))
+        self.assertIn("    # c", out)
+        self.assertIn("    3", out)
+
+
+class EffectsSourceOrderContractTests(WrapBase):
+    """Commented effects keep source order, comment order and idempotence."""
+
+    def test_unsorted_commented_effects_survive_narrow_width(self):
+        src = ("fn f() -> Int effects {\n # note one\n net,\n"
+               " io # note two\n} { return 1 }\nprint f()\n")
+        # roundtrip proves idempotence, AST equality, token order (including
+        # the effect names) and comment order at the narrow width.
+        out = self.roundtrip(src, width=20)
+        self.assertLess(out.index("net,"), out.index("io # note two"))
+        self.assertEqual(out.count("# note one"), 1)
+        self.assertEqual(out.count("# note two"), 1)
+
+    def test_head_pre_mid_and_tail_comments_all_kept_in_order(self):
+        src = ("fn f() -> Int effects { # head\n # pre\n zeta,\n"
+               " alpha, # mid\n net # tail\n} { return 1 }\nprint f()\n")
+        out = self.roundtrip(src, width=40)
+        expected = ["# head", "# pre", "# mid", "# tail"]
+        self.assertEqual([out.count(c) for c in expected], [1, 1, 1, 1])
+        indexes = [out.index(c) for c in expected]
+        self.assertEqual(indexes, sorted(indexes))
+        # Effect names stay in source order, not sorted order.
+        self.assertLess(out.index("zeta,"), out.index("alpha,"))
+        self.assertLess(out.index("alpha,"), out.index("net # tail"))
+
+    def test_empty_commented_effects_stays_expanded_and_idempotent(self):
+        src = "fn f() -> Int effects {\n # only\n} { return 1 }\nprint f()\n"
+        out = self.roundtrip(src, width=20)
+        self.assertEqual(out.count("# only"), 1)
+        self.assertIn("effects {\n  # only\n}", out)
+
+    def test_duplicate_effect_names_fallback_keeps_every_comment(self):
+        # The parser stores effects in a set, so the duplicate ``io`` is
+        # already gone from the AST.  Comments cannot all pair with a name;
+        # the documented fallback emits them in source order before the
+        # sorted unique names.  This is the one case where the semantic token
+        # stream cannot be compared (the parser itself removed a token), so
+        # idempotence, AST equality and comment order are checked explicitly.
+        src = ("fn f() -> Int effects {\n # a\n io, # b\n io,\n net\n}"
+               " { return 1 }\nprint f()\n")
+        out = gama_fmt.format_source(src)
+        self.assertEqual(out, gama_fmt.format_source(out),
+                         "duplicate-effects fallback is not idempotent")
+        self.assertEqual(shape(G.parse(src)), shape(G.parse(out)))
+        self.assertEqual(comments_in(src), comments_in(out))
+        self.assertEqual(out.count("# a"), 1)
+        self.assertEqual(out.count("# b"), 1)
+        self.assertLess(out.index("# a"), out.index("# b"))
+        self.assertLess(out.index("# b"), out.index("io,"))
+        self.assertEqual(out.count("\n  io"), 1)
+        self.assertIn("  net", out)
+        G.check(out)
+
+
+class IndivisibleTokenWidthTests(WrapBase):
+    """A single token longer than the width overflows instead of looping."""
+
+    LONG = ("supercalifragilisticexpialidocious_"
+            "supercalifragilisticexpialidocious")
+
+    def test_long_identifier_overflows_one_line(self):
+        src = "let " + self.LONG + " = 1\nprint " + self.LONG + "\n"
+        out = self.roundtrip(src, width=20)
+        self.assertEqual(out, src)
+        self.assertGreater(max(len(line) for line in out.splitlines()), 20)
+        self.assertEqual(out.count(self.LONG), 2)
+
+    def test_long_string_literal_is_byte_identical(self):
+        literal = '"' + ("a" * 80) + '"'
+        src = "let s = " + literal + "\nprint s\n"
+        out = self.roundtrip(src, width=20)
+        self.assertIn(literal, out)
+        self.assertGreater(max(len(line) for line in out.splitlines()), 20)
+
+    def test_long_entry_wraps_container_not_the_token(self):
+        src = ("let " + self.LONG + " = 1\nlet xs = [" + self.LONG +
+               ", 2]\nprint xs\n")
+        out = self.roundtrip(src, width=20)
+        lines = out.splitlines()
+        start = lines.index("let xs = [")
+        self.assertEqual(lines[start + 1], "  " + self.LONG + ",")
+        self.assertEqual(lines[start + 2], "  2")
+        self.assertEqual(lines[start + 3], "]")
+        self.assertGreater(max(len(line) for line in lines), 20)
+
+    def test_long_map_key_overflows_one_entry_line(self):
+        key = "k" * 70
+        src = "let m = {" + key + ": 1, b: 2}\nprint m\n"
+        out = self.roundtrip(src, width=20)
+        self.assertEqual(out.splitlines()[0], "let m = {")
+        self.assertIn("  " + key + ": 1,", out)
+        self.assertGreater(max(len(line) for line in out.splitlines()), 20)
+
+    def test_long_effect_name_overflows_expanded_set(self):
+        # Keep the source in sorted order: uncommented effects are always
+        # emitted sorted, so token order can only be compared when it starts
+        # sorted (commented effects are covered by the source-order tests).
+        src = ("fn f() -> Int effects { io, " + self.LONG + " }"
+               " { return 1 }\nprint f()\n")
+        out = self.roundtrip(src, width=20)
+        self.assertIn("  " + self.LONG + "\n} { return 1 }", out)
+        self.assertGreater(max(len(line) for line in out.splitlines()), 20)
+
+    def test_tiny_width_terminates_and_is_stable(self):
+        src = "let xs = [100000, 200000, 300000]\nprint xs\n"
+        zero = gama_fmt.format_source(src, width=0)
+        negative = gama_fmt.format_source(src, width=-5)
+        floor = gama_fmt.format_source(src, width=20)
+        self.assertEqual(zero, floor)
+        self.assertEqual(negative, floor)
+        self.assertEqual(floor, gama_fmt.format_source(floor, width=20))
+        self.assertEqual(shape(G.parse(src)), shape(G.parse(floor)))
+        G.check(floor)
+
+
+class NestedCommentWidthCombinationTests(WrapBase):
+    """Nested combinations of comment attachment and width wrapping."""
+
+    def test_commented_effects_in_lambda_inside_list_narrow(self):
+        src = ("let fs = [fn(a: Int) -> Int effects { # head\n # pre\n"
+               " zeta,\n alpha # tail\n} { return a }]\nprint 1\n")
+        out = self.roundtrip(src, width=20)
+        expected = ["# head", "# pre", "# tail"]
+        self.assertEqual([out.count(c) for c in expected], [1, 1, 1])
+        self.assertEqual([out.index(c) for c in expected],
+                         sorted(out.index(c) for c in expected))
+        # Source order of the effect names survives inside the lambda.
+        self.assertLess(out.index("zeta,"), out.index("alpha # tail"))
+
+    def test_commented_effects_in_lambda_inside_if_block(self):
+        src = ("if true {\n let g = fn() -> Int effects { # head\n # pre\n"
+               " net,\n io # tail\n } { return 1 }\n print 1\n}\n")
+        out = self.roundtrip(src, width=20)
+        self.assertIn("  let g = fn() -> Int effects { # head\n", out)
+        self.assertEqual(out.count("# pre"), 1)
+        self.assertEqual(out.count("# tail"), 1)
+        self.assertLess(out.index("net,"), out.index("io # tail"))
+        self.assertIn("    return 1", out)
+
+    def test_container_comment_and_pipe_bar_comment_narrow(self):
+        src = ("let r = [1, 2, # tail\n 3] | # bar\n count\n"
+               "print r\n")
+        out = self.roundtrip(src, width=20)
+        self.assertEqual(out.count("# tail"), 1)
+        self.assertEqual(out.count("# bar"), 1)
+        self.assertLess(out.index("# tail"), out.index("# bar"))
+        self.assertIn("2, # tail", out)
+        self.assertIn("  | # bar\n  count", out)
+
+    def test_record_and_enum_comments_narrow(self):
+        src = ("record R {\n # field\n alpha: Int,\n beta: Int # tail\n}\n"
+               "enum C {\n # variant\n Red,\n Green # tail\n}\nprint 1\n")
+        out = self.roundtrip(src, width=20)
+        self.assertEqual(out.count("# field"), 1)
+        self.assertEqual(out.count("# variant"), 1)
+        self.assertEqual(out.count("# tail"), 2)
+        self.assertEqual(out.splitlines()[0], "record R {")
+        self.assertIn("enum C {", out)
+        self.assertIn("  alpha: Int,", out)
+        self.assertIn("  Red,", out)
+
+    def test_long_indivisible_token_inside_commented_effects(self):
+        long_effect = ("supercalifragilisticexpialidocious_"
+                       "supercalifragilisticexpialidocious")
+        src = ("fn f() -> Int effects {\n # head\n " + long_effect + ",\n"
+               " io # tail\n} { return 1 }\nprint f()\n")
+        out = self.roundtrip(src, width=20)
+        self.assertEqual(out.count("# head"), 1)
+        self.assertEqual(out.count("# tail"), 1)
+        self.assertLess(out.index("# head"), out.index(long_effect))
+        self.assertLess(out.index(long_effect), out.index("io # tail"))
+        self.assertGreater(max(len(line) for line in out.splitlines()), 20)
+
+
 class DeterminismTests(WrapBase):
     def test_wrapped_output_is_stable(self):
         src = ("let data = [100000, 200000, 300000, 400000, 500000, "
