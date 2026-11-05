@@ -93,9 +93,8 @@ Limitations (raise ``IRUnsupported`` / documented runtime errors)
   validates the whole chain, appends under one exclusive POSIX ``flock`` and
   re-reads the tail before extending, exactly like the interpreter (the parent
   directory is created; without ``fcntl`` cross-process atomicity is
-  best-effort). Relative to the interpreter, the IR does **not** enforce
-  ``GAMA_L_MAX_STEPS``/``GAMA_L_LOOP_LIMIT``; proof support includes neither
-  extra operations nor any special interpreter-only state.
+  best-effort). Proof support includes neither extra operations nor any
+  special interpreter-only state.
 
   Plain ``import "lib.gm"`` is supported only through :func:`compile_file`
   (and the ``gamal2 ir run|compile FILE`` CLI), where the core loader flattens
@@ -167,9 +166,24 @@ Limitations (raise ``IRUnsupported`` / documented runtime errors)
   ``f`` is a variable).  Calling such a value fails with a clear runtime error.
 * ``break``/``continue`` outside a loop and ``return`` outside a function are
   rejected at compile time.
-* The safety limits ``GAMA_L_MAX_STEPS`` and ``GAMA_L_LOOP_LIMIT`` are **not**
-  enforced by the IR (the optional ``GAMA_L_MAX_CALL_DEPTH`` guard is).  The
-  IR is a prototype, not a hardened runtime.
+* Runtime limits are enforced with interpreter parity:
+  ``GAMA_L_MAX_STEPS`` (one tick per executed statement dispatch, plus one per
+  ``for``/``while`` body iteration), ``GAMA_L_MAX_EXPR_STEPS`` (one tick per
+  evaluated expression node), ``GAMA_L_LOOP_LIMIT`` (``while`` iterations,
+  strict integer parsing), ``GAMA_L_MAX_OUTPUT_CHARS`` and
+  ``GAMA_L_MAX_CALL_DEPTH`` (default 200, additionally clamped to
+  ``(sys.getrecursionlimit() - 100) // 4``).  On exceed they raise
+  :class:`IRRuntimeError` with the interpreter's wording, limits and (where the
+  interpreter has one) the source line/col; no raw Python exception or hang
+  escapes.  Step/expression counters are tracked even when the caps are
+  disabled and are exposed on :class:`RunResult` as ``steps`` / ``expr_steps``
+  (plus ``out_chars``).  Scope differences: the IR counts one statement tick
+  per compiled statement, so a statement the checker removes/rewrites is not
+  counted, and every expression node the compiler emits one ``EXPR_STEP`` for
+  (synthetic receiver lookups for dotted method calls are counted explicitly
+  to match ``Interpreter.method_call``).  Default-argument expressions and
+  pipe stage expressions are counted per evaluation, exactly like the
+  interpreter.
 * Errors produced while running supported code raise :class:`IRRuntimeError`
   (a subclass of :class:`gamal2.GamaError`) with messages aligned to the
   reference runtime; they remain catchable as :class:`IRError` too.
@@ -299,6 +313,11 @@ class Program:
 class RunResult:
     out: list[str]
     globals: dict
+    # Execution counters.  They are always tracked (even when the optional caps
+    # are disabled), so IR/interpreted counts can be compared directly.
+    steps: int = 0
+    expr_steps: int = 0
+    out_chars: int = 0
 
 
 # ------------------------------------------------------------------ frames
@@ -900,6 +919,7 @@ class _Compiler:
         # and in default-argument expressions).  ``?`` needs ``Result``/``Any``.
         self.ret_type = ret_type
         self.match_seq = 0
+        self.loop_seq = 0
         # Nominal type tables used only to decide, at compile time, whether a
         # ``Call`` is a positional record constructor.  Dotted names and
         # ``RecordLit`` are resolved dynamically at run time.  ``records`` holds
@@ -932,6 +952,10 @@ class _Compiler:
             self.compile_statement(stmt)
 
     def compile_statement(self, stmt: Any) -> None:
+        # Every executed statement dispatch counts one step, exactly like
+        # ``Interpreter.stmt`` (including function-body and nested block
+        # statements).  The tick happens before the statement's expressions.
+        self.emit("STEP", (getattr(stmt, "line", 0), getattr(stmt, "col", 0)))
         if isinstance(stmt, g2.Let):
             self.compile_expr(stmt.expr)
             self.emit("LET", stmt.name)
@@ -1070,7 +1094,9 @@ class _Compiler:
             self.emit("NEW_FRAME")
             self.frame_depth += 1
             if isinstance(stmt.other, g2.If):
-                self.compile_if(stmt.other)
+                # ``else if`` is a real nested If statement in the AST, so the
+                # interpreter ticks it again when executed.
+                self.compile_statement(stmt.other)
             else:
                 self.compile_statements(stmt.other)
             self.frame_depth -= 1
@@ -1078,9 +1104,19 @@ class _Compiler:
         self.patch(jump_end, self.here())
 
     def compile_while(self, stmt: g2.While) -> None:
+        # The interpreter resets its per-loop iteration counter every time the
+        # ``while`` statement is dispatched.  Keep it in VM state, keyed by a
+        # compiler-unique loop id and local to one ``_exec`` activation (so
+        # recursion gets independent counters and no user-visible binding is
+        # introduced).
+        self.loop_seq += 1
+        loop_id = self.loop_seq
+        self.emit("LOOP_RESET", loop_id)
         start = self.here()
         self.compile_expr(stmt.cond)
         jump_false = self.emit("JUMP_IF_FALSE", None)
+        # One tick per iteration, then the GAMA_L_LOOP_LIMIT guard, then body.
+        self.emit("LOOP_TICK", (loop_id, stmt.line, stmt.col))
 
         ctx = {"base_depth": self.frame_depth, "continue": start, "breaks": []}
         self.loops.append(ctx)
@@ -1102,6 +1138,9 @@ class _Compiler:
         base_depth = self.frame_depth
         start = self.here()
         next_jump = self.emit("FOR_NEXT", None)
+        # FOR_NEXT only falls through when an item was produced, so this tick
+        # counts exactly one per body iteration, like ``Interpreter.stmt``.
+        self.emit("STEP", (stmt.line, stmt.col))
 
         self.emit("NEW_FRAME")
         self.frame_depth += 1
@@ -1241,6 +1280,12 @@ class _Compiler:
 
     # -- expressions -----------------------------------------------------
     def compile_expr(self, expr: Any) -> None:
+        # Each AST expression node is evaluated once at run time and counts one
+        # expression step, mirroring ``Interpreter.expr``.  The marker is
+        # emitted before the node's operands, so parent-then-child order and
+        # short-circuiting match the interpreter.
+        self.emit("EXPR_STEP",
+                  (getattr(expr, "line", 0), getattr(expr, "col", 0)))
         if isinstance(expr, g2.Literal):
             self.emit("CONST", expr.value)
             return
@@ -1439,11 +1484,14 @@ class _Compiler:
 
 # ------------------------------------------------------------------ runtime
 class _CallTarget:
-    __slots__ = ("proto", "closure")
+    __slots__ = ("proto", "closure", "line", "col")
 
-    def __init__(self, proto: FunctionProto, closure: Frame):
+    def __init__(self, proto: FunctionProto, closure: Frame,
+                 line: int = 0, col: int = 0):
         self.proto = proto
         self.closure = closure
+        self.line = line
+        self.col = col
 
 
 class _FuncValue:
@@ -1488,12 +1536,15 @@ class _MethodTarget:
     ``Interpreter.method_call``) and bound to ``self`` when the call runs.
     """
 
-    __slots__ = ("proto", "closure", "receiver")
+    __slots__ = ("proto", "closure", "receiver", "line", "col")
 
-    def __init__(self, proto: FunctionProto, closure: Frame, receiver: Any):
+    def __init__(self, proto: FunctionProto, closure: Frame, receiver: Any,
+                 line: int = 0, col: int = 0):
         self.proto = proto
         self.closure = closure
         self.receiver = receiver
+        self.line = line
+        self.col = col
 
 
 class _VM:
@@ -1510,7 +1561,12 @@ class _VM:
             raise TypeError("env must be a dict, a gama_ir.Frame or None")
         self.functions: dict[str, tuple[FunctionProto, Frame]] = {}
         self.out: list[str] = []
+        self.out_chars = 0
         self.call_depth = 0
+        # Execution counters mirror ``gamal2.Interpreter``: one statement/loop
+        # tick per dispatch and one expression tick per evaluated node.
+        self.steps = 0
+        self.expr_steps = 0
         # Nominal type registries.  Copies so a reused ``Program`` is unaffected
         # by declarations that activate only at run time.  ``records`` maps a
         # record to its flattened field list (inherited fields first);
@@ -1531,15 +1587,91 @@ class _VM:
         ledger = (os.environ.get("GAMA_L_PROOF_LEDGER") or "").strip() or None
         self.proof = _ProofEngine(ledger)
 
+    # -- limits ----------------------------------------------------------
+    @staticmethod
+    def _env_int(name: str, default: int, strict: bool = False,
+                 line: int = 0, col: int = 0) -> int:
+        """Parse an integer env limit exactly like ``Interpreter._env_int``.
+
+        Blank or malformed values fall back to ``default`` unless ``strict`` is
+        set, in which case they raise an ``IRRuntimeError`` with the reference
+        wording (used by the while-loop limit so a typo cannot silently
+        disable or crash the guard).
+        """
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        if not raw.strip():
+            if strict:
+                raise IRRuntimeError(
+                    f"{name} must be an integer, got {raw!r}", line, col)
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            if strict:
+                raise IRRuntimeError(
+                    f"{name} must be an integer, got {raw!r}",
+                    line, col) from None
+            return default
+
+    @staticmethod
+    def _env_optional_int(name: str):
+        """Return int from env, or None when unset/blank/malformed/negative."""
+        raw = os.environ.get(name)
+        if raw is None or not raw.strip():
+            return None
+        try:
+            val = int(raw)
+        except ValueError:
+            return None
+        return val if val >= 0 else None
+
+    def _tick(self, line: int = 0, col: int = 0) -> None:
+        """Count one statement dispatch or loop iteration and enforce the cap."""
+        self.steps += 1
+        limit = self._env_optional_int("GAMA_L_MAX_STEPS")
+        if limit is not None and self.steps > limit:
+            raise IRRuntimeError(
+                f"step limit exceeded: {self.steps} > GAMA_L_MAX_STEPS={limit}",
+                line, col)
+
+    def _expr_tick(self, line: int = 0, col: int = 0) -> None:
+        """Count one evaluated expression node (nested nodes count separately)."""
+        self.expr_steps += 1
+        limit = self._env_optional_int("GAMA_L_MAX_EXPR_STEPS")
+        if limit is not None and self.expr_steps > limit:
+            raise IRRuntimeError(
+                f"expression step limit exceeded: {self.expr_steps} > "
+                f"GAMA_L_MAX_EXPR_STEPS={limit}", line, col)
+
+    def _emit(self, text: Any) -> None:
+        """Append one rendered output line, enforcing the output char cap."""
+        text = str(text)
+        limit = self._env_int("GAMA_L_MAX_OUTPUT_CHARS", 1000000)
+        total = self.out_chars + len(text)
+        if total > limit:
+            raise IRRuntimeError(
+                f"output limit exceeded: {total} chars > "
+                f"GAMA_L_MAX_OUTPUT_CHARS={limit}")
+        self.out.append(text)
+        self.out_chars = total
+
     # -- call handling ---------------------------------------------------
     def _invoke(self, proto: FunctionProto, closure: Frame, args: list,
-                self_value: Any = _NO_SELF) -> Any:
+                self_value: Any = _NO_SELF, line: int = 0,
+                col: int = 0) -> Any:
+        configured = self._env_int("GAMA_L_MAX_CALL_DEPTH", g2.DEFAULT_CALL_DEPTH)
+        # Even an explicit high value must not exceed what CPython can hold.
+        depth_limit = min(configured, g2._call_depth_cap())
         self.call_depth += 1
         try:
-            limit = self._call_depth_limit()
-            if self.call_depth > limit:
+            if self.call_depth > depth_limit:
                 raise IRRuntimeError(
-                    f"call depth limit exceeded: {self.call_depth} > GAMA_L_MAX_CALL_DEPTH={limit}")
+                    f"call depth limit exceeded: {self.call_depth} > "
+                    f"GAMA_L_MAX_CALL_DEPTH={configured} "
+                    f"(effective cap {depth_limit})",
+                    line, col)
             local = Frame(parent=closure)
             if self_value is not _NO_SELF:
                 # ``self`` is bound before parameters/defaults, exactly like
@@ -1552,18 +1684,14 @@ class _VM:
                 else:
                     local.define(param.name, self._exec(param.default, closure))
             return self._exec(proto.body, local)
+        except RecursionError:
+            # Backstop: if the CPython stack is exhausted before the depth
+            # guard, surface a language error, never ``RecursionError``.
+            raise IRRuntimeError(
+                "call depth exceeded the Python recursion limit",
+                line, col) from None
         finally:
             self.call_depth -= 1
-
-    @staticmethod
-    def _call_depth_limit() -> int:
-        raw = os.environ.get("GAMA_L_MAX_CALL_DEPTH")
-        if raw is None or not raw.strip():
-            return 1000
-        try:
-            return int(raw)
-        except ValueError:
-            return 1000
 
     # -- dotted names / records / enums ----------------------------------
     def _enum_value(self, name: str, line: int, col: int):
@@ -1660,6 +1788,10 @@ class _VM:
         receiver_name, _, method_name = name.rpartition(".")
         if not receiver_name:
             return None
+        # The interpreter's ``method_call`` evaluates a synthetic ``Var`` for
+        # the receiver, so every dotted call that reaches method resolution
+        # counts one extra expression step (even when resolution fails).
+        self._expr_tick(line, col)
         try:
             receiver = self._load_name(frame, (receiver_name, line, col), row)
         except IRRuntimeError:
@@ -1688,7 +1820,7 @@ class _VM:
                 f"{rec_name}.{method_name} expects {required}.."
                 f"{len(proto.params)} args, got {argc}", line, col)
         closure = self.record_env.get(decl, self.root)
-        return _MethodTarget(proto, closure, receiver)
+        return _MethodTarget(proto, closure, receiver, line, col)
 
     def _record_chain(self, name: str) -> tuple[list[str], bool]:
         """Return ``([child, parent, ...], ok)`` for ``name``.
@@ -1876,13 +2008,38 @@ class _VM:
         ip = 0
         stack: list[Any] = []
         frames: list[Frame] = [frame]
+        # Per-activation ``while`` iteration counters (reset at dispatch).
+        loop_counts: dict[Any, int] = {}
         while ip < len(instrs):
             ins = instrs[ip]
             ip += 1
             op = ins.op
             arg = ins.arg
 
-            if op == "CONST":
+            if op == "STEP":
+                # One executed statement dispatch (or a ``for`` body iteration).
+                self._tick(arg[0], arg[1])
+            elif op == "EXPR_STEP":
+                # One evaluated expression node; nested nodes emit their own.
+                self._expr_tick(arg[0], arg[1])
+            elif op == "LOOP_RESET":
+                loop_counts[arg] = 0
+            elif op == "LOOP_TICK":
+                # One ``while`` iteration: bump the per-loop counter, count the
+                # step, then enforce GAMA_L_LOOP_LIMIT (same order and wording
+                # as Interpreter.stmt).
+                loop_id, line, col = arg
+                counter = loop_counts.get(loop_id, 0) + 1
+                loop_counts[loop_id] = counter
+                self._tick(line, col)
+                loop_limit = self._env_int(
+                    "GAMA_L_LOOP_LIMIT", 1000000, strict=True,
+                    line=line, col=col)
+                if counter > loop_limit:
+                    raise IRRuntimeError(
+                        f"loop limit exceeded: {counter} > "
+                        f"GAMA_L_LOOP_LIMIT={loop_limit}", line, col)
+            elif op == "CONST":
                 stack.append(arg)
             elif op == "LOAD":
                 # A pipe stage binds its current row; the reference evaluator
@@ -2111,7 +2268,7 @@ class _VM:
                 line, col = arg
                 raise IRRuntimeError("match: no arm matched", line, col)
             elif op == "PRINT":
-                self.out.append(_render(stack.pop()))
+                self._emit(_render(stack.pop()))
             elif op == "PROVE":
                 # ``prove name = expr``: build/return the receipt and bind it
                 # in the current frame (dotted names are literal bindings, as
@@ -2126,7 +2283,7 @@ class _VM:
                 line, col = arg
                 verdict = self.proof.verify(stack.pop())
                 frames[-1].define("_verify", verdict)
-                self.out.append(_render(verdict))
+                self._emit(_render(verdict))
             elif op == "JUMP":
                 ip = arg
             elif op == "JUMP_IF_FALSE":
@@ -2155,7 +2312,7 @@ class _VM:
                         raise IRRuntimeError(
                             f"{name} expects {required}..{len(proto.params)} args, got {argc}",
                             line, col)
-                    stack.append(_CallTarget(proto, closure))
+                    stack.append(_CallTarget(proto, closure, line, col))
                 else:
                     # A call name may also be a function value bound in the
                     # current scope: a lambda, a named-function value or a
@@ -2182,7 +2339,7 @@ class _VM:
                                 f"{fnval.name} expects {required}.."
                                 f"{len(proto.params)} args, got {argc}",
                                 line, col)
-                        stack.append(_CallTarget(proto, fnval.closure))
+                        stack.append(_CallTarget(proto, fnval.closure, line, col))
                     else:
                         # Functions first, then enum constructors: the
                         # reference interpreter resolves ``Call`` through
@@ -2234,10 +2391,13 @@ class _VM:
                 elif isinstance(target, _MethodTarget):
                     stack.append(self._invoke(
                         target.proto, target.closure, args,
-                        self_value=target.receiver))
+                        self_value=target.receiver,
+                        line=target.line, col=target.col))
                 else:
                     stack.append(self._invoke(
-                        target.proto, target.closure, args))
+                        target.proto, target.closure, args,
+                        line=getattr(target, "line", 0),
+                        col=getattr(target, "col", 0)))
             elif op == "CHECK_CALL_VALUE":
                 # Expression callee (``(fn ...)(2)``, ``make()(2)``): validate
                 # the already-evaluated callee before arguments run, matching
@@ -2255,6 +2415,9 @@ class _VM:
                         f"{target.name} expects {required}.."
                         f"{len(proto.params)} args, got {argc}",
                         line, col)
+                # Carry the call site so depth/limit errors match the
+                # interpreter's line/col.
+                stack[-1] = _CallTarget(proto, target.closure, line, col)
             elif op == "CALL_VALUE":
                 argc = arg
                 args = stack[-argc:] if argc else []
@@ -2262,7 +2425,9 @@ class _VM:
                     del stack[-argc:]
                 target = stack.pop()
                 stack.append(self._invoke(
-                    target.proto, target.closure, args))
+                    target.proto, target.closure, args,
+                    line=getattr(target, "line", 0),
+                    col=getattr(target, "col", 0)))
             elif op == "MAKE_FUNC":
                 # A lambda/function value captures the *current* frame, so
                 # later mutations of captured variables are visible, exactly
@@ -2382,7 +2547,9 @@ def run_program(ast: Any, env: Any = None) -> RunResult:
     vm = _VM(env, program.records, program.enums, program.methods,
              record_parents=program.record_parents)
     vm._exec(program.main, vm.root)
-    return RunResult(list(vm.out), dict(vm.root.outermost().vars))
+    return RunResult(list(vm.out), dict(vm.root.outermost().vars),
+                     steps=vm.steps, expr_steps=vm.expr_steps,
+                     out_chars=vm.out_chars)
 
 
 def run_file(path: Any, env: Any = None) -> RunResult:
