@@ -346,7 +346,7 @@ LINE_CHAIN_TAIL_RE = re.compile(
 RECORD_DECL_RE = re.compile(
     r"\brecord\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{([^}]*)\}")
 ENUM_DECL_RE = re.compile(
-    r"\benum\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{([^}]*)\}")
+    r"\benum\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[A-Za-z0-9_,\s]*>)?\s*\{([^}]*)\}")
 RECORD_FIELD_RE = re.compile(
     r"([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([A-Za-z_][A-Za-z0-9_.]*)")
 

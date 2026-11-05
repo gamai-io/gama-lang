@@ -288,7 +288,7 @@ class Lambda: params: list; ret: str | None; effects: set | None; body: list; li
 @dataclass
 class Match: expr: Any; arms: list; line: int; col: int
 @dataclass
-class EnumDecl: name: str; variants: list; line: int; col: int; exported: bool = False
+class EnumDecl: name: str; variants: list; line: int; col: int; exported: bool = False; type_params: list = field(default_factory=list)
 @dataclass
 class If: cond: Any; then: list; other: list | None; line: int; col: int
 @dataclass
@@ -681,6 +681,7 @@ class Parser:
         name = self.expect("IDENT").val
         if "." in name:
             raise GamaError("enum name must be a simple identifier", x.line, x.col)
+        type_params = self.type_params()
         self.expect("OP", "{"); self.skip_seps()
         variants = []
         while not self.at("OP", "}"):
@@ -692,12 +693,8 @@ class Parser:
                 self.take(); self.skip_nl()
                 payload_types = []
                 while not self.at("OP", ")"):
-                    pt = self.expect("IDENT")
-                    if "." in pt.val:
-                        raise GamaError(
-                            "enum payload type must be a simple identifier",
-                            pt.line, pt.col)
-                    payload_types.append(pt.val)
+                    pt = self.type_ref()
+                    payload_types.append(pt)
                     self.skip_nl()
                     if self.at("OP", ","):
                         self.take(); self.skip_nl()
@@ -719,7 +716,7 @@ class Parser:
                 y = self.peek()
                 raise GamaError("expected ',' or '}' in enum", y.line, y.col)
         self.expect("OP", "}")
-        return EnumDecl(name, variants, x.line, x.col)
+        return EnumDecl(name, variants, x.line, x.col, type_params=type_params)
     def match_stmt(self):
         x = self.take(); subject = self.expr(); self.skip_nl(); self.expect("OP", "{")
         arms = []
@@ -981,6 +978,13 @@ def _erase_type_ref(t, params):
     if base in params:
         return "Any"
     return base
+
+def _type_ref_uses_param(t, params):
+    """True when ``t`` mentions any name in ``params`` (recursively)."""
+    base, args = _type_ref_parts(t)
+    if base in params:
+        return True
+    return any(_type_ref_uses_param(a, params) for a in args)
 
 def _subst_type_ref(t, bindings):
     """Replace type parameters by their bound refs (recursively)."""
@@ -1524,6 +1528,7 @@ class Checker:
         self.funcs: dict[str, Fn] = {}
         self.records: dict[str, RecordDecl] = {}
         self.enums: dict[str, set[str]] = {}
+        self.enum_params: dict[str, list[str]] = {}
         self.effects: set[str] = set()
         self.ret_type: str | None = None
         self.loop_depth = 0
@@ -1570,6 +1575,17 @@ class Checker:
         rec = self.records.get(base)
         if rec is not None:
             want = len(getattr(rec, "type_params", None) or [])
+            if len(args) != want:
+                raise GamaTypeError(
+                    f"{base} expects {want} type argument"
+                    f"{'s' if want != 1 else ''}, got {len(args)}",
+                    line, col)
+            for a in args:
+                self._check_type_annotation(a, line, col, params)
+            return
+        enum_params = self.enum_params.get(base)
+        if enum_params is not None:
+            want = len(enum_params)
             if len(args) != want:
                 raise GamaTypeError(
                     f"{base} expects {want} type argument"
@@ -1692,6 +1708,15 @@ class Checker:
                     e = GamaTypeError(f"duplicate enum {s.name}", s.line, s.col)
                     e.src = getattr(s, "_src", None)
                     raise e
+                tparams = list(getattr(s, "type_params", None) or [])
+                dup = next((tp for i, tp in enumerate(tparams)
+                            if tp in tparams[:i]), None)
+                if dup is not None:
+                    e = GamaTypeError(
+                        f"duplicate type parameter {dup} in enum {s.name}",
+                        s.line, s.col)
+                    e.src = getattr(s, "_src", None)
+                    raise e
                 seen = set()
                 for vn, _vp, vl, vc in s.variants:
                     if vn in seen:
@@ -1701,6 +1726,16 @@ class Checker:
                         raise e
                     seen.add(vn)
                 self.enums[s.name] = {vn: vp for vn, vp, _vl, _vc in s.variants}
+                self.enum_params[s.name] = tparams
+        # Enum payloads may name enum type parameters or other generic enums;
+        # validate their arity once every declaration is registered.
+        for s in stmts:
+            if not isinstance(s, EnumDecl):
+                continue
+            params = set(getattr(s, "type_params", None) or [])
+            for _vn, vp, vl, vc in s.variants:
+                for pt in _payload_type_list(vp):
+                    self._check_type_annotation(pt, vl, vc, params)
         # Method bodies are checked after every record, function and enum is
         # registered so a method can call records/functions/enums declared
         # later in the file (and other methods of the same record).
@@ -1782,6 +1817,9 @@ class Checker:
                             f"match: {kind} pattern does not match subject type {t}",
                             s.line, s.col)
                     payload_types = _payload_type_list(payload_type)
+                    eparams = set(self.enum_params.get(base) or [])
+                    payload_types = tuple(
+                        _erase_type_ref(pt, eparams) for pt in payload_types)
                     if not payload_types and names:
                         raise GamaTypeError(
                             f"enum variant {base}.{variant} is nullary and cannot bind a payload",
@@ -2246,14 +2284,16 @@ class Checker:
                             f"{len(payload_types)} payload argument"
                             f"{'s' if len(payload_types) != 1 else ''}, "
                             f"got {len(e.args)}", e.line, e.col)
+                    eparams = set(self.enum_params.get(base) or [])
                     for idx, (arg, ptype) in enumerate(
                             zip(e.args, payload_types)):
                         at = self.expr(arg)
-                        if not self.compat(at, ptype):
+                        want = _erase_type_ref(ptype, eparams)
+                        if not self.compat(at, want):
                             where = ("" if len(payload_types) == 1
                                      else f" {idx + 1}")
                             raise GamaTypeError(
-                                f"{base}.{variant}: payload{where} {at} != {ptype}",
+                                f"{base}.{variant}: payload{where} {at} != {want}",
                                 e.line, e.col)
                     return base
                 mt = self.method_call(e, row)
@@ -2299,21 +2339,32 @@ class Checker:
                 # erase them to Any. Non-type-parameter positions still get a
                 # normal compatibility check.
                 bindings = {}
+                tparam_set = set(f.type_params)
                 for p, a in zip(f.params, e.args):
                     at = self.expr(a)
-                    if p.type_name in f.type_params:
+                    if p.type_name in tparam_set:
                         if at != "Any":
                             bindings.setdefault(p.type_name, at)
+                    elif _type_ref_uses_param(p.type_name, tparam_set):
+                        # Erased annotation that mentions a type parameter,
+                        # e.g. ``Option<T>``: compare against the nominal base.
+                        want = _erase_type_ref(p.type_name, tparam_set)
+                        if not self.compat(at, want):
+                            raise GamaTypeError(
+                                f"{e.name}: {p.name} {at} != {want}",
+                                e.line, e.col)
                     elif not self.compat(at, p.type_name):
                         raise GamaTypeError(f"{e.name}: {p.name} {at} != {p.type_name}", e.line, e.col)
                 self.effects |= (f.effects or set())
                 rt = f.ret or "Any"
-                return bindings.get(rt, "Any") if rt in f.type_params else rt
+                if rt in tparam_set:
+                    return bindings.get(rt, "Any")
+                return _erase_type_ref(rt, tparam_set)
             for p, a in zip(f.params, e.args):
                 at = self.expr(a)
                 if not self.compat(at, p.type_name): raise GamaTypeError(f"{e.name}: {p.name} {at} != {p.type_name}", e.line, e.col)
             self.effects |= (f.effects or set())
-            return f.ret or "Any"
+            return self.erase_type(f.ret or "Any")
         if isinstance(e, CallExpr):
             ct = self.expr(e.callee)
             if ct not in ("Function", "Any"):
@@ -2477,12 +2528,14 @@ def _rename_refs(node, mapping):
                    _rename_refs(body, mapping))
                   for kind, bindings, body in node.arms])
     if isinstance(node, EnumDecl):
+        own = set(getattr(node, "type_params", None) or [])
+        pmap = {k: v for k, v in mapping.items() if k not in own}
         def _payload(p):
             if p is None:
                 return None
             if isinstance(p, tuple):
-                return tuple(mapping.get(x, x) for x in p)
-            return mapping.get(p, p)
+                return tuple(_rename_type_ref(x, pmap) for x in p)
+            return _rename_type_ref(p, pmap)
         return replace(
             node, name=mapping.get(node.name, node.name),
             variants=[(vn, _payload(vp), vl, vc)

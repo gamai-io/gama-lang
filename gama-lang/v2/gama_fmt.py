@@ -2131,9 +2131,11 @@ class _AstFormatter:
     @classmethod
     def _enum_text(cls, s) -> str:
         parts = [cls._enum_variant_text(v) for v in s.variants]
+        names = getattr(s, "type_params", None) or []
+        name = s.name + ("<" + ", ".join(names) + ">" if names else "")
         if not parts:
-            return "enum " + s.name + " { }"
-        return "enum " + s.name + " { " + ", ".join(parts) + " }"
+            return "enum " + name + " { }"
+        return "enum " + name + " { " + ", ".join(parts) + " }"
 
     def _record_field_positions(self, s):
         """Token spans ``(start, end)`` for each record field, in order."""
@@ -2255,7 +2257,7 @@ class _AstFormatter:
             self._emit(ind + text, [s.line], suffix=semi)
             return
         inner = len(ind) + 2
-        lines = ["enum " + s.name + " {"]
+        lines = ["enum " + s.name + self._type_params_text(s) + " {"]
         self._render_decl_body(
             s, s.variants, self._enum_variant_positions(s),
             [self._enum_variant_text(v) for v in s.variants],
