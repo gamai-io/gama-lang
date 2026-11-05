@@ -349,7 +349,9 @@ ENUM_DECL_RE = re.compile(
 RECORD_FIELD_RE = re.compile(
     r"([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([A-Za-z_][A-Za-z0-9_.]*)")
 RECORD_HEADER_RE = re.compile(
-    r"\brecord\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^>{}]*>)?\s*\{")
+    r"\brecord\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^<>{}]*>)?\s*"
+    r"(?:extends\s+([A-Za-z_][A-Za-z0-9_.]*)\s*(?:<[^<>{}]*>)?\s*)?"
+    r"\{")
 METHOD_HEADER_RE = re.compile(
     r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*"
     r"(?:->\s*([A-Za-z_][A-Za-z0-9_.]*(?:\s*<[^>{}]*>)?))?"
@@ -632,7 +634,17 @@ def _module_declarations(uri: str, path: str):
         if not all(isinstance(st, allowed) for st in stmts):
             return None
     except Exception:
-        return None
+        # LSP-only record inheritance: the core parser currently rejects
+        # ``record Child extends Parent``. Keep the module usable for LSP
+        # navigation when that is the only reason flattening failed.
+        try:
+            body = target.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return None
+        if "extends" not in body:
+            return None
+        return list(_record_decls(body).values()) + list(
+            _enum_decls(body).values())
     return [st for st in stmts
             if isinstance(st, (G.Fn, G.Let, G.RecordDecl, G.EnumDecl))]
 
@@ -744,19 +756,23 @@ def _record_decls(text):
     whose braces are closed. Missing or malformed declarations are simply
     absent, never fatal.
     """
+    extends = _record_extends_map(text)
     program = _parse_or_none(text)
     if program is not None:
         out = {}
         for node in _walk(program):
             if isinstance(node, G.RecordDecl) and node.name not in out:
+                _set_record_extends(node, extends.get(node.name))
                 out[node.name] = node
         return out
     out = {}
-    for name, body in _record_bodies(text):
+    for name, parent, body, line, col, body_start in _record_bodies(text):
         if name in out:
             continue
-        fields, methods = _record_body_members(body)
-        out[name] = G.RecordDecl(name, fields, 0, 0, methods=methods)
+        fields, methods = _record_body_members(body, text, body_start)
+        decl = G.RecordDecl(name, fields, line, col, methods=methods)
+        _set_record_extends(decl, parent or extends.get(name))
+        out[name] = decl
     return out
 
 
@@ -790,7 +806,9 @@ def _record_bodies(text):
         rng = _brace_body_range(text, match.end() - 1)
         if rng is None:
             continue
-        yield match.group(1), (text or "")[rng[0]:rng[1]]
+        line, col = _offset_line_col(text, match.start())
+        yield (match.group(1), match.group(2),
+               (text or "")[rng[0]:rng[1]], line, col, rng[0])
 
 
 def _split_top_level(spec: str) -> list:
@@ -897,7 +915,187 @@ def _iter_method_blocks(body: str):
     return out
 
 
-def _record_body_members(body: str):
+def _offset_line_col(text: str, offset: int):
+    """1-based line/column for ``offset`` (columns are 1-based)."""
+    text = text or ""
+    offset = max(0, min(offset, len(text)))
+    line = text.count("\n", 0, offset) + 1
+    prev = text.rfind("\n", 0, offset)
+    return line, offset - (prev + 1) + 1
+
+
+def _set_record_extends(decl, parent):
+    try:
+        setattr(decl, "extends", parent or None)
+    except Exception:
+        pass
+    return decl
+
+
+def _record_extends(decl):
+    return getattr(decl, "extends", None)
+
+
+def _record_extends_map(text: str):
+    out = {}
+    for match in RECORD_HEADER_RE.finditer(text or ""):
+        out.setdefault(match.group(1), match.group(2))
+    return out
+
+
+def _module_text_records(file_uri, path):
+    """``(target, body, records, aliases)`` using tolerant record parsing."""
+    target = _resolve_module(file_uri, path or "")
+    if target is None:
+        return None
+    try:
+        body = target.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    return target, body, _record_decls(body), _alias_map(body)
+
+
+def _module_record_scope(file_uri, imp, name):
+    got = _module_text_records(file_uri, (imp or {}).get("path"))
+    if got is None:
+        return None
+    target, body, records, aliases = got
+    decl = records.get(name)
+    if decl is None:
+        return None
+    ref = {"owner": name, "decl": decl, "local": False, "path": target,
+           "import": imp}
+    return {"ref": ref, "records": records, "aliases": aliases,
+            "text": body, "uri": target.as_uri()}
+
+
+def _local_record_ref(owner, decl):
+    return {"owner": owner, "decl": decl, "local": True, "path": None,
+            "import": None}
+
+
+def _record_parent_scope(uri, text, decl, records, aliases):
+    parent = _record_extends(decl)
+    if not parent:
+        return None
+    parent = parent.split("<", 1)[0].strip()
+    if not parent:
+        return None
+    local = _record_name_for(parent, records, aliases)
+    if local is not None and local in records:
+        return {"ref": _local_record_ref(local, records[local]),
+                "records": records, "aliases": aliases, "text": text,
+                "uri": uri}
+    head, sep, tail = parent.partition(".")
+    if sep and tail and "." not in tail and head in aliases:
+        return _module_record_scope(uri, aliases[head], tail)
+    return None
+
+
+def _record_scopes(uri, text, ref, records, aliases, seen=None):
+    """Base-first scopes for ``ref`` and its ancestors (cycle-safe).
+
+    Cycles and malformed/missing parents terminate the walk quietly. Each
+    scope carries the declaring ref and the records/aliases needed to
+    resolve that scope's own parent.
+    """
+    if ref is None or ref.get("decl") is None:
+        return []
+    if seen is None:
+        seen = set()
+    path = ref.get("path")
+    key = (str(path) if path is not None else None, ref.get("owner"))
+    if key in seen:
+        return []
+    seen.add(key)
+    # For an imported record, its own parent must be resolved in the module
+    # that declares it (which may use its own alias imports), not in the
+    # importing document's namespace.
+    scope_uri, scope_text = uri, text
+    scope_records, scope_aliases = records, aliases
+    scope_ref = ref
+    if ref.get("path") is not None:
+        try:
+            target = Path(ref["path"]).resolve()
+            body = target.read_text(encoding="utf-8")
+            own_records = _record_decls(body)
+            own_aliases = _alias_map(body)
+            own_decl = own_records.get(ref.get("owner")) or ref["decl"]
+            scope_uri = target.as_uri()
+            scope_text = body
+            scope_records = own_records
+            scope_aliases = own_aliases
+            scope_ref = dict(ref, decl=own_decl)
+        except (OSError, UnicodeError, ValueError):
+            pass
+    scopes = []
+    try:
+        parent = _record_parent_scope(scope_uri, scope_text, scope_ref["decl"],
+                                      scope_records, scope_aliases)
+    except Exception:
+        parent = None
+    if parent is not None:
+        scopes.extend(_record_scopes(
+            parent.get("uri"), parent.get("text"), parent.get("ref"),
+            parent.get("records") or {}, parent.get("aliases") or {}, seen))
+    scopes.append({"ref": scope_ref, "records": scope_records,
+                   "aliases": scope_aliases, "text": scope_text,
+                   "uri": scope_uri})
+    return scopes
+
+
+def _aggregate_members(scopes):
+    """Ordered member map; derived declarations override ancestors.
+
+    Both fields and methods are keyed by name. A child member with the
+    same name shadows the inherited one, while inherited members keep the
+    scope that declared them so hover/definition can report the parent.
+    """
+    out = {}
+    for scope in scopes or []:
+        ref = scope.get("ref") or {}
+        decl = ref.get("decl")
+        if decl is None:
+            continue
+        owner = ref.get("owner") or getattr(decl, "name", "")
+        for field, type_name in getattr(decl, "fields", None) or []:
+            out[field] = {"kind": "field", "name": field, "type": type_name,
+                          "owner": owner, "decl": decl, "scope": scope}
+        for method in getattr(decl, "methods", None) or []:
+            out[method.name] = {"kind": "method", "name": method.name,
+                                "method": method, "owner": owner,
+                                "decl": decl, "scope": scope}
+    return out
+
+
+def _member_info(scopes, member):
+    info = _aggregate_members(scopes).get(member)
+    if info is None:
+        return None
+    target_owner = scopes[-1]["ref"].get("owner") if scopes else None
+    info = dict(info)
+    info["inherited"] = info.get("owner") != target_owner
+    return info
+
+
+def _context_member(ctx, owner, member):
+    """Member info for ``owner.member`` inside a type-resolution context."""
+    if ctx is None:
+        return None
+    decl = (ctx.get("records") or {}).get(owner)
+    if decl is None:
+        return None
+    ref = {"owner": owner, "decl": decl,
+           "local": ctx.get("path") is None,
+           "path": ctx.get("path"), "import": ctx.get("import")}
+    scopes = _record_scopes(ctx.get("uri"), "", ref,
+                            ctx.get("records") or {},
+                            ctx.get("aliases") or {})
+    return _member_info(scopes, member)
+
+
+def _record_body_members(body: str, text: str | None = None,
+                         body_start: int = 0):
     """Best-effort ``(fields, methods)`` for a raw record body."""
     blocks = _iter_method_blocks(body)
     if blocks:
@@ -911,12 +1109,16 @@ def _record_body_members(body: str):
         masked = body
     fields = [(match.group(1), match.group(2))
               for match in RECORD_FIELD_RE.finditer(masked)]
-    methods = [
-        G.Method(match.group(1), _parse_method_params(match.group(2)),
-                 match.group(3), None, [], 0, 0)
-        for _start, _end, match in blocks
-        if match is not None
-    ]
+    methods = []
+    for start, _end, match in blocks:
+        if match is None:
+            continue
+        line = col = 0
+        if text is not None:
+            line, col = _offset_line_col(text, body_start + start)
+        methods.append(
+            G.Method(match.group(1), _parse_method_params(match.group(2)),
+                     match.group(3), None, [], line, col))
     return fields, methods
 
 
@@ -1007,7 +1209,8 @@ def _var_type_name(text, name, line, records, aliases):
     return chosen[1]
 
 
-def _chain_target_type(text, parts, records, enums, aliases, line):
+def _chain_target_type(text, parts, records, enums, aliases, line,
+                       uri=None):
     """Resolve a dotted prefix before the cursor to a record or enum type."""
     if not parts:
         return None
@@ -1020,13 +1223,14 @@ def _chain_target_type(text, parts, records, enums, aliases, line):
         return ("record", record) if record else None
     type_name = _var_type_name(text, base, line, records, aliases)
     record = _record_name_for(type_name, records, aliases)
+    ctx = _document_context(uri, records, aliases)
     for part in parts[1:]:
         if record is None:
             return None
-        fields = dict(records[record].fields)
-        if part not in fields:
+        info = _context_member(ctx, record, part)
+        if info is None or info.get("kind") != "field":
             return None
-        record = _record_name_for(fields[part], records, aliases)
+        record = _record_name_for(info.get("type"), records, aliases)
     return ("record", record) if record else None
 
 
@@ -1106,20 +1310,33 @@ def _record_signature_text(decl, qualifier=None):
     body = ", ".join(parts)
     if qualifier:
         head = "%s.%s" % (qualifier, decl.name)
-        return head + (" { %s }" % body if body else " { }")
-    head = "record %s" % decl.name
+    else:
+        head = "record %s" % decl.name
+    parent = _record_extends(decl)
+    if parent:
+        head += " extends %s" % parent
     return head + (" { %s }" % body if body else " { }")
 
 
-def _record_hover_text(decl, qualifier=None):
+def _record_hover_text(decl, qualifier=None, scopes=None):
     fields = ", ".join("`%s: %s`" % pair for pair in decl.fields)
     methods = ", ".join("`%s`" % _method_signature_text(method, decl.name)
                         for method in _record_methods(decl))
+    inherited = []
+    if scopes:
+        for info in _aggregate_members(scopes).values():
+            if info["kind"] == "field" and info.get("owner") != decl.name:
+                inherited.append(info)
     facts = []
     if fields:
         facts.append("fields %s" % fields)
     if methods:
         facts.append("methods %s" % methods)
+    if inherited:
+        facts.append("inherited fields %s" % ", ".join(
+            "`%s: %s` (from `%s`)" % (info["name"], info["type"],
+                                       info["owner"])
+            for info in inherited))
     if facts:
         return ("`%s`\n\nGAMA-L record `%s` with %s."
                 % (_record_signature_text(decl, qualifier), decl.name,
@@ -1143,11 +1360,13 @@ def _enum_hover_text(decl):
             % (_enum_signature_text(decl), decl.name))
 
 
-def _structural_hover(text, name):
+def _structural_hover(text, name, uri=None):
     """Hover for a record/enum declaration name, or ``None``."""
     records = _record_decls(text)
     if name in records:
-        return _record_hover_text(records[name])
+        ref = _local_record_ref(name, records[name])
+        scopes = _record_scopes(uri, text, ref, records, _alias_map(text))
+        return _record_hover_text(records[name], scopes=scopes)
     enums = _enum_decls(text)
     if name in enums:
         return _enum_hover_text(enums[name])
@@ -1199,29 +1418,36 @@ def _local_member_hover(text, line, character, uri=None):
     if ref is None:
         type_name = _var_type_name(context, parts[0], line, records, aliases)
         record = _record_name_for(type_name, records, aliases)
+        ctx = _document_context(uri, records, aliases)
         for part in parts[1:]:
             if record is None:
                 break
-            fields = dict(records[record].fields)
-            if part not in fields:
+            info = _context_member(ctx, record, part)
+            if info is None or info.get("kind") != "field":
                 record = None
                 break
-            record = _record_name_for(fields[part], records, aliases)
+            record = _record_name_for(info.get("type"), records, aliases)
         if record is not None:
-            ref = {"owner": record, "decl": records[record], "local": True,
-                   "path": None, "import": None}
+            ref = _local_record_ref(record, records[record])
     if ref is None:
         return None
-    decl = ref["decl"]
-    fields = dict(decl.fields)
-    if member in fields:
-        return ("`%s.%s`\n\nGAMA-L field `%s: %s` of record `%s`."
-                % (".".join(parts), member, member, fields[member],
-                   ref["owner"]))
-    for method in _record_methods(decl):
-        if method.name == member:
-            return _method_hover_text(method, ref["owner"],
-                                      receiver=".".join(parts))
+    scopes = _record_scopes(uri, context, ref, records, aliases)
+    info = _member_info(scopes, member)
+    if info is None:
+        return None
+    receiver = ".".join(parts)
+    if info["kind"] == "field":
+        inherited = (" (inherited by `%s`)" % ref["owner"]
+                     if info.get("inherited") else "")
+        return ("`%s.%s`\n\nGAMA-L field `%s: %s` of record `%s`%s."
+                % (receiver, member, member, info["type"], info["owner"],
+                   inherited))
+    if info["kind"] == "method":
+        value = _method_hover_text(info["method"], info["owner"],
+                                   receiver=receiver)
+        if info.get("inherited"):
+            value += "\n\nInherited by record `%s`." % ref["owner"]
+        return value
     return None
 
 
@@ -1231,7 +1457,8 @@ def _member_type_items(text, line, character, parts, uri=None):
     records = _record_decls(context)
     enums = _enum_decls(context)
     aliases = _alias_map(text)
-    target = _chain_target_type(context, parts, records, enums, aliases, line)
+    target = _chain_target_type(context, parts, records, enums, aliases,
+                                line, uri)
     items = []
     seen = set()
     if target is not None and target[0] == "enum":
@@ -1252,40 +1479,52 @@ def _member_type_items(text, line, character, parts, uri=None):
             })
         return items
 
-    decl = None
+    ref = None
     if target is not None and target[0] == "record":
         decl = records.get(target[1])
-    if decl is None and uri:
+        if decl is not None:
+            ref = _local_record_ref(target[1], decl)
+    if ref is None and uri:
         ref = _resolve_member_owner(
             uri, context, parts, line, records, aliases)
-        if ref is not None:
-            decl = ref["decl"]
-    if decl is None:
+    if ref is None:
         return []
-    for field, type_name in decl.fields:
-        if field in seen:
+    scopes = _record_scopes(uri, context, ref, records, aliases)
+    target_owner = ref.get("owner")
+    for info in _aggregate_members(scopes).values():
+        name = info["name"]
+        if name in seen:
             continue
-        seen.add(field)
-        items.append({
-            "label": field,
-            "kind": KIND_FIELD,
-            "detail": "field %s: %s" % (field, type_name),
-            "documentation": "Field `%s` of record `%s`."
-                             % (field, decl.name),
-        })
-    for method in _record_methods(decl):
-        if method.name in seen:
-            continue
-        seen.add(method.name)
-        items.append({
-            "label": method.name,
-            "kind": KIND_METHOD,
-            "detail": "method " + _method_signature_text(method, decl.name),
-            "documentation": "Method `%s` of record `%s`; call as "
-                             "`%s.%s(...)` (self is the receiver)."
-                             % (method.name, decl.name, ".".join(parts),
-                                method.name),
-        })
+        seen.add(name)
+        inherited = info.get("owner") != target_owner
+        suffix = (" (inherited from %s)" % info["owner"]
+                  if inherited else "")
+        if info["kind"] == "field":
+            items.append({
+                "label": name,
+                "kind": KIND_FIELD,
+                "detail": "field %s: %s%s"
+                          % (name, info["type"], suffix),
+                "documentation": "Field `%s` of record `%s`%s."
+                                 % (name, info["owner"],
+                                    (" (inherited by `%s`)" % target_owner
+                                     if inherited else "")),
+            })
+        else:
+            method = info["method"]
+            items.append({
+                "label": name,
+                "kind": KIND_METHOD,
+                "detail": "method "
+                          + _method_signature_text(method, info["owner"])
+                          + suffix,
+                "documentation": "Method `%s` of record `%s`%s; call as "
+                                 "`%s.%s(...)` (self is the receiver)."
+                                 % (name, info["owner"],
+                                    (" (inherited by `%s`)" % target_owner
+                                     if inherited else ""),
+                                    ".".join(parts), name),
+            })
     return items
 
 
@@ -1522,12 +1761,17 @@ def completion(uri: str, text: str, line: int = 0, character: int = 0):
             continue
         seen.add(name)
         items.append({"label": name, "kind": KIND_TYPE})
-    for name in sorted(_record_decls(text)):
+    record_decls = _record_decls(text)
+    for name in sorted(record_decls):
         if name in seen:
             continue
         seen.add(name)
+        detail = "record %s" % name
+        parent = _record_extends(record_decls[name])
+        if parent:
+            detail += " extends %s" % parent
         items.append({"label": name, "kind": KIND_CLASS,
-                      "detail": "record %s" % name,
+                      "detail": detail,
                       "documentation": "GAMA-L record `%s`." % name})
     for name in sorted(_enum_decls(text)):
         if name in seen:
@@ -1766,6 +2010,19 @@ def _enum_variant_spans(text: str, decl):
     return _top_level_tokens(text, start, end)
 
 
+def _method_name_span(text: str, decl, name: str):
+    """``(line0, idx)`` of a method declaration name, or ``None``."""
+    for method in _record_methods(decl):
+        if method.name != name:
+            continue
+        loc = _decl_start("", text, method, name)
+        if loc is None:
+            continue
+        start = loc["range"]["start"]
+        return (start["line"], start["character"])
+    return None
+
+
 def _enum_variant_owners(enums, variant: str):
     """Local enum names declaring ``variant``."""
     owners = []
@@ -1984,13 +2241,14 @@ def _resolve_record_chain(text: str, parts, line: int, records, aliases):
         return None
     type_name = _var_type_name(text, parts[0], line, records, aliases)
     record = _record_name_for(type_name, records, aliases)
+    ctx = _document_context(None, records, aliases)
     for part in parts[1:-1]:
         if record is None:
             return None
-        fields = dict(records[record].fields)
-        if part not in fields:
+        info = _context_member(ctx, record, part)
+        if info is None or info.get("kind") != "field":
             return None
-        record = _record_name_for(fields[part], records, aliases)
+        record = _record_name_for(info.get("type"), records, aliases)
     return record
 
 
@@ -2067,6 +2325,31 @@ def _resolve_type_in_context(ctx, type_name):
     return None
 
 
+def _context_for_path(path):
+    """Context for a resolved module file (used for bare cross-module refs)."""
+    try:
+        target = Path(path).resolve()
+        body = target.read_text(encoding="utf-8")
+    except (OSError, UnicodeError, ValueError):
+        return None
+    uri = target.as_uri()
+    decls = _module_declarations(uri, target.name)
+    records = {}
+    enums = {}
+    if decls is not None:
+        for node in decls:
+            if isinstance(node, G.RecordDecl):
+                records.setdefault(node.name, node)
+            elif isinstance(node, G.EnumDecl):
+                enums.setdefault(node.name, node)
+    else:
+        records = _record_decls(body)
+        enums = _enum_decls(body)
+    return {"uri": uri, "records": records,
+            "aliases": _alias_map(body), "path": target, "import": None,
+            "enums": enums}
+
+
 def _context_for_ref(ref, ctx):
     """Context in which ``ref``'s own field types must be resolved."""
     if ref is None or ctx is None:
@@ -2075,6 +2358,10 @@ def _context_for_ref(ref, ctx):
         return ctx
     imp = ref.get("import")
     if not imp:
+        # A bare record reached through a nested imported chain carries the
+        # declaring module path but no import alias: use that module.
+        if ref.get("path") is not None:
+            return _context_for_path(ref["path"])
         # Bare record declared in the current context's own module.
         return ctx
     return _module_context(ctx["uri"], imp.get("path"))
@@ -2095,13 +2382,14 @@ def _resolve_member_owner(uri, text, parts, line, records, aliases):
     for part in parts[1:]:
         if ref is None:
             return None
-        fields = dict(ref["decl"].fields)
-        if part not in fields:
+        decl_ctx = _context_for_ref(ref, ctx)
+        if decl_ctx is None:
             return None
-        ctx = _context_for_ref(ref, ctx)
-        if ctx is None:
+        info = _context_member(decl_ctx, ref["owner"], part)
+        if info is None or info.get("kind") != "field":
             return None
-        ref = _resolve_type_in_context(ctx, fields[part])
+        ctx = decl_ctx
+        ref = _resolve_type_in_context(ctx, info.get("type"))
     return ref
 
 
@@ -2135,13 +2423,14 @@ def _resolve_record_chain_ref(uri: str, text: str, parts, line: int,
     for part in parts[1:-1]:
         if ref is None:
             return None
-        fields = dict(ref["decl"].fields)
-        if part not in fields:
+        decl_ctx = _context_for_ref(ref, ctx)
+        if decl_ctx is None:
             return None
-        ctx = _context_for_ref(ref, ctx)
-        if ctx is None:
+        info = _context_member(decl_ctx, ref["owner"], part)
+        if info is None or info.get("kind") != "field":
             return None
-        ref = _resolve_type_in_context(ctx, fields[part])
+        ctx = decl_ctx
+        ref = _resolve_type_in_context(ctx, info.get("type"))
     return ref
 
 
@@ -2370,13 +2659,29 @@ def _symbol_at(uri: str, text: str, line: int, character: int):
         if ref is None:
             ref = _resolve_record_chain_ref(
                 uri, context, parts + [member], line, records, aliases)
-        if ref is not None and member in dict(ref["decl"].fields):
-            if ref.get("local"):
-                return {"kind": "field", "name": member,
-                        "owner": ref["owner"], "decl": ref["decl"]}
-            return {"kind": "field_external", "name": member,
-                    "owner": ref["owner"], "decl": ref["decl"],
-                    "path": ref["path"], "import": ref["import"]}
+        if ref is not None:
+            decl_ctx = _context_for_ref(
+                ref, _document_context(uri, records, aliases))
+            info = _context_member(decl_ctx, ref["owner"], member)
+            if info is not None:
+                scope_ref = info["scope"]["ref"]
+                external = scope_ref.get("path") is not None
+                base = {"name": member, "owner": scope_ref.get("owner"),
+                        "decl": scope_ref.get("decl")}
+                if info["kind"] == "field":
+                    if external:
+                        return dict(base, **{
+                            "kind": "field_external",
+                            "path": scope_ref.get("path"),
+                            "import": scope_ref.get("import")})
+                    return dict(base, kind="field")
+                if info["kind"] == "method":
+                    if external:
+                        return dict(base, **{
+                            "kind": "method_external",
+                            "path": scope_ref.get("path"),
+                            "import": scope_ref.get("import")})
+                    return dict(base, kind="method")
         return None
 
     span = _word_span_at(text, line, character)
@@ -2637,6 +2942,21 @@ def _structural_definition(uri: str, text: str, line: int, character: int):
             if name == sym["name"]:
                 span = _linecol_at(text, off)
                 break
+    elif kind == "method":
+        span = _method_name_span(text, sym["decl"], sym["name"])
+    elif kind == "method_external":
+        target = sym.get("path")
+        if target is None:
+            return None
+        try:
+            target_text = target.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        span = _method_name_span(target_text, sym["decl"], sym["name"])
+        if span is None:
+            return None
+        return _location(target.as_uri(), target_text, span[0], span[1],
+                         len(sym["name"]))
     elif kind in ("field_external", "variant_external"):
         target = sym.get("path")
         if target is None:
@@ -3134,9 +3454,14 @@ def _member_hover(uri: str, text: str, line: int, character: int):
                 node, intro="GAMA-L function from `%s`." % imp["path"],
                 qualifier=alias)
         if isinstance(node, G.RecordDecl):
-            return ("`%s`\n\nGAMA-L record from `%s` (imported as `%s`)."
-                    % (_record_signature_text(node, alias),
-                       imp["path"], alias))
+            scope = _module_record_scope(uri, imp, node.name)
+            scopes = (_record_scopes(scope["uri"], scope["text"],
+                                     scope["ref"], scope["records"],
+                                     scope["aliases"])
+                      if scope is not None else [])
+            hover = _record_hover_text(node, alias, scopes=scopes)
+            return ("%s\n\nGAMA-L record from `%s` (imported as `%s`)."
+                    % (hover, imp["path"], alias))
         type_name = _const_type(node)
         value = _const_value(node)
         facts = []
@@ -3158,7 +3483,7 @@ def hover(uri: str, text: str, line: int, character: int):
     if value is None:
         value = _local_member_hover(text, line, character, uri)
     if value is None:
-        value = _structural_hover(text, name)
+        value = _structural_hover(text, name, uri)
     if value is None:
         value = _method_decl_hover(text, name, line)
     if value is None and name in TYPE_HOVERS:
@@ -3454,6 +3779,8 @@ def document_symbols(uri: str, text: str):
             "selectionRange": rng,
             "children": [],
         })
+    all_records = _record_decls(text)
+    aliases = _alias_map(text)
     for node in _record_nodes(text):
         loc = _decl_start(uri, text, node, node.name)
         if loc is None:
@@ -3472,9 +3799,27 @@ def document_symbols(uri: str, text: str):
                 "selectionRange": mloc["range"],
                 "children": [],
             })
+        ref = _local_record_ref(node.name, all_records.get(node.name, node))
+        scopes = _record_scopes(uri, text, ref, all_records, aliases)
+        for info in _aggregate_members(scopes).values():
+            if info["kind"] != "field" or info.get("owner") == node.name:
+                continue
+            children.append({
+                "name": info["name"],
+                "detail": "field %s: %s (inherited from %s)"
+                          % (info["name"], info["type"], info["owner"]),
+                "kind": 8,  # SymbolKind.Field
+                "range": rng,
+                "selectionRange": rng,
+                "children": [],
+            })
+        detail = "record %s" % node.name
+        parent = _record_extends(node)
+        if parent:
+            detail += " extends %s" % parent
         out.append({
             "name": node.name,
-            "detail": "record %s" % node.name,
+            "detail": detail,
             "kind": KIND_SYMBOL_CLASS,
             "range": rng,
             "selectionRange": rng,
@@ -3484,12 +3829,14 @@ def document_symbols(uri: str, text: str):
 
 
 def _record_nodes(text: str):
-    """Record declarations in document order (parsed AST only)."""
+    """Record declarations in document order (AST or tolerant fallback)."""
     program = _parse_or_none(text)
-    if program is None:
-        return []
-    return [node for node in _walk(program)
-            if isinstance(node, G.RecordDecl)]
+    if program is not None:
+        return [node for node in _walk(program)
+                if isinstance(node, G.RecordDecl)]
+    return sorted(_record_decls(text).values(),
+                  key=lambda node: (int(node.line or 0),
+                                    int(node.col or 0)))
 
 
 def _line_offsets(src: str):
