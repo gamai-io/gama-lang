@@ -231,7 +231,13 @@ class IRSubsetStillRejectsUnsupported(unittest.TestCase):
         self.assertIn("IR does not support pipe stage", str(ctx.exception))
 
     def test_prove_statement(self):
-        self.assert_unsupported('prove p = { a: 1 }\n')
+        # ``prove``/``verify`` are supported now; full parity lives in
+        # ``test_ir_prove.py``.
+        src = 'prove p = { a: 1 }\nverify p\n'
+        expected = G.run(src)
+        got = IR.run_program(G.check(src))
+        self.assertEqual(got.out, expected.out)
+        self.assertTrue(got.globals["_verify"]["ok"])
 
     def test_import_statement(self):
         self.assert_unsupported('import "x.gm"\n')

@@ -15,7 +15,11 @@ chains), ``while``, ``for`` (list/text iteration), ``break``, ``continue``,
 ``match`` on ``Ok``/``Err`` results and enum variants (nullary, one-payload and
 multi-payload patterns), ``record`` and ``enum`` declarations (including
 payload variants and record methods), ``fn`` (named function definitions),
-``return`` (inside functions only), and expression statements.
+``return`` (inside functions only), expression statements, and
+``prove name = expr`` / ``verify expr`` (proof receipts: canonical JSON value
+hash, optional HMAC signature via ``GAMA_L_PROOF_KEY``, hash-chain ``prev``
+link, duplicate-key rules, intent/lease binding, and the optional persistent
+JSONL ledger via ``GAMA_L_PROOF_LEDGER``).
 
 Supported expressions
 ---------------------
@@ -76,11 +80,28 @@ implementation byte-for-byte.
 
 Limitations (raise ``IRUnsupported`` / documented runtime errors)
 ------------------------------------------------------------------
-* ``prove``/``verify`` (and dotted proof names).  Plain ``import "lib.gm"`` is
-  supported only through :func:`compile_file` (and the ``gamal2 ir run|compile
-  FILE`` CLI), where the core loader flattens imported statements before
-  compiling; compiling a bare source string has no filesystem context to
-  resolve imports.  Aliased imports flatten too and are supported: the loader
+* ``prove``/``verify`` are supported with interpreter parity, implemented by
+  the VM itself (no ``gamal2.Interpreter`` is instantiated at run time). A
+  receipt is the same ``name``/``value``/``sha256``/``prev``/``id``/``ts``
+  object with optional ``intent``/``lease`` and ``sig`` fields; the hash-chain
+  payload, canonical JSON value form, duplicate-key rules (same value is an
+  idempotent hit, a different value is an error), HMAC via
+  ``GAMA_L_PROOF_KEY``/``GAMA_L_REQUIRE_SIG`` and intent/lease verification use
+  the reference helpers, so hashes and signatures match byte-for-byte. Dotted
+  proof names (``prove inv.posted = ...``) are supported as literal bindings.
+  When ``GAMA_L_PROOF_LEDGER`` names a JSONL file the VM loads it at start,
+  validates the whole chain, appends under one exclusive POSIX ``flock`` and
+  re-reads the tail before extending, exactly like the interpreter (the parent
+  directory is created; without ``fcntl`` cross-process atomicity is
+  best-effort). Relative to the interpreter, the IR does **not** enforce
+  ``GAMA_L_MAX_STEPS``/``GAMA_L_LOOP_LIMIT``; proof support includes neither
+  extra operations nor any special interpreter-only state.
+
+  Plain ``import "lib.gm"`` is supported only through :func:`compile_file`
+  (and the ``gamal2 ir run|compile FILE`` CLI), where the core loader flattens
+  imported statements before compiling; compiling a bare source string has no
+  filesystem context to resolve imports. Aliased imports flatten too and are
+  supported: the loader
   exposes module declarations as dotted names (``math.add``, ``math.pi``,
   ``geo.Point``) and this backend resolves them against the same function,
   global and nominal-type tables it uses for local names.
@@ -151,8 +172,11 @@ The public API is :func:`compile_program`, :func:`run_program`, the
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -555,6 +579,255 @@ def _builtin(name: str, args: list, line: int, col: int) -> Any:
     raise IRRuntimeError(f"unknown builtin {name}", line, col)  # pragma: no cover
 
 
+# ------------------------------------------------------------------ proofs
+class _ProofEngine:
+    """Standalone proof state for the IR VM (mirrors ``Interpreter.prove``).
+
+    The reference interpreter is never instantiated: this class owns the
+    receipt dict, the in-memory chain and the optional persistent ledger, and
+    calls the same reference *module-level* helpers (``_proof_raw``,
+    ``_proof_payload``, ``_proof_env``, ``_ledger_scan``) the interpreter uses.
+    Hashes, HMAC signatures, canonical JSON and chain diagnostics therefore
+    match byte-for-byte, while the VM stays free of interpreter runtime state.
+    """
+
+    def __init__(self, ledger_path: "str | None" = None):
+        self.proofs: dict[str, dict] = {}
+        self.proof_chain: list[str] = []
+        self.prev_proof = "GENESIS"
+        self._ledger_records: list[dict] = []
+        self._ledger_problems: list[str] = []
+        self.proof_ledger_path = ledger_path
+        if ledger_path:
+            self._load_ledger()
+
+    # -- persistent ledger ----------------------------------------------
+    def _load_ledger(self) -> None:
+        """Load the JSONL ledger under a shared POSIX ``flock``.
+
+        Mirrors ``Interpreter._load_proof_ledger``: the whole chain is scanned
+        once; a fork/gap is recorded (``verify`` reports it, ``prove`` refuses
+        to extend it) instead of being silently accepted.
+        """
+        path = self.proof_ledger_path
+        records, problems, data = [], [], None
+        try:
+            import fcntl as _fcntl
+        except ImportError:  # non-POSIX: no shared lock available
+            _fcntl = None
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                locked = False
+                if _fcntl is not None:
+                    try:
+                        _fcntl.flock(fh.fileno(), _fcntl.LOCK_SH)
+                        locked = True
+                    except OSError:
+                        locked = False
+                try:
+                    data = fh.read()
+                finally:
+                    if locked:
+                        try:
+                            _fcntl.flock(fh.fileno(), _fcntl.LOCK_UN)
+                        except OSError:
+                            pass
+        except FileNotFoundError:
+            data = None
+        if data is not None:
+            records, problems = g2._ledger_scan(data)
+        self._install_ledger_state(records)
+        self._ledger_problems = problems
+
+    def _install_ledger_state(self, records: list[dict]) -> None:
+        """Make ``records`` (file order) the authoritative in-memory view."""
+        self._ledger_records = list(records)
+        chain: list[str] = []
+        proofs: dict[str, dict] = {}
+        for rec in records:
+            sha = str(rec.get("sha256", "") or "")
+            if sha:
+                chain.append(sha)
+            name = rec.get("name")
+            if isinstance(name, str) and name not in proofs:
+                proofs[name] = rec
+        self.proof_chain = chain
+        self.proofs = proofs
+        self.prev_proof = chain[-1] if chain else "GENESIS"
+        self._ledger_problems = []
+
+    @staticmethod
+    def _check_binding(name: str, rec: dict, intent, lease) -> None:
+        """Enforce ``(intent, lease, key)`` uniqueness for one proof key."""
+        if intent is not None:
+            old_intent = rec.get("intent")
+            if old_intent != intent:
+                raise IRRuntimeError(
+                    f"prove: proof {name!r} is bound to intent {old_intent!r}, "
+                    f"not {intent!r}")
+        if lease is not None:
+            old_lease = rec.get("lease")
+            if old_lease != lease:
+                raise IRRuntimeError(
+                    f"prove: proof {name!r} is bound to lease {old_lease!r}, "
+                    f"not {lease!r}")
+
+    def _ledger_prove(self, name: str, val, raw: str, intent, lease) -> dict:
+        """Serialize load + tail read + hash + append under one exclusive lock.
+
+        Same protocol as ``Interpreter._ledger_prove``: concurrent writers
+        cannot both extend the same predecessor, and a forked/malformed ledger
+        is refused rather than extended. Without ``fcntl`` the re-read still
+        removes the common read-then-write race; cross-process atomicity is
+        best-effort.
+        """
+        path = self.proof_ledger_path
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        try:
+            import fcntl as _fcntl
+        except ImportError:
+            _fcntl = None
+        with open(path, "a+", encoding="utf-8") as fh:
+            locked = False
+            if _fcntl is not None:
+                try:
+                    _fcntl.flock(fh.fileno(), _fcntl.LOCK_EX)
+                    locked = True
+                except OSError:
+                    locked = False
+            try:
+                fh.seek(0)
+                data = fh.read()
+                records, problems = g2._ledger_scan(data)
+                if problems:
+                    raise IRRuntimeError(
+                        "prove: proof ledger is not a single valid chain ("
+                        + ", ".join(problems) + f"): {path}")
+                for old in records:
+                    if old.get("name") != name:
+                        continue
+                    self._check_binding(name, old, intent, lease)
+                    if (old.get("value") == val
+                            or g2._proof_raw(old.get("name"), old.get("value"))
+                            == raw):
+                        self._install_ledger_state(records)
+                        return old
+                    raise IRRuntimeError(
+                        f"prove: duplicate key {name!r} with different value")
+                prev = str(records[-1].get("sha256")) if records else "GENESIS"
+                payload = g2._proof_payload(prev, raw, intent, lease)
+                h = hashlib.sha256(payload.encode()).hexdigest()
+                rec = {"name": name, "value": val, "sha256": h, "prev": prev,
+                       "id": h[:16], "ts": time.time()}
+                if intent is not None:
+                    rec["intent"] = intent
+                if lease is not None:
+                    rec["lease"] = lease
+                key = os.environ.get("GAMA_L_PROOF_KEY", "").encode()
+                if key:
+                    rec["sig"] = hmac.new(
+                        key, payload.encode(), hashlib.sha256).hexdigest()
+                if data and not data.endswith("\n"):
+                    fh.write("\n")
+                fh.write(json.dumps(rec, ensure_ascii=False,
+                                    separators=(",", ":"), default=str) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+                self._install_ledger_state(records + [rec])
+                return rec
+            finally:
+                if locked:
+                    try:
+                        _fcntl.flock(fh.fileno(), _fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+
+    # -- prove / verify --------------------------------------------------
+    def prove(self, name: str, val) -> dict:
+        raw = g2._proof_raw(name, val)
+        intent = g2._proof_env("GAMA_L_PROOF_INTENT")
+        lease = g2._proof_env("GAMA_L_PROOF_LEASE")
+        if self.proof_ledger_path:
+            return self._ledger_prove(name, val, raw, intent, lease)
+        if name in self.proofs:
+            old = self.proofs[name]
+            if (old.get("value") == val
+                    or g2._proof_raw(old.get("name"), old.get("value")) == raw):
+                self._check_binding(name, old, intent, lease)
+                return old
+            raise IRRuntimeError(
+                f"prove: duplicate key {name!r} with different value")
+        payload = g2._proof_payload(self.prev_proof, raw, intent, lease)
+        h = hashlib.sha256(payload.encode()).hexdigest()
+        rec = {"name": name, "value": val, "sha256": h, "prev": self.prev_proof,
+               "id": h[:16], "ts": time.time()}
+        if intent is not None:
+            rec["intent"] = intent
+        if lease is not None:
+            rec["lease"] = lease
+        key = os.environ.get("GAMA_L_PROOF_KEY", "").encode()
+        if key:
+            rec["sig"] = hmac.new(
+                key, payload.encode(), hashlib.sha256).hexdigest()
+        self.prev_proof = h
+        self.proof_chain.append(h)
+        self.proofs[name] = rec
+        return rec
+
+    def verify(self, rec) -> dict:
+        if not isinstance(rec, dict) or "sha256" not in rec:
+            return {"ok": False, "errors": ["not_a_proof"]}
+        raw = g2._proof_raw(rec.get("name"), rec.get("value"))
+        rec_intent = rec.get("intent")
+        rec_lease = rec.get("lease")
+        prev = rec.get("prev", "GENESIS")
+        payload = g2._proof_payload(prev, raw, rec_intent, rec_lease)
+        exp = hashlib.sha256(payload.encode()).hexdigest()
+        errs: list[str] = []
+        if not hmac.compare_digest(exp, str(rec.get("sha256"))):
+            errs.append("hash_mismatch")
+        if (rec.get("prev") not in ("GENESIS",)
+                and rec.get("prev") not in self.proof_chain):
+            errs.append("untrusted_chain")
+        # A malformed or forked ledger is never silently usable: any verify in
+        # a process that loaded it reports the integrity failure.
+        for code in self._ledger_problems:
+            if code not in errs:
+                errs.append(code)
+        key = os.environ.get("GAMA_L_PROOF_KEY", "").encode()
+        sig = rec.get("sig")
+        if sig:
+            if not key:
+                errs.append("missing_key")
+            else:
+                want = hmac.new(
+                    key, payload.encode(), hashlib.sha256).hexdigest()
+                if not hmac.compare_digest(want, str(sig)):
+                    errs.append("bad_signature")
+        elif os.environ.get("GAMA_L_REQUIRE_SIG") == "1":
+            errs.append("missing_signature")
+        env_intent = g2._proof_env("GAMA_L_PROOF_INTENT")
+        env_lease = g2._proof_env("GAMA_L_PROOF_LEASE")
+        if env_intent is not None:
+            if rec_intent is None:
+                errs.append("intent_missing")
+            elif rec_intent != env_intent:
+                errs.append("intent_mismatch")
+        if env_lease is not None:
+            if rec_lease is None:
+                errs.append("lease_missing")
+            elif rec_lease != env_lease:
+                errs.append("lease_mismatch")
+        if os.environ.get("GAMA_L_REQUIRE_INTENT_LEASE") == "1":
+            if env_intent is None:
+                errs.append("intent_not_configured")
+            if env_lease is None:
+                errs.append("lease_not_configured")
+        return {"ok": not errs, "expected": exp, "errors": errs}
+
+
 # ------------------------------------------------------------------ compiler
 class _Compiler:
     """Compiles one instruction stream (main program, a function body or a
@@ -642,6 +915,16 @@ class _Compiler:
         if isinstance(stmt, g2.Print):
             self.compile_expr(stmt.expr)
             self.emit("PRINT")
+            return
+        if isinstance(stmt, g2.Prove):
+            # ``prove name = expr``: evaluate the value, then let the VM build
+            # the receipt (hash chain, HMAC, ledger) and bind it to ``name``.
+            self.compile_expr(stmt.expr)
+            self.emit("PROVE", (stmt.name, stmt.line, stmt.col))
+            return
+        if isinstance(stmt, g2.Verify):
+            self.compile_expr(stmt.expr)
+            self.emit("VERIFY", (stmt.line, stmt.col))
             return
         if isinstance(stmt, g2.ExprStmt):
             self.compile_expr(stmt.expr)
@@ -1153,6 +1436,11 @@ class _VM:
             name: dict(table) for name, table in (methods or {}).items()}
         self.record_env: dict[str, Frame] = {
             name: self.root for name in self.records}
+        # Proof state (chain + optional persistent ledger).  Built here so a
+        # ledger load/validation happens once, before ``main`` runs, exactly
+        # like ``Interpreter.__init__``.  No interpreter instance is created.
+        ledger = (os.environ.get("GAMA_L_PROOF_LEDGER") or "").strip() or None
+        self.proof = _ProofEngine(ledger)
 
     # -- call handling ---------------------------------------------------
     def _invoke(self, proto: FunctionProto, closure: Frame, args: list,
@@ -1664,6 +1952,21 @@ class _VM:
                 raise IRRuntimeError("match: no arm matched", line, col)
             elif op == "PRINT":
                 self.out.append(_render(stack.pop()))
+            elif op == "PROVE":
+                # ``prove name = expr``: build/return the receipt and bind it
+                # in the current frame (dotted names are literal bindings, as
+                # in ``Interpreter`` which calls ``env.set(s.name, rec)``).
+                name, line, col = arg
+                rec = self.proof.prove(name, stack.pop())
+                frames[-1].define(name, rec)
+                self.proof.proofs[name] = rec
+            elif op == "VERIFY":
+                # ``verify expr``: print the verdict and expose it as
+                # ``_verify`` in the current frame, like the interpreter.
+                line, col = arg
+                verdict = self.proof.verify(stack.pop())
+                frames[-1].define("_verify", verdict)
+                self.out.append(_render(verdict))
             elif op == "JUMP":
                 ip = arg
             elif op == "JUMP_IF_FALSE":

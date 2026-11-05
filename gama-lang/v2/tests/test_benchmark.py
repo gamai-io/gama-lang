@@ -62,10 +62,12 @@ class BenchmarkTests(unittest.TestCase):
         self.assertTrue(records["ir"]["outputs_match"])
 
         proof = next(p for p in data["programs"] if p["name"] == "proof")
-        self.assertFalse(proof["ir"]["supported"])
-        self.assertTrue(proof["ir"]["reason"].startswith("IRUnsupported:"))
-        self.assertNotIn("run_ms", proof["ir"])
-        self.assertNotIn("compile_ms", proof["ir"])
+        # IR now supports prove/verify with interpreter parity.
+        self.assertTrue(proof["ir"]["supported"])
+        self.assertTrue(proof["ir"]["outputs_match"])
+        _check_stats(self, proof["ir"]["compile_ms"])
+        _check_stats(self, proof["ir"]["run_ms"])
+        self.assertIsInstance(proof["ir"]["speedup"], float)
 
     def test_deterministic_structure(self):
         kwargs = dict(runs=1, warmup=0, seed=3,
@@ -111,7 +113,7 @@ class BenchmarkTests(unittest.TestCase):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             rc = bench.main([
-                "--runs", "1", "--warmup", "0", "--only", "proof",
+                "--runs", "1", "--warmup", "0", "--only", "sql_map",
                 "--no-startup",
             ])
         self.assertEqual(rc, 0)
@@ -119,7 +121,7 @@ class BenchmarkTests(unittest.TestCase):
         self.assertIn("GAMA-L benchmark", text)
         self.assertIn("IR unsupported", text)
         self.assertIn("IRUnsupported:", text)
-        self.assertIn("proof", text)
+        self.assertIn("sql_map", text)
 
 
 if __name__ == "__main__":

@@ -590,8 +590,10 @@ class IRUnsupportedTests(unittest.TestCase):
     """Constructs outside the documented IR subset must raise IRUnsupported."""
 
     _CASES = (
-        ("prove", "prove p = 1\n"),
-        ("verify", "verify true\n"),
+        # ``prove``/``verify`` are supported now (see test_ir_prove.py); these
+        # slots keep constructs that are still outside the IR subset.
+        ("unsupported lower", 'print lower("X")\n'),
+        ("unsupported keys", "print keys({})\n"),
         ("import", 'import "lib.gm" as m\nprint 1\n'),
         # Dotted names (field access / enum variants) are supported now; this
         # slot keeps a construct that is still outside the IR subset.

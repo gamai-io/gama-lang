@@ -255,7 +255,8 @@ Exact supported subset:
   `while`, `for` over list/text, `break`, `continue`, `match` on `Ok`/`Err`
   and enum variants (nullary, one-payload and multi-payload patterns),
   named `fn` definitions, `return` (inside functions), expression statements,
-  and `use` as a no-op.
+  `prove name = expr` / `verify expr` (hash-chained receipts with optional HMAC
+  and the optional persistent JSONL ledger — see below), and `use` as a no-op.
 - Expressions: `Int`/`Decimal`/`Text`/`Bool`/`null`, list `[a, b]` and map
   `{k: v}` literals, variables, enum variants and payload constructors
   (`Color.Red`, `Some(5)`, `Option.Some(5)`, `Pair(1, 2)`), `!`/`-`,
@@ -284,7 +285,7 @@ Exact supported subset:
 - Builtins: `len`, `text`, `number`, `round`, `Ok`, `Err` only.
 
 Not supported (raises `IRUnsupported`; the normal interpreter still supports
-them): `prove`/`verify`, unresolved `import` nodes (file imports go through
+them): unresolved `import` nodes (file imports go through
 `compile_file`), bare `Attr` expression nodes, host callables injected through
 `run_program(env=...)` (first-class functions cover IR-compiled lambdas and
 named functions only), structural matching beyond `Ok`/`Err`/enum arms
@@ -298,6 +299,17 @@ not enforce `GAMA_L_MAX_STEPS`/`GAMA_L_LOOP_LIMIT` (it does honour
 literals are JSON values, so text-keyed maps are not indexable. Successful
 programs produce byte-for-byte the same output as the interpreter, and runtime
 error messages keep the interpreter's text and line/col.
+
+`prove`/`verify` run on VM proof state, never on a `gamal2.Interpreter`
+instance. They reuse the reference module-level canonical-JSON, hash-payload
+and ledger-scan helpers, so receipts, `sha256`/`id`/`prev` links, HMAC `sig`
+(`GAMA_L_PROOF_KEY`, `GAMA_L_REQUIRE_SIG`) and intent/lease fields
+(`GAMA_L_PROOF_INTENT`/`GAMA_L_PROOF_LEASE`, `GAMA_L_REQUIRE_INTENT_LEASE`)
+match the interpreter exactly. `GAMA_L_PROOF_LEDGER=<file>` loads and validates
+the JSONL chain at startup, appends under one exclusive POSIX `flock` with a
+tail re-read, and refuses to extend a malformed/forked ledger; without `fcntl`
+cross-process atomicity is best-effort. Proof statements inherit the IR's
+general limits: `GAMA_L_MAX_STEPS`/`GAMA_L_LOOP_LIMIT` are not enforced.
 
 ## Implemented
 
