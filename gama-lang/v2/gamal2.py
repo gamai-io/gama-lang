@@ -1936,6 +1936,12 @@ class Checker:
         self.type_aliases: dict[str, TypeAlias] = {}
         self.effects: set[str] = set()
         self.ret_type: str | None = None
+        # Return-type inference state.  ``_infer_sink`` is a list collecting
+        # ``(type, line, col, expr)`` for every ``return`` while an unannotated
+        # function/lambda/method is being scanned; ``_infer_stack`` holds the
+        # ids of nodes currently being inferred so recursion degrades to Any.
+        self._infer_sink: list | None = None
+        self._infer_stack: set[int] = set()
         self.loop_depth = 0
         # Stack of generic type-parameter scopes. Names are erased to ``Any``
         # wherever they appear as a type annotation.
@@ -2438,6 +2444,7 @@ class Checker:
                         e.src = getattr(s, "_src", None)
                         raise e
                     method_names.add(m.name)
+                    m._record_name = s.name
                     if not m.params or m.params[0].name != "self":
                         e = GamaTypeError(
                             f"method {s.name}.{m.name} must declare self as its "
@@ -2817,6 +2824,9 @@ class Checker:
         elif isinstance(s, Return):
             if self.ret_type is None: raise GamaTypeError("return outside function", s.line, s.col)
             rt = self.expr(s.expr)
+            if self._infer_sink is not None:
+                self._infer_sink.append((rt, s.line, s.col, s.expr))
+                return
             if rt != "Any" and not self.compat(rt, self.ret_type): raise GamaTypeError(f"return {rt} != {self.ret_type}", s.line, s.col)
         elif isinstance(s, Prove):
             self.expr(s.expr); self.effects.add("proof.write")
@@ -2824,6 +2834,131 @@ class Checker:
         elif isinstance(s, Verify): self.expr(s.expr); self.effects.add("proof.read")
         elif isinstance(s, Print): self.expr(s.expr); self.effects.add("io.print")
         elif isinstance(s, ExprStmt): self.expr(s.expr)
+    def _merge_return_types(self, a, b, line, col):
+        """Least upper bound of two inferred return types.
+
+        Identical types stay as-is; ``Int``/``Decimal`` merge to ``Decimal``
+        so numeric branches stay usable in arithmetic; ``Any`` absorbs
+        everything (it already means "unknown", e.g. an inferred recursive or
+        erased generic position).  Anything else is a real conflict and is
+        reported at the position of the later ``return``.
+        """
+        if a == b:
+            return a
+        if a == "Any" or b == "Any":
+            return "Any"
+        if a in NUM and b in NUM:
+            return "Decimal"
+        raise GamaTypeError(
+            f"incompatible return types: {a} and {b}", line, col)
+
+    def _raw_return_type(self, expr, node):
+        """Unerased type of a return that is a direct type-parameter use.
+
+        Inference normally runs on erased annotations, so ``return x`` where
+        ``x: T`` looks like ``Any``.  A bare parameter reference keeps its
+        written annotation when that annotation names one of the node's type
+        parameters, so ``fn id<T>(x: T) { return x }`` behaves like
+        ``-> T`` at generic call sites (argument inference binds ``T``).
+        Other expressions stay erased; mixing this marker with a concrete
+        return degrades the whole result to ``Any`` via the normal merge.
+        """
+        if not isinstance(expr, Var):
+            return None
+        tparams = set(getattr(node, "type_params", None) or [])
+        if not tparams:
+            return None
+        for p in getattr(node, "params", None) or []:
+            if p.name != expr.name:
+                continue
+            if not _type_ref_uses_param(p.type_name, tparams):
+                return None
+            return p.type_name
+        return None
+
+    def _merge_returns(self, collected, node=None):
+        """Merge ``(type, line, col, expr)`` returns; empty body infers ``Any``.
+
+        A single unerased type-parameter annotation shared by every return is
+        kept as-is for generic call-site binding.  Otherwise erased types are
+        merged (identical, ``Int``/``Decimal`` -> ``Decimal``, ``Any`` absorbs).
+        Choosing ``Any`` for a function with no ``return`` keeps the previous
+        permissive behaviour (callers were never constrained for unannotated
+        functions); it is documented in ``CONFORMANCE.md``.
+        """
+        if not collected:
+            return "Any"
+        raw = [self._raw_return_type(item[3], node) if node is not None
+               else None for item in collected]
+        if raw and raw[0] is not None and all(r == raw[0] for r in raw):
+            return raw[0]
+        result = collected[0][0]
+        for rt, line, col, _expr in collected[1:]:
+            result = self._merge_return_types(result, rt, line, col)
+        return result
+
+    def _infer_returns(self, node, body):
+        """Scan ``body`` once to infer an omitted return annotation.
+
+        Runs the normal statement checker with ``ret_type = "Any"`` so every
+        expression is resolved in its real scope (locals, globals, records,
+        effects are all available) and records the type of each ``return``.
+        Nested functions/lambdas return early through their own scope, so only
+        this function's ``return`` statements are collected.  The real body
+        check then runs again against the merged type, so return statements
+        are still checked statically (never deferred to runtime).
+        """
+        cached = getattr(node, "_inferred_ret", None)
+        if cached is not None:
+            return cached
+        key = id(node)
+        if key in self._infer_stack:
+            # Direct or mutual recursion without an annotation: no finite
+            # type can be derived here, so the recursive use is Any.
+            return "Any"
+        self._infer_stack.add(key)
+        old_sink = self._infer_sink
+        old_ret = self.ret_type
+        old_effects = self.effects
+        sink: list = []
+        self._infer_sink = sink
+        self.ret_type = "Any"
+        self.effects = set()
+        try:
+            for s in body:
+                self.stmt(s, node.effects or set())
+        finally:
+            self._infer_sink = old_sink
+            self.ret_type = old_ret
+            self.effects = old_effects
+            self._infer_stack.discard(key)
+        return self._merge_returns(sink, node)
+
+    def _ret_of(self, node, method_record=None):
+        """Return annotation, or the inferred type when it was omitted.
+
+        ``Any`` means "not knowable yet": the node is currently being
+        inferred (recursion), or its body has not been reached.  Callers may
+        trigger inference on demand so forward references (a function defined
+        later in the file) still expose a concrete type.
+        """
+        if getattr(node, "ret", None) is not None:
+            return node.ret
+        cached = getattr(node, "_inferred_ret", None)
+        if cached is not None:
+            return cached
+        if id(node) in self._infer_stack:
+            return "Any"
+        if isinstance(node, Fn):
+            self.fn(node)
+        elif isinstance(node, Lambda):
+            self.expr(node)
+        elif isinstance(node, Method):
+            rec = getattr(node, "_record_name", None) or method_record
+            if rec is not None and rec in self.records:
+                self.check_method(rec, node)
+        return getattr(node, "_inferred_ret", None) or "Any"
+
     def fn(self, f: Fn):
         type_params = list(getattr(f, "type_params", None) or [])
         bounds = dict(getattr(f, "type_param_bounds", None) or {})
@@ -2867,10 +3002,22 @@ class Checker:
         self.type_params.append(seen_tp)
         try:
             for p in f.params: self.set(p.name, self.erase_type(p.type_name))
+            inferred = None
+            if f.ret is None:
+                inferred = self._infer_returns(f, f.body)
+                f._inferred_ret = inferred
             old = self.effects; self.effects = set()
             old_ret = self.ret_type
-            self.ret_type = self.erase_type(f.ret or "Any")
-            for s in f.body: self.stmt(s, f.effects or set())
+            self.ret_type = (self.erase_type(f.ret) if f.ret is not None
+                             else inferred)
+            # A nested function's real body check must not feed the enclosing
+            # inference sink (its returns belong to its own scope).
+            old_sink = self._infer_sink
+            self._infer_sink = None
+            try:
+                for s in f.body: self.stmt(s, f.effects or set())
+            finally:
+                self._infer_sink = old_sink
             used = set(self.effects); self.effects = old; self.ret_type = old_ret
             allowed = f.effects or set()
             bad = used - allowed
@@ -2898,9 +3045,20 @@ class Checker:
                 self._check_type_annotation(p.type_name, m.line, m.col, params)
                 self.set(p.name, self.erase_type(p.type_name))
             self._check_type_annotation(m.ret, m.line, m.col, params)
+            inferred = None
+            if m.ret is None:
+                inferred = self._infer_returns(m, m.body)
+                m._inferred_ret = inferred
             old = self.effects; self.effects = set()
-            old_ret = self.ret_type; self.ret_type = self.erase_type(m.ret or "Any")
-            for s in m.body: self.stmt(s, m.effects or set())
+            old_ret = self.ret_type
+            self.ret_type = (self.erase_type(m.ret) if m.ret is not None
+                             else inferred)
+            old_sink = self._infer_sink
+            self._infer_sink = None
+            try:
+                for s in m.body: self.stmt(s, m.effects or set())
+            finally:
+                self._infer_sink = old_sink
             used = set(self.effects); self.effects = old; self.ret_type = old_ret
             bad = used - (m.effects or set())
             if bad:
@@ -2954,9 +3112,10 @@ class Checker:
                     f"{rt}.{method_name}: {p.name} {at} != {want}",
                     e.line, e.col)
         self.effects |= (m.effects or set())
-        if not m.ret:
+        mret = self._ret_of(m, method_record=rt)
+        if not mret:
             return "Any"
-        return self.resolve_field_type(rt, m.ret)
+        return self.resolve_field_type(rt, mret)
 
     def compat(self, got, want):
         """Static compatibility, including union aliases.
@@ -3197,7 +3356,7 @@ class Checker:
                 raise GamaTypeError(
                     f"lambda: {p.name} {at} != {p.type_name}", e.line, e.col)
         self.effects |= (lmb.effects or set())
-        rt = lmb.ret or "Any"
+        rt = self._ret_of(lmb)
         if rt in tset:
             return bindings.get(rt, "Any")
         return self._erase_ann(rt, tset)
@@ -3226,10 +3385,20 @@ class Checker:
             try:
                 for p in e.params:
                     self.set(p.name, self.erase_type(p.type_name))
+                inferred = None
+                if e.ret is None:
+                    inferred = self._infer_returns(e, e.body)
+                    e._inferred_ret = inferred
                 old = self.effects; self.effects = set()
                 old_ret = self.ret_type
-                self.ret_type = self.erase_type(e.ret or "Any")
-                for s in e.body: self.stmt(s, e.effects or set())
+                self.ret_type = (self.erase_type(e.ret) if e.ret is not None
+                                 else inferred)
+                old_sink = self._infer_sink
+                self._infer_sink = None
+                try:
+                    for s in e.body: self.stmt(s, e.effects or set())
+                finally:
+                    self._infer_sink = old_sink
                 used = set(self.effects)
                 self.effects = old; self.ret_type = old_ret
                 allowed = e.effects or set()
@@ -3478,6 +3647,13 @@ class Checker:
                 vt = self.get(e.name)
                 if vt == "Function":
                     for a in e.args: self.expr(a)
+                    # A lambda bound with let/:= exposes its inferred return
+                    # type; annotated lambdas keep the historical Any result
+                    # here, so existing annotated code is unchanged.
+                    bl = self._get_lambda(e.name)
+                    if (bl is not None
+                            and getattr(bl, "_inferred_ret", None) is not None):
+                        return bl._inferred_ret
                     return "Any"
                 if vt is not None:
                     raise GamaTypeError(f"{e.name} is not callable ({vt})", e.line, e.col)
@@ -3557,7 +3733,7 @@ class Checker:
                         raise GamaTypeError(
                             f"{e.name}: {p.name} {at} != {want}", e.line, e.col)
                 self.effects |= (f.effects or set())
-                rt = f.ret or "Any"
+                rt = self._ret_of(f)
                 if rt in bindings:
                     rt = bindings[rt]
                 return self.erase_type(rt)
@@ -3587,7 +3763,7 @@ class Checker:
                             at, self._erase_ann(p.type_name, tparam_set)):
                         raise GamaTypeError(f"{e.name}: {p.name} {at} != {p.type_name}", e.line, e.col)
                 self.effects |= (f.effects or set())
-                rt = f.ret or "Any"
+                rt = self._ret_of(f)
                 if rt in tparam_set:
                     return bindings.get(rt, "Any")
                 return self._erase_ann(rt, tparam_set)
@@ -3596,7 +3772,7 @@ class Checker:
                 want = self.erase_type(p.type_name)
                 if not self.compat(at, want): raise GamaTypeError(f"{e.name}: {p.name} {at} != {p.type_name}", e.line, e.col)
             self.effects |= (f.effects or set())
-            return self.erase_type(f.ret or "Any")
+            return self.erase_type(self._ret_of(f))
         if isinstance(e, CallExpr):
             ct = self.expr(e.callee)
             if ct not in ("Function", "Any"):
@@ -3635,7 +3811,7 @@ class Checker:
                                 raise GamaTypeError(
                                     f"{callee.name}: {p.name} {at} != "
                                     f"{p.type_name}", e.line, e.col)
-                    rt = f.ret or "Any"
+                    rt = self._ret_of(f)
                     if rt in f.type_params:
                         return bindings.get(rt, "Any")
                     return self._erase_ann(rt, f.type_params)
@@ -3644,8 +3820,11 @@ class Checker:
                     want = self.erase_type(p.type_name)
                     if not self.compat(at, want):
                         raise GamaTypeError(f"{callee.name}: {p.name} {at} != {p.type_name}", e.line, e.col)
-                return self.erase_type(f.ret or "Any")
+                return self.erase_type(self._ret_of(f))
             for a in e.args: self.expr(a)
+            if bound_lambda is not None and getattr(
+                    bound_lambda, "_inferred_ret", None) is not None:
+                return bound_lambda._inferred_ret
             return "Any"
         if isinstance(e, Pipe):
             t = self.expr(e.base, row)

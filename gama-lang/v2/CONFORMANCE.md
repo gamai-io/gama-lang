@@ -76,7 +76,8 @@ These are outside the T1–T10 checks or only partially covered; see
    arms, locally and through aliases.
    Runtime limits are enforced (call depth, output, statement/expression steps,
    loop limit); there is no production resource budget or cost model.
-4. **Full type system.** No full inference. Nominal records with typed fields,
+4. **Full type system.** No full inference beyond omitted return types (see
+   below). Nominal records with typed fields,
    positional/named construction, dotted field access, in-place field
    assignment and copy/`with` updates are implemented (`tests/test_records.py`,
    `tests/test_record_update.py`, `tests/test_record_with.py`); nullary and
@@ -98,6 +99,25 @@ These are outside the T1–T10 checks or only partially covered; see
    (flattened fields, inherited/overridden methods, dynamic dispatch) and
    first-class functions/lambdas with interpreter parity for its documented
    subset.
+   **Return type inference.** When a function, method or lambda omits
+   `-> Type`, the checker infers the return type from every `return expr`
+   lexically in its body (nested functions/lambdas excluded): identical
+   branches keep the type, `Int`/`Decimal` merge to `Decimal`, and any other
+   mix is a `GamaTypeError` at the later return. A bare parameter whose
+   annotation names a type parameter keeps that parameter (e.g.
+   `fn id<T>(x: T) { return x }` behaves like `-> T`), so generic call sites
+   bind it from arguments; other expressions are checked after erasure, so a
+   type parameter used inside a larger expression degrades to `Any`. A body
+   with no `return` infers `Any` (the historical permissive result). Direct or
+   mutual recursion without an annotation also infers `Any` at the recursive
+   use. Inferred types are available to callers, higher-order calls and
+   methods but are stored out-of-band: the AST's `ret` stays `None`, so the
+   formatter preserves the omission and the IR keeps its existing behaviour
+   (it continues to treat a missing annotation as `Any`; it does not read the
+   inferred type). Overrides still compare the written annotations, so an
+   omitted return on an override is `Any`. The checker still checks every
+   `return` against the inferred type; nothing is deferred to runtime
+   (`tests/test_return_inference.py`).
 5. **Formatter edges.** `fmt` is AST-based; it preserves comments and strings,
    is idempotent, and wraps at a configurable width (default 88,
    `fmt --width`): expressions (list/map/record literals, calls, binary chains,

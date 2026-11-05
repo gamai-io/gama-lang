@@ -159,6 +159,13 @@ Limitations (raise ``IRUnsupported`` / documented runtime errors)
   documented stages; a hand-built AST with an unknown stage keyword (or a
   stage missing its required argument) is rejected with
   :class:`IRUnsupported` rather than silently ignored.
+* A missing return annotation is treated as ``Any`` here, exactly as before
+  checker-side return inference was added.  Inference is a static (checker)
+  feature stored out-of-band (``_inferred_ret``); the AST's ``ret`` field is
+  left ``None`` so this compiler neither sees nor depends on it.  IR output is
+  therefore unchanged for annotated and unannotated functions alike; the IR
+  never defers return-type checks to runtime because it performs no type
+  checking of its own.
 * ``?`` is accepted only inside a named function whose declared return type is
   ``Result`` or ``Any``. Using it at the top level, in a function returning a
   concrete non-``Result`` type, or inside a default-parameter expression is
