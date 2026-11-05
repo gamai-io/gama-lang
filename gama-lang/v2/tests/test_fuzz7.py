@@ -803,14 +803,11 @@ _WITH_REJECT = (
 )
 
 _INTERSECTION_REJECT = (
-    "fn f<T: A & B>(x: T) -> Int { return 1 }\n",
     "type I = A & B\n",
     "fn f(x: A & B) -> Int { return 1 }\n",
     "record R { x: A & B }\n",
     "type I = Int & Text\n",
-    "fn f<T: Int & Text>() -> Int { return 1 }\n",
     "let x: Int & Text = 1\n",
-    "fn f<T: A&B>(x: T) -> T { return x }\n",
     "type I = Int | Text & Bool\n",
 )
 
@@ -1272,9 +1269,14 @@ class FeatureProbeTests(unittest.TestCase):
                         "print r.p.x\n",
                         ["2"], "probe-nested-with")
 
-    def test_intersection_bounds_are_not_supported(self):
-        _assert_parse_error(self, "fn f<T: A & B>(x: T) -> Int { return 1 }\n",
-                            "probe-intersection")
+    def test_intersection_bounds_are_supported(self):
+        _assert_program(
+            self,
+            "record A { x: Int }\nrecord B { y: Int }\n"
+            "record C { x: Int, y: Int }\n"
+            "fn f<T: A & B>(v: T) -> Int { return v.x + v.y }\n"
+            "print f(C(1, 2))\n",
+            ["3"], "probe-intersection")
 
 
 class Fuzz7RegressionPins(unittest.TestCase):
@@ -1285,14 +1287,12 @@ class Fuzz7RegressionPins(unittest.TestCase):
     was fixed and the pin can be removed.
     """
 
-    @unittest.expectedFailure
     def test_generic_union_alias_substitutes_bare_type_parameter(self):
         src = ("type Maybe<T> = T | Text\n"
                "let x: Maybe<Int> = 1\nprint x\n")
         G.check(src)
         self.assertEqual(list(G.run(src).out), ["1"])
 
-    @unittest.expectedFailure
     def test_union_alias_distinguishes_same_generic_with_different_args(self):
         src = ("record Box<T> { v: T }\n"
                "type U = Box<Int> | Box<Text>\n"
@@ -1300,7 +1300,6 @@ class Fuzz7RegressionPins(unittest.TestCase):
         G.check(src)
         self.assertEqual(list(G.run(src).out), ["Box { v: 1 }"])
 
-    @unittest.expectedFailure
     def test_generic_alias_branch_inside_generic_union_alias(self):
         src = ("type Boxed<T> = List<T>\n"
                "type Maybe<T> = Boxed<T> | Text\n"

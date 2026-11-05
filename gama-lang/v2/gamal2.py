@@ -1324,9 +1324,20 @@ def _type_ref_uses_param(t, params):
     return any(_type_ref_uses_param(a, params) for a in args)
 
 def _subst_type_ref(t, bindings):
-    """Replace type parameters by their bound refs (recursively)."""
-    if not bindings:
+    """Replace type parameters by their bound refs (recursively).
+
+    Unions and intersections are substituted branch by branch; a bare type
+    parameter is replaced by its binding; generic arguments are substituted
+    recursively.
+    """
+    if not bindings or not isinstance(t, str):
         return t
+    inters = _split_intersection(t)
+    if len(inters) > 1:
+        return " & ".join(_subst_type_ref(a, bindings) for a in inters)
+    alts = _split_bound(t)
+    if len(alts) > 1:
+        return " | ".join(_subst_type_ref(a, bindings) for a in alts)
     base, args = _type_ref_parts(t)
     if not args:
         return bindings.get(base, base)
@@ -2266,10 +2277,6 @@ class Checker:
                         a.line, a.col)
                 base, args = _type_ref_parts(alt)
                 if base in self.type_aliases:
-                    if args:
-                        raise GamaTypeError(
-                            f"type alias {base} is not generic",
-                            a.line, a.col)
                     if base not in stack and self._alias_union_name(base):
                         raise GamaTypeError(
                             f"type alias {alias_name}: nested union alias "
@@ -2763,7 +2770,8 @@ class Checker:
                             if s.type_name else None)
             if (isinstance(s.expr, Call)
                     and not getattr(s.expr, "type_args", None)
-                    and resolved_ann and "<" in resolved_ann):
+                    and resolved_ann and "<" in resolved_ann
+                    and "|" not in resolved_ann and "&" not in resolved_ann):
                 self._check_annotated_record_call(resolved_ann, s.expr)
             # Bind the name before checking a lambda body so recursive
             # lambdas can refer to themselves.
