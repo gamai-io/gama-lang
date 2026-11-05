@@ -606,13 +606,353 @@ def _resolve_module(uri: str, path: str):
     return None
 
 
+_DECL_HEAD_RE = re.compile(
+    r"(?m)^[ \t]*(export[ \t]+)?(fn|let|record|enum)[ \t]+"
+    r"([A-Za-z_][A-Za-z0-9_]*)")
+_RENAME_RE = re.compile(r"\bas\s+([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _brace_depths(masked: str):
+    """Brace depth *before* each character (same length as ``masked``)."""
+    n = len(masked or "")
+    depths = [0] * (n + 1)
+    depth = 0
+    for i, ch in enumerate(masked or ""):
+        if ch == "{":
+            depth += 1
+            depths[i] = depth
+        elif ch == "}":
+            depth = max(0, depth - 1)
+            depths[i] = depth
+        else:
+            depths[i] = depth
+    depths[n] = depth
+    return depths
+
+
+def _matching_delim(text: str, start: int):
+    """Index of the delimiter closing ``text[start]``, or ``None``."""
+    if start is None or start < 0 or start >= len(text or ""):
+        return None
+    opener = text[start]
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    closer = pairs.get(opener)
+    if closer is None:
+        return None
+    depth = 0
+    quote = None
+    i = start
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+        elif ch == "#":
+            nl = text.find("\n", i)
+            i = n if nl < 0 else nl
+            continue
+        elif ch == opener:
+            depth += 1
+        elif ch == closer:
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def _line_end(text: str, start: int):
+    idx = (text or "").find("\n", max(0, start))
+    return len(text or "") if idx < 0 else idx
+
+
+def _statement_end(masked: str, start: int):
+    """End offset of a top-level statement starting at ``start``."""
+    depth = 0
+    i = max(0, start)
+    n = len(masked or "")
+    while i < n:
+        ch = masked[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        elif ch == "\n" and depth == 0:
+            return i
+        i += 1
+    return n
+
+
+def _declaration_span(text: str, masked: str, match):
+    """``(end, body_start, body_end)`` offsets for one declaration header."""
+    kind = match.group(2)
+    base = match.end()
+    if kind in ("record", "enum"):
+        brace = text.find("{", base)
+        if brace >= 0:
+            rng = _brace_body_range(text, brace)
+            if rng is not None:
+                close_end = rng[1] + 1
+                return (_statement_end(masked, close_end), brace, close_end)
+        return _line_end(text, base), None, None
+    if kind == "fn":
+        paren = text.find("(", base)
+        close = _matching_delim(text, paren)
+        pos = close + 1 if close is not None else base
+        brace = text.find("{", pos)
+        if brace >= 0 and re.search(r"\beffects\b", text[pos:brace]):
+            rng = _brace_body_range(text, brace)
+            if rng is not None:
+                pos = rng[1] + 1
+        brace = text.find("{", pos)
+        if brace >= 0:
+            rng = _brace_body_range(text, brace)
+            if rng is not None:
+                close_end = rng[1] + 1
+                return (_statement_end(masked, close_end), brace, close_end)
+        return _line_end(text, pos), None, None
+    return _statement_end(masked, base), None, None
+
+
+def _rename_span(text: str, masked: str, kind: str, match_end: int,
+                 body_start, body_end, end):
+    """Span and new name of an ``as`` re-export on one declaration."""
+    header_end = body_start if body_start is not None else end
+    header = masked[match_end:header_end]
+    chosen = None
+    for m in _RENAME_RE.finditer(header):
+        after = header[m.end():]
+        if kind == "let":
+            ok = re.match(r"\s*(?:=|#|$)", after) is not None
+        else:
+            ok = (after.strip() == ""
+                  or re.match(r"\s*effects\b", after) is not None)
+        if ok:
+            chosen = m
+    if chosen is not None:
+        return (match_end + chosen.start(),
+                match_end + chosen.end(), chosen.group(1))
+    if body_end is not None:
+        suffix = masked[body_end:end]
+        m = re.match(
+            r"\s*as\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:;\s*)?(?:#[^\n]*)?$",
+            suffix)
+        if m is not None:
+            as_idx = suffix.find("as", m.start())
+            return (body_end + as_idx, body_end + m.end(1), m.group(1))
+    return None
+
+
+def _module_export_info(text: str):
+    """Top-level declarations plus export/rename metadata.
+
+    Core GAMA-L understands ``export fn/let/record`` but rejects
+    ``export enum`` and any ``as`` re-export. This tolerant scanner therefore
+    works on the masked text, ignores declarations nested in record bodies,
+    and never raises: malformed declarations are simply skipped. The returned
+    entries are ``{kind, name, line, col, exported, keyword_pos, end,
+    rename, rename_span, export_span}``.
+    """
+    body = text or ""
+    masked = _masked_text(body)
+    depths = _brace_depths(masked)
+    out = []
+    seen = set()
+    for match in _DECL_HEAD_RE.finditer(masked):
+        if depths[match.start()] != 0:
+            continue
+        kind = match.group(2)
+        name = match.group(3)
+        key = (kind, name)
+        if key in seen:
+            continue
+        try:
+            end, body_start, body_end = _declaration_span(body, masked, match)
+            rename = _rename_span(body, masked, kind, match.end(),
+                                  body_start, body_end, end)
+        except Exception:
+            continue
+        seen.add(key)
+        line, col = _offset_line_col(body, match.start(2))
+        out.append({
+            "kind": kind,
+            "name": name,
+            "line": line,
+            "col": col,
+            "exported": bool(match.group(1)),
+            "keyword_pos": match.start(2),
+            "end": end,
+            "rename": rename[2] if rename else None,
+            "rename_span": (rename[0], rename[1]) if rename else None,
+            "export_span": match.span(1) if match.group(1) else None,
+        })
+    return out
+
+
+def _blank_spans(text: str, spans):
+    chars = list(text or "")
+    for span in spans:
+        if not span:
+            continue
+        for i in range(max(0, span[0]), min(len(chars), span[1])):
+            if chars[i] != "\n":
+                chars[i] = " "
+    return "".join(chars)
+
+
+def _export_view_text(text: str, info):
+    spans = []
+    for entry in info:
+        spans.append(entry.get("export_span"))
+        spans.append(entry.get("rename_span"))
+    return _blank_spans(text, spans)
+
+
+def _module_has_side_effects(text: str, info):
+    """True when non-declaration top-level code would break alias imports."""
+    body = text or ""
+    masked = _masked_text(body)
+    chars = list(masked)
+    spans = []
+    for entry in info:
+        spans.append(entry.get("export_span"))
+        spans.append((entry["keyword_pos"], entry["end"]))
+    for match in re.finditer(
+            r"(?m)^[ \t]*(?:import|use)\b[^\n]*", masked):
+        spans.append(match.span())
+    for span in spans:
+        if not span:
+            continue
+        for i in range(max(0, span[0]), min(len(chars), span[1])):
+            chars[i] = " "
+    leftover = "".join(ch for ch in chars
+                       if not ch.isspace() and ch not in ";\ufeff")
+    return leftover != ""
+
+
+def _original_name(node):
+    return (getattr(node, "_original_name", None)
+            or getattr(node, "name", None))
+
+
+def _exported_name(node):
+    return getattr(node, "_exported_name", None) or getattr(node, "name", None)
+
+
+def _clone_exported(node, exposed: str):
+    """Copy ``node`` under its public name, remembering the original."""
+    original = _original_name(node)
+    try:
+        clone = dataclasses.replace(node, name=exposed)
+    except Exception:
+        try:
+            setattr(node, "name", exposed)
+            clone = node
+        except Exception:
+            return node
+    for attr, value in (("_exported_name", exposed),
+                        ("_original_name", original)):
+        try:
+            setattr(clone, attr, value)
+        except Exception:
+            pass
+    return clone
+
+
+def _structural_fn_lets(text: str, info, original: str):
+    """Best-effort ``Fn``/``Let`` nodes from per-declaration snippets."""
+    out = []
+    for entry in info:
+        if entry["kind"] not in ("fn", "let"):
+            continue
+        snippet = text[entry["keyword_pos"]:entry["end"]]
+        try:
+            program = G.parse(snippet)
+        except Exception:
+            continue
+        base_line, base_col = _offset_line_col(original, entry["keyword_pos"])
+        for node in program:
+            if not isinstance(node, (G.Fn, G.Let)):
+                continue
+            if node.name != entry["name"]:
+                continue
+            try:
+                if int(node.line) <= 1:
+                    node.col = base_col + max(0, int(node.col) - 1)
+                node.line = base_line + max(0, int(node.line) - 1)
+            except Exception:
+                pass
+            out.append(node)
+    return out
+
+
+def _structural_module_nodes(text: str, info):
+    """Declarations for a module whose export syntax core cannot parse."""
+    transformed = _export_view_text(text, info)
+    nodes = []
+    program = _parse_or_none(transformed)
+    if program is not None:
+        for node in program:
+            if isinstance(node, (G.Fn, G.Let, G.RecordDecl, G.EnumDecl)):
+                nodes.append(node)
+    else:
+        nodes.extend(_record_decls(text).values())
+        nodes.extend(_enum_decls(text).values())
+        nodes.extend(_structural_fn_lets(transformed, info, text))
+    by_name = {}
+    for entry in info:
+        by_name.setdefault(entry["name"], entry)
+    for node in nodes:
+        entry = by_name.get(node.name)
+        if entry is not None and entry["exported"]:
+            try:
+                setattr(node, "exported", True)
+            except Exception:
+                pass
+    return nodes
+
+
+def _export_view(nodes, info):
+    """Filter private declarations and apply ``as`` re-export names."""
+    if not nodes:
+        return nodes
+    by_name = {}
+    for entry in info or []:
+        by_name.setdefault(entry["name"], entry)
+    explicit = any(entry["exported"] for entry in (info or []))
+    out = []
+    for node in nodes:
+        entry = by_name.get(node.name)
+        exported = bool(getattr(node, "exported", False)
+                        or (entry and entry["exported"]))
+        if explicit and isinstance(node, (G.Fn, G.Let, G.RecordDecl)) \
+                and not exported:
+            continue
+        exposed = entry.get("rename") if entry else None
+        if exposed and exposed != node.name:
+            node = _clone_exported(node, exposed)
+        out.append(node)
+    return out
+
+
 def _module_declarations(uri: str, path: str):
     """Exported ``fn``/``let``/``record``/``enum`` declarations of a module.
 
     Mirrors the core alias-import rules: the module (including plain imports
     it inlines) may only contain declarations, plain imports and ``use`` at
     the top level. Enums are accepted as an LSP navigation extension even
-    though core alias imports still reject their evaluation. Malformed,
+    though core alias imports still reject their evaluation. Modules using
+    ``export enum`` or ``export ... as`` (which the core parser rejects) are
+    parsed structurally so completion/hover/definition stay useful; nested
+    plain imports are not expanded in that best-effort mode. Malformed,
     missing or side-effect modules are treated as unavailable so completion
     and hover stay quiet instead of advertising members the runtime would
     reject. ``None`` means unavailable, while an empty list means nothing
@@ -623,30 +963,38 @@ def _module_declarations(uri: str, path: str):
     if target is None or root is None:
         return None
     try:
+        body = target.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    info = _module_export_info(body)
+    try:
         flat_fn = getattr(G, "_flatten", None)
         if flat_fn is not None:
             stmts = flat_fn(target, root)
         else:  # pragma: no cover - older cores without namespace flattening
-            stmts = G.parse(target.read_text(encoding="utf-8"))
+            stmts = G.parse(body)
         allowed = tuple(getattr(G, "_ALIAS_ALLOWED_TOPLEVEL",
                                (G.Fn, G.Let, G.Import, G.Use))) + (
                                    G.EnumDecl,)
         if not all(isinstance(st, allowed) for st in stmts):
-            return None
+            stmts = None
     except Exception:
-        # LSP-only record inheritance: the core parser currently rejects
-        # ``record Child extends Parent``. Keep the module usable for LSP
-        # navigation when that is the only reason flattening failed.
-        try:
-            body = target.read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
-            return None
-        if "extends" not in body:
-            return None
-        return list(_record_decls(body).values()) + list(
-            _enum_decls(body).values())
-    return [st for st in stmts
-            if isinstance(st, (G.Fn, G.Let, G.RecordDecl, G.EnumDecl))]
+        stmts = None
+    if stmts is not None:
+        nodes = [st for st in stmts
+                 if isinstance(st, (G.Fn, G.Let, G.RecordDecl, G.EnumDecl))]
+        return _export_view(nodes, info)
+    # Structural mode is only justified when core failed for a LSP-known
+    # reason; side-effect or malformed modules must stay quiet.
+    needs_structural = "extends" in body or any(
+        entry.get("rename")
+        or (entry["kind"] == "enum" and entry["exported"])
+        for entry in info)
+    if not needs_structural:
+        return None
+    if _module_has_side_effects(body, info):
+        return None
+    return _export_view(_structural_module_nodes(body, info), info)
 
 
 def _module_functions(uri: str, path: str):
@@ -792,7 +1140,8 @@ def _enum_decls(text):
         variants = [(token, 0, 0) for token in re.split(r"[,\s]+", body)
                     if ALIAS_RE.match(token)]
         if name not in out:
-            out[name] = G.EnumDecl(name, variants, 0, 0)
+            line, col = _offset_line_col(text, match.start())
+            out[name] = G.EnumDecl(name, variants, line, col)
     return out
 
 
@@ -1412,6 +1761,20 @@ def _local_member_hover(text, line, character, uri=None):
             return ("`%s.%s`\n\nGAMA-L enum variant `%s` of enum `%s`."
                     % (parts[0], member, member, parts[0]))
 
+    if len(parts) == 2 and parts[0] in aliases:
+        imp = aliases[parts[0]]
+        enum = _module_enum(uri, imp.get("path"), parts[1])
+        if enum is None or member not in {
+                variant[0] for variant in enum.variants}:
+            return None
+        original = _original_name(enum)
+        renamed = ("" if original == enum.name
+                   else "\n\nExported from `%s`." % original)
+        return ("`%s.%s.%s`\n\nGAMA-L enum variant `%s` of enum `%s` from "
+                "`%s`.%s"
+                % (parts[0], parts[1], member, member, parts[1],
+                   imp["path"], renamed))
+
     ref = None
     if uri:
         ref = _resolve_member_owner(
@@ -1458,6 +1821,30 @@ def _member_type_items(text, line, character, parts, uri=None):
     records = _record_decls(context)
     enums = _enum_decls(context)
     aliases = _alias_map(text)
+    if len(parts) == 2 and parts[0] in aliases:
+        imp = aliases[parts[0]]
+        enum = _module_enum(uri, imp.get("path"), parts[1])
+        if enum is not None:
+            original = _original_name(enum)
+            renamed = ("" if original == enum.name
+                       else " Exported from `%s`." % original)
+            items = []
+            seen = set()
+            for variant_info in enum.variants:
+                variant = variant_info[0]
+                if variant in seen:
+                    continue
+                seen.add(variant)
+                items.append({
+                    "label": variant,
+                    "kind": KIND_ENUM_MEMBER,
+                    "detail": "%s.%s" % (parts[1], variant),
+                    "documentation": "Variant `%s` of enum `%s` from `%s`."
+                                     "%s"
+                                     % (variant, parts[1], imp["path"],
+                                        renamed),
+                })
+            return items
     target = _chain_target_type(context, parts, records, enums, aliases,
                                 line, uri)
     items = []
@@ -1690,13 +2077,16 @@ def completion(uri: str, text: str, line: int = 0, character: int = 0):
                 if node.name in seen_members:
                     continue
                 seen_members.add(node.name)
+                original = _original_name(node)
+                renamed = ("" if original == node.name
+                           else " Exported from `%s`." % original)
                 if isinstance(node, G.Fn):
                     items.append({
                         "label": node.name,
                         "kind": KIND_FUNCTION,
                         "detail": fn_signature(node),
-                        "documentation": "From `%s` (imported as `%s`)."
-                                         % (imp["path"], alias),
+                        "documentation": "From `%s` (imported as `%s`).%s"
+                                         % (imp["path"], alias, renamed),
                     })
                 elif isinstance(node, G.RecordDecl):
                     items.append({
@@ -1704,7 +2094,22 @@ def completion(uri: str, text: str, line: int = 0, character: int = 0):
                         "kind": KIND_CLASS,
                         "detail": "record %s" % node.name,
                         "documentation": "Record from `%s` (imported as "
-                                         "`%s`)." % (imp["path"], alias),
+                                         "`%s`).%s"
+                                         % (imp["path"], alias, renamed),
+                    })
+                elif isinstance(node, G.EnumDecl):
+                    variants = ", ".join(
+                        entry[0] for entry in getattr(node, "variants", ()))
+                    detail = "enum %s" % node.name
+                    if variants:
+                        detail += " { %s }" % variants
+                    items.append({
+                        "label": node.name,
+                        "kind": KIND_ENUM,
+                        "detail": detail,
+                        "documentation": "Enum from `%s` (imported as "
+                                         "`%s`).%s"
+                                         % (imp["path"], alias, renamed),
                     })
                 else:
                     type_name = _const_type(node)
@@ -1715,7 +2120,8 @@ def completion(uri: str, text: str, line: int = 0, character: int = 0):
                         "kind": KIND_CONSTANT,
                         "detail": detail,
                         "documentation": "Constant from `%s` (imported as "
-                                         "`%s`)." % (imp["path"], alias),
+                                         "`%s`).%s"
+                                         % (imp["path"], alias, renamed),
                     })
             return {"isIncomplete": False, "items": items}
 
@@ -2632,12 +3038,25 @@ def _symbol_at(uri: str, text: str, line: int, character: int):
             if node is not None:
                 target = _resolve_module(uri, imp.get("path") or "")
                 return {"kind": "record_external", "name": member,
+                        "decl_name": _original_name(node),
                         "decl": node, "path": target, "import": imp}
             enum = _module_enum(uri, imp.get("path"), member)
             if enum is not None:
                 target = _resolve_module(uri, imp.get("path") or "")
                 return {"kind": "enum_external", "name": member,
+                        "decl_name": _original_name(enum),
                         "decl": enum, "path": target, "import": imp}
+            other = _module_decl_by_name(uri, imp.get("path"), member)
+            if isinstance(other, G.Fn):
+                target = _resolve_module(uri, imp.get("path") or "")
+                return {"kind": "fn_external", "name": member,
+                        "decl_name": _original_name(other),
+                        "decl": other, "path": target, "import": imp}
+            if isinstance(other, G.Let):
+                target = _resolve_module(uri, imp.get("path") or "")
+                return {"kind": "let_external", "name": member,
+                        "decl_name": _original_name(other),
+                        "decl": other, "path": target, "import": imp}
             return None
         if len(parts) == 2 and parts[0] in aliases:
             imp = aliases[parts[0]]
@@ -2699,12 +3118,25 @@ def _symbol_at(uri: str, text: str, line: int, character: int):
             if node is not None:
                 target = _resolve_module(uri, imp.get("path") or "")
                 return {"kind": "record_external", "name": member_name,
+                        "decl_name": _original_name(node),
                         "decl": node, "path": target, "import": imp}
             enum = _module_enum(uri, imp.get("path"), member_name)
             if enum is not None:
                 target = _resolve_module(uri, imp.get("path") or "")
                 return {"kind": "enum_external", "name": member_name,
+                        "decl_name": _original_name(enum),
                         "decl": enum, "path": target, "import": imp}
+            other = _module_decl_by_name(uri, imp.get("path"), member_name)
+            if isinstance(other, G.Fn):
+                target = _resolve_module(uri, imp.get("path") or "")
+                return {"kind": "fn_external", "name": member_name,
+                        "decl_name": _original_name(other),
+                        "decl": other, "path": target, "import": imp}
+            if isinstance(other, G.Let):
+                target = _resolve_module(uri, imp.get("path") or "")
+                return {"kind": "let_external", "name": member_name,
+                        "decl_name": _original_name(other),
+                        "decl": other, "path": target, "import": imp}
             return None
 
     records = _record_decls(text)
@@ -2745,7 +3177,8 @@ def _module_record(uri: str, path, name: str):
     if not path:
         return None
     for node in _module_declarations(uri, path) or []:
-        if isinstance(node, G.RecordDecl) and node.name == name:
+        if isinstance(node, G.RecordDecl) and (
+                node.name == name or _original_name(node) == name):
             return node
     return None
 
@@ -2754,7 +3187,17 @@ def _module_enum(uri: str, path, name: str):
     if not path:
         return None
     for node in _module_declarations(uri, path) or []:
-        if isinstance(node, G.EnumDecl) and node.name == name:
+        if isinstance(node, G.EnumDecl) and (
+                node.name == name or _original_name(node) == name):
+            return node
+    return None
+
+
+def _module_decl_by_name(uri: str, path, name: str):
+    if not path:
+        return None
+    for node in _module_declarations(uri, path) or []:
+        if node.name == name or _original_name(node) == name:
             return node
     return None
 
@@ -2924,12 +3367,23 @@ def _structural_definition(uri: str, text: str, line: int, character: int):
         except OSError:
             return None
         keyword = "record" if kind == "record_external" else "enum"
-        span = _decl_name_span(target_text, sym["decl"], keyword,
-                               sym["name"])
+        decl_name = sym.get("decl_name") or sym["name"]
+        span = _decl_name_span(target_text, sym["decl"], keyword, decl_name)
         if span is None:
             return None
         return _location(target.as_uri(), target_text, span[0], span[1],
-                         len(sym["name"]))
+                         len(decl_name))
+    if kind in ("fn_external", "let_external"):
+        target = sym.get("path")
+        if target is None:
+            return None
+        try:
+            target_text = target.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        decl_name = sym.get("decl_name") or sym["name"]
+        return _decl_start(target.as_uri(), target_text, sym["decl"],
+                           decl_name)
     if kind == "record":
         span = _decl_name_span(text, sym["decl"], "record", sym["name"])
     elif kind == "enum":
@@ -3450,19 +3904,29 @@ def _member_hover(uri: str, text: str, line: int, character: int):
     for node in _module_declarations(uri, imp["path"]) or []:
         if node.name != name:
             continue
+        original = _original_name(node)
+        renamed = ("" if original == node.name
+                   else "\n\nExported from `%s`." % original)
         if isinstance(node, G.Fn):
             return _fn_hover_text(
                 node, intro="GAMA-L function from `%s`." % imp["path"],
-                qualifier=alias)
+                qualifier=alias) + renamed
         if isinstance(node, G.RecordDecl):
-            scope = _module_record_scope(uri, imp, node.name)
-            scopes = (_record_scopes(scope["uri"], scope["text"],
-                                     scope["ref"], scope["records"],
-                                     scope["aliases"])
-                      if scope is not None else [])
+            original = _original_name(node)
+            scope = _module_record_scope(uri, imp, original)
+            scopes = []
+            if scope is not None:
+                ref = scope["ref"]
+                if original != node.name:
+                    ref = dict(ref, owner=node.name, decl=node)
+                scopes = _record_scopes(scope["uri"], scope["text"], ref,
+                                        scope["records"], scope["aliases"])
             hover = _record_hover_text(node, alias, scopes=scopes)
-            return ("%s\n\nGAMA-L record from `%s` (imported as `%s`)."
-                    % (hover, imp["path"], alias))
+            return ("%s\n\nGAMA-L record from `%s` (imported as `%s`).%s"
+                    % (hover, imp["path"], alias, renamed))
+        if isinstance(node, G.EnumDecl):
+            return ("%s\n\nGAMA-L enum from `%s` (imported as `%s`).%s"
+                    % (_enum_hover_text(node), imp["path"], alias, renamed))
         type_name = _const_type(node)
         value = _const_value(node)
         facts = []
@@ -3471,8 +3935,8 @@ def _member_hover(uri: str, text: str, line: int, character: int):
         if value is not None:
             facts.append("value `%s`" % value)
         detail = ", ".join(facts) if facts else "constant"
-        return ("`%s.%s`\n\nGAMA-L constant from `%s` (%s)."
-                % (alias, name, imp["path"], detail))
+        return ("`%s.%s`\n\nGAMA-L constant from `%s` (%s).%s"
+                % (alias, name, imp["path"], detail, renamed))
     return None
 
 
