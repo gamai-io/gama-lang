@@ -1,0 +1,110 @@
+name: release
+
+# Tag pushes and manual dispatches only. A tag push never publishes: it builds,
+# verifies, packages and uploads artifacts. Publishing to PyPI / the VS Code
+# Marketplace is opt-in via manual dispatch with `publish: true` and the
+# matching repository secrets, and is skipped entirely when secrets are absent.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish to PyPI/Marketplace (requires PYPI_API_TOKEN and VSCE_PAT secrets)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run GAMA-L 2 core tests
+        run: python3 -m unittest discover -s gama-lang/v2/tests -v
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+      VSCE_PAT: ${{ secrets.VSCE_PAT }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build and verification tooling
+        run: python -m pip install --upgrade pip setuptools wheel twine pyyaml
+
+      - name: Install VS Code extension packaging tool
+        run: |
+          npm install -g @vscode/vsce@4.1.0
+          vsce --version
+
+      - name: Validate release workflow YAML
+        run: |
+          python - <<'PY'
+          import pathlib
+          import yaml
+
+          data = yaml.safe_load(pathlib.Path(".github/workflows/release.yml").read_text())
+          assert isinstance(data, dict), "workflow must be a mapping"
+          assert "jobs" in data and "release" in data["jobs"], "missing release job"
+          assert "test" in data["jobs"], "missing test job"
+          print("release.yml: valid YAML; jobs=%s" % ", ".join(sorted(data["jobs"])))
+          PY
+
+      - name: Reproducible release dry run
+        env:
+          KEEP_DIST: ${{ runner.temp }}/dist
+        run: bash gama-lang/v2/scripts/release_dry_run.sh
+
+      - name: Show generated artifacts
+        run: find "${{ runner.temp }}/dist" -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gama-l-release
+          path: ${{ runner.temp }}/dist
+          if-no-files-found: error
+          retention-days: 14
+
+      # Opt-in publishing. The `publish` input defaults to false and tag pushes
+      # never set it, so the default path is artifacts-only. Secrets are read
+      # through `env` because the `secrets` context is not available in step
+      # `if` conditions.
+      - name: Publish wheel to PyPI (opt-in, requires PYPI_API_TOKEN)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish == true && env.PYPI_API_TOKEN != '' }}
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          # release.py's deterministic source archive is not a PEP 517 sdist
+          # (no PKG-INFO) and is intentionally not uploaded. The wheel is the
+          # publishable artifact.
+          python -m twine upload --skip-existing "${{ runner.temp }}"/dist/*.whl
+
+      - name: Publish VS Code extension (opt-in, requires VSCE_PAT)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish == true && env.VSCE_PAT != '' }}
+        run: |
+          vsce publish --packagePath "${{ runner.temp }}"/dist/*.vsix

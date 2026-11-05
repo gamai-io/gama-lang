@@ -134,7 +134,69 @@ bash scripts/verify_release.sh
 
 The wheel ships code only; `gama-l doctor` needs a tree with `examples/`, so
 run it from the source checkout or pass `--root` to a directory that exposes
-`examples/`. Publishing (PyPI, VS Code Marketplace) stays manual.
+`examples/`.
+
+### Release dry run (recommended gate)
+
+`scripts/release_dry_run.sh` is the single "everything except publish" gate. It
+builds twice, verifies hashes, installs the wheel into a fresh virtualenv, runs
+the shipped CLI and doctor, checks the wheel with `twine` when available,
+packages the VSIX when `vsce` is available, and prints a manifest with versions,
+sizes, hashes, and tool availability. All work happens in a temporary directory.
+
+```bash
+cd gama-lang/v2
+bash scripts/release_dry_run.sh
+
+# Optional: keep the verified artifacts + manifest (outside the repo, e.g. CI)
+KEEP_DIST=/tmp/gama-l-dist bash scripts/release_dry_run.sh
+```
+
+Exact checks:
+
+1. `release.py build --out dist-a` and `release.py build --out dist-b`; the
+   wheel and sdist SHA-256 must match across both builds.
+2. `release.py verify --out dist-a` and `sha256sum -c SHA256SUMS`.
+3. `python3 -m venv`, install the wheel with `--no-index --no-deps`, then
+   `gama-l --help`, `gama-l run examples/hello.gm`, and
+   `gama-l doctor --json --root <temp-root>` (8/8).
+4. `twine check` on the wheel when twine is installed.
+5. `vsce package` (or cached `npx --no-install @vscode/vsce`) when available.
+6. A manifest containing the core version, extension version, artifact sizes
+   and hashes, doctor result, and tool matrix.
+
+Limitations:
+
+- `release.py` writes a deterministic *source* archive, not a PEP 517 sdist (it
+  has no `PKG-INFO`). `twine check` therefore validates the wheel only; the
+  sdist is covered by `release.py verify` and `sha256sum`. The sdist is not
+  directly PyPI-uploadable.
+- `twine` and `vsce` are optional. Missing tools are reported and skipped; real
+  build/checksum/install/CLI/doctor failures exit non-zero.
+- Byte-reproducibility is checked within a single run on the same
+  Python/toolchain (two builds); builds on different Python versions are not
+  compared.
+- Artifacts are never written into the repository (the `dist/` directories are
+  git-ignored) and nothing is published. `KEEP_DIST` is only for CI/scratch
+  space, not for committing.
+- `gama-l doctor` runs against the installed wheel by pointing `--root` at a
+  temporary directory that symlinks the source `examples/`.
+
+### Release workflow (tag → artifacts; publish is opt-in)
+
+`.github/workflows/release.yml` runs on `v*` tag pushes and on manual dispatch.
+It runs the full test suite (Python 3.10 and 3.12), then the release job runs
+`scripts/release_dry_run.sh` with `KEEP_DIST` set, validates the workflow YAML,
+and uploads `dist` (wheel, sdist, `SHA256SUMS`, `RELEASE.json`, manifest, and
+VSIX when packaged) as the `gama-l-release` artifact.
+
+- Concurrency: `release-${{ github.ref }}` with `cancel-in-progress: false`.
+- Timeouts: 20 minutes for tests, 30 minutes for release.
+- A tag push **never publishes**: it builds and uploads artifacts only.
+- Publishing is opt-in via manual dispatch with `publish: true` **and**
+  repository secrets. The PyPI step requires `PYPI_API_TOKEN`; the VS Code
+  Marketplace step requires `VSCE_PAT`. Without those secrets the publish steps
+  are skipped and only artifacts are uploaded.
 
 ## Doctor
 
@@ -354,7 +416,8 @@ Conformance: see `CONFORMANCE.md` (SPEC 2.0 T1–T10: **PASS 10/10**, including 
 - full type inference and structural subtyping; multiple/higher-kinded bounds and generic record/enum bounds
 - formatter remaining edges: a comment *before* a binary operator has no legal source position (the grammar only breaks after an operator), so the defensive renderer keeps it after the operator; comments in a commented `fn` effects set use source order (uncommented sets stay sorted); indivisible tokens longer than the width still overflow
 - VS Code Marketplace signing/publishing (VSIX packaging is reproducible locally)
-- publishing a built release to PyPI (build/checksums/verify work)
+- publishing a built release by default: the release workflow has secret-gated,
+  opt-in PyPI/Marketplace steps, but tag pushes only build and upload artifacts
 
 The old v0.1 transpiler remains in `gama-lang/` for reference. Do not call this
 full 2.0 until the remaining conformance tests and connectors are done.
