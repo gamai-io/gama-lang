@@ -269,16 +269,15 @@ class BoundErasureAndIrTests(unittest.TestCase):
         self.assertEqual(
             gama_ir.run_program(ast).out, ['Box { value: "z" }'])
 
-    def test_ir_still_rejects_record_methods_with_bounds(self):
-        ast = G.check(
+    def test_ir_runs_record_methods_with_bounds(self):
+        src = (
             'record Box<T: Text> {\n'
             '  value: T\n'
             '  fn get(self: Box<T>) -> T { return self.value }\n'
             '}\n'
             'print Box("x")\n')
-        with self.assertRaisesRegex(gama_ir.IRUnsupported,
-                                    r"record methods"):
-            gama_ir.run_program(ast)
+        self.assertEqual(gama_ir.run_program(G.check(src)).out,
+                         G.run(src).out)
 
 
 if __name__ == "__main__":
