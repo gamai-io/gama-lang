@@ -7,8 +7,9 @@ Syntax::
 
 A bound is one of the base types ``Int``, ``Decimal``, ``Text`` or ``Bool``,
 or a declared record/enum.  Exactly one bound per parameter; there are no
-multiple bounds, no bounds on records/enums, no higher-kinded bounds, and no
-generic lambdas.  Bounds are a checker-only contract: runtime erasure is
+multiple bounds and no higher-kinded bounds.  Records and enums can also
+declare bounds (see ``test_generic_bounds.py``); the function-bound tests here
+keep their original scope.  Bounds are a checker-only contract: runtime erasure is
 unchanged (``T`` -> ``Any``), explicit call type arguments are checked against
 the bound, and inferred calls accept values compatible with the bound
 (``Int``/``Decimal`` are mutually compatible for a numeric bound).  A value
@@ -51,13 +52,15 @@ class BoundParsingTests(unittest.TestCase):
         self.assertEqual(fn.type_params, ["T"])
         self.assertEqual(fn.type_param_bounds, {})
 
-    def test_bound_on_record_is_rejected(self):
-        with self.assertRaisesRegex(G.GamaError, r"bounds are only supported"):
-            G.check('record Box<T: Int> { v: T }\n')
+    def test_parse_captures_record_bound(self):
+        rec = G.parse('record Box<T: Int> { v: T }\n')[0]
+        self.assertEqual(rec.type_params, ["T"])
+        self.assertEqual(rec.type_param_bounds, {"T": "Int"})
 
-    def test_bound_on_enum_is_rejected(self):
-        with self.assertRaisesRegex(G.GamaError, r"bounds are only supported"):
-            G.check('enum Box<T: Int> { Empty }\n')
+    def test_parse_captures_enum_bound(self):
+        enum = G.parse('enum Box<T: Int> { Empty }\n')[0]
+        self.assertEqual(enum.type_params, ["T"])
+        self.assertEqual(enum.type_param_bounds, {"T": "Int"})
 
     def test_multiple_bounds_are_rejected(self):
         with self.assertRaises(G.GamaError):

@@ -288,7 +288,7 @@ class Lambda: params: list; ret: str | None; effects: set | None; body: list; li
 @dataclass
 class Match: expr: Any; arms: list; line: int; col: int
 @dataclass
-class EnumDecl: name: str; variants: list; line: int; col: int; exported: bool = False; type_params: list = field(default_factory=list)
+class EnumDecl: name: str; variants: list; line: int; col: int; exported: bool = False; type_params: list = field(default_factory=list); type_param_bounds: dict = field(default_factory=dict)
 @dataclass
 class If: cond: Any; then: list; other: list | None; line: int; col: int
 @dataclass
@@ -302,7 +302,7 @@ class Try: expr: Any; line: int; col: int
 @dataclass
 class Method: name: str; params: list; ret: str | None; effects: set | None; body: list; line: int; col: int; end_line: int = 0; end_col: int = 0
 @dataclass
-class RecordDecl: name: str; fields: list; line: int; col: int; exported: bool = False; methods: list = field(default_factory=list); type_params: list = field(default_factory=list)
+class RecordDecl: name: str; fields: list; line: int; col: int; exported: bool = False; methods: list = field(default_factory=list); type_params: list = field(default_factory=list); type_param_bounds: dict = field(default_factory=dict)
 @dataclass
 class RecordLit: name: str; fields: list; line: int; col: int
 @dataclass
@@ -491,7 +491,7 @@ class Parser:
     def record_decl(self):
         x = self.take()  # `record`
         name = self.expect("IDENT").val
-        type_params, _bounds = self.type_params()
+        type_params, type_param_bounds = self.type_params(allow_bounds=True)
         self.skip_nl()
         self.expect("OP", "{")
         self.skip_seps()
@@ -514,7 +514,8 @@ class Parser:
                 self.take(); self.skip_seps()
         self.expect("OP", "}")
         return RecordDecl(name, fields, x.line, x.col, methods=methods,
-                          type_params=type_params)
+                          type_params=type_params,
+                          type_param_bounds=type_param_bounds)
     def method(self):
         x = self.take()  # `fn`
         name_tok = self.peek()
@@ -584,8 +585,8 @@ class Parser:
 
         Generic type parameters are erased to ``Any`` at runtime; parsing only
         captures the names so the checker and formatter can round-trip them.
-        Named functions may add one nominal upper bound per parameter
-        (``<T: Text>``); records and enums reject bounds.
+        Named functions, records and enums may add one nominal upper bound per
+        parameter (``<T: Text>``).
         """
         if not self.at("OP", "<"):
             return [], {}
@@ -734,7 +735,7 @@ class Parser:
         name = self.expect("IDENT").val
         if "." in name:
             raise GamaError("enum name must be a simple identifier", x.line, x.col)
-        type_params, _bounds = self.type_params()
+        type_params, type_param_bounds = self.type_params(allow_bounds=True)
         self.expect("OP", "{"); self.skip_seps()
         variants = []
         while not self.at("OP", "}"):
@@ -769,7 +770,8 @@ class Parser:
                 y = self.peek()
                 raise GamaError("expected ',' or '}' in enum", y.line, y.col)
         self.expect("OP", "}")
-        return EnumDecl(name, variants, x.line, x.col, type_params=type_params)
+        return EnumDecl(name, variants, x.line, x.col, type_params=type_params,
+                        type_param_bounds=type_param_bounds)
     def match_stmt(self):
         x = self.take(); subject = self.expr(); self.skip_nl(); self.expect("OP", "{")
         arms = []
@@ -1583,6 +1585,7 @@ class Checker:
         self.records: dict[str, RecordDecl] = {}
         self.enums: dict[str, set[str]] = {}
         self.enum_params: dict[str, list[str]] = {}
+        self.enum_bounds: dict[str, dict[str, str]] = {}
         self.effects: set[str] = set()
         self.ret_type: str | None = None
         self.loop_depth = 0
@@ -1646,8 +1649,80 @@ class Checker:
             if rec in self.records:
                 return rec, ".".join(parts[i:])
         return None
+    def _check_decl_bounds(self, node):
+        """Validate the bounds declared on a record/enum.
+
+        Runs after every record/enum is registered so a bound may name a
+        declaration that appears later in the file.  A bound must be one base
+        type or a declared record/enum used without type arguments.
+        """
+        params = list(getattr(node, "type_params", None) or [])
+        bounds = dict(getattr(node, "type_param_bounds", None) or {})
+        seen = set(params)
+        for tp in params:
+            bound = bounds.get(tp)
+            if not bound:
+                continue
+            base, args = _type_ref_parts(bound)
+            if args:
+                raise GamaTypeError(
+                    f"type parameter {tp} bound must be a simple type, "
+                    f"got {bound}", node.line, node.col)
+            if base in seen or not (base in BOUND_BASE_TYPES
+                                    or base in self.records
+                                    or base in self.enums):
+                raise GamaTypeError(
+                    f"unknown bound {bound} for type parameter {tp}",
+                    node.line, node.col)
+
+    def _decl_type_params_and_bounds(self, base):
+        """``(type_params, bounds)`` for a declared generic record/enum."""
+        rec = self.records.get(base)
+        if rec is not None:
+            return (list(getattr(rec, "type_params", None) or []),
+                    dict(getattr(rec, "type_param_bounds", None) or {}))
+        eparams = self.enum_params.get(base)
+        if eparams is not None:
+            return list(eparams), dict(self.enum_bounds.get(base) or {})
+        return None, None
+
+    def _check_type_arg_bounds(self, base, args, line, col, params=None):
+        """Check explicit type arguments against the declaration's bounds."""
+        params = self._type_param_names() if params is None else set(params)
+        tparams, bounds = self._decl_type_params_and_bounds(base)
+        if tparams is None or len(args) != len(tparams):
+            return  # arity is reported by the annotation/call path
+        for tp, arg in zip(tparams, args):
+            bound = bounds.get(tp)
+            if not bound:
+                continue
+            abase, _aargs = _type_ref_parts(arg)
+            if abase in params:
+                continue  # unknown concrete type (an in-scope type parameter)
+            bbase, _bargs = _type_ref_parts(bound)
+            if not self.compat(abase, bbase):
+                raise GamaTypeError(
+                    f"{base}: type argument {abase} != bound {bbase} for {tp}",
+                    line, col)
+
+    def _check_inferred_bound(self, where, tp, got, bound, line, col):
+        """Constructor inference: reject a payload that cannot satisfy a bound.
+
+        A value already erased to ``Any`` (a type parameter from an enclosing
+        generic function) is accepted because its concrete type is unknown,
+        mirroring function-call inference.
+        """
+        if not bound or got == "Any":
+            return
+        base, _args = _type_ref_parts(got)
+        bbase, _bargs = _type_ref_parts(bound)
+        if not self.compat(base, bbase):
+            raise GamaTypeError(
+                f"{where}: type parameter {tp} {base} != bound {bbase}",
+                line, col)
+
     def _check_type_annotation(self, t, line, col, params=None):
-        """Validate generic type-ref arity; unknown simple names stay lenient."""
+        """Validate generic type-ref arity and bounds; unknown names stay lenient."""
         if t is None:
             return
         params = self._type_param_names() if params is None else set(params)
@@ -1666,6 +1741,7 @@ class Checker:
                     f"{base} expects {want} type argument"
                     f"{'s' if want != 1 else ''}, got {len(args)}",
                     line, col)
+            self._check_type_arg_bounds(base, args, line, col, params)
             for a in args:
                 self._check_type_annotation(a, line, col, params)
             return
@@ -1677,6 +1753,7 @@ class Checker:
                     f"{base} expects {want} type argument"
                     f"{'s' if want != 1 else ''}, got {len(args)}",
                     line, col)
+            self._check_type_arg_bounds(base, args, line, col, params)
             for a in args:
                 self._check_type_annotation(a, line, col, params)
             return
@@ -1848,6 +1925,8 @@ class Checker:
                     seen.add(vn)
                 self.enums[s.name] = {vn: vp for vn, vp, _vl, _vc in s.variants}
                 self.enum_params[s.name] = tparams
+                self.enum_bounds[s.name] = dict(
+                    getattr(s, "type_param_bounds", None) or {})
         # Enum payloads may name enum type parameters or other generic enums;
         # validate their arity once every declaration is registered.
         for s in stmts:
@@ -1857,6 +1936,16 @@ class Checker:
             for _vn, vp, vl, vc in s.variants:
                 for pt in _payload_type_list(vp):
                     self._check_type_annotation(pt, vl, vc, params)
+        # Bounds may name a record/enum declared later, so validate them only
+        # after every declaration is registered.
+        for s in stmts:
+            if isinstance(s, (RecordDecl, EnumDecl)):
+                try:
+                    self._check_decl_bounds(s)
+                except GamaError as e:
+                    if e.src is None:
+                        e.src = getattr(s, "_src", None)
+                    raise
         # Method bodies are checked after every record, function and enum is
         # registered so a method can call records/functions/enums declared
         # later in the file (and other methods of the same record).
@@ -2073,6 +2162,11 @@ class Checker:
         """
         rec = self.records[record_name]
         params = set(getattr(rec, "type_params", None) or [])
+        if m.params:
+            sbase, sargs = _type_ref_parts(m.params[0].type_name)
+            if sargs:
+                self._check_type_arg_bounds(sbase, sargs, m.line, m.col,
+                                            params=params)
         self.push()
         self.type_params.append(params)
         try:
@@ -2463,12 +2557,26 @@ class Checker:
                             f"{len(rec_args)}", e.line, e.col)
                     for targ in rec_args:
                         self._check_type_annotation(targ, e.line, e.col)
+                    self._check_type_arg_bounds(
+                        e.name, rec_args, e.line, e.col)
                     bindings = dict(zip(rec.type_params, rec_args))
                 else:
                     bindings = None
-                for (fn, ft), a in zip(rec.fields, e.args):
+                arg_types = [self.expr(a, row) for a in e.args]
+                if not rec_args:
+                    # A bound can be enforced from the payload alone, so an
+                    # unannotated ``Box(1)`` is still rejected when T: Text.
+                    rec_params = set(getattr(rec, "type_params", None) or [])
+                    rec_bounds = dict(
+                        getattr(rec, "type_param_bounds", None) or {})
+                    for (fn, ft), at in zip(rec.fields, arg_types):
+                        fbase, fargs = _type_ref_parts(ft)
+                        if fbase in rec_params and not fargs:
+                            self._check_inferred_bound(
+                                e.name, fbase, at, rec_bounds.get(fbase),
+                                e.line, e.col)
+                for (fn, ft), at in zip(rec.fields, arg_types):
                     want = self.resolve_field_type(e.name, ft, bindings)
-                    at = self.expr(a, row)
                     if not self.compat(at, want):
                         raise GamaTypeError(
                             f"{e.name}.{fn}: {at} != {want}", e.line, e.col)
@@ -2524,9 +2632,16 @@ class Checker:
                             f"{'s' if len(payload_types) != 1 else ''}, "
                             f"got {len(e.args)}", e.line, e.col)
                     eparams = set(self.enum_params.get(base) or [])
+                    ebounds = dict(self.enum_bounds.get(base) or {})
                     for idx, (arg, ptype) in enumerate(
                             zip(e.args, payload_types)):
                         at = self.expr(arg)
+                        if ptype in eparams:
+                            # ``Some(5)`` infers T=Int and must satisfy the
+                            # enum's declared bound.
+                            self._check_inferred_bound(
+                                e.name, ptype, at, ebounds.get(ptype),
+                                e.line, e.col)
                         want = _erase_type_ref(ptype, eparams)
                         if not self.compat(at, want):
                             where = ("" if len(payload_types) == 1
@@ -2783,16 +2898,24 @@ def _rename_refs(node, mapping):
             if isinstance(p, tuple):
                 return tuple(_rename_type_ref(x, pmap) for x in p)
             return _rename_type_ref(p, pmap)
+        bounds = getattr(node, "type_param_bounds", None) or {}
         return replace(
             node, name=mapping.get(node.name, node.name),
             variants=[(vn, _payload(vp), vl, vc)
-                      for vn, vp, vl, vc in node.variants])
+                      for vn, vp, vl, vc in node.variants],
+            type_param_bounds={k: _rename_type_ref(v, pmap)
+                               for k, v in bounds.items()})
     if isinstance(node, RecordDecl):
+        own = set(getattr(node, "type_params", None) or [])
+        pmap = {k: v for k, v in mapping.items() if k not in own}
+        bounds = getattr(node, "type_param_bounds", None) or {}
         return replace(
             node, name=mapping.get(node.name, node.name),
             fields=[(fn, _rename_type_ref(ft, mapping))
                     for fn, ft in node.fields],
-            methods=[_rename_refs(m, mapping) for m in node.methods])
+            methods=[_rename_refs(m, mapping) for m in node.methods],
+            type_param_bounds={k: _rename_type_ref(v, pmap)
+                               for k, v in bounds.items()})
     if isinstance(node, Method):
         return replace(
             node,

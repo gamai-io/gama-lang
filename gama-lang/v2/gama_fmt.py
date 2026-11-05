@@ -1342,7 +1342,8 @@ class _AstFormatter:
             return "make"
         return "fn"
 
-    def _type_params_text(self, s) -> str:
+    @staticmethod
+    def _type_params_text(s) -> str:
         names = getattr(s, "type_params", None) or []
         bounds = getattr(s, "type_param_bounds", None) or {}
         parts = [(str(n) + (": " + str(bounds[n]) if n in bounds else ""))
@@ -2136,8 +2137,7 @@ class _AstFormatter:
     @classmethod
     def _enum_text(cls, s) -> str:
         parts = [cls._enum_variant_text(v) for v in s.variants]
-        names = getattr(s, "type_params", None) or []
-        name = s.name + ("<" + ", ".join(names) + ">" if names else "")
+        name = s.name + cls._type_params_text(s)
         if not parts:
             return "enum " + name + " { }"
         return "enum " + name + " { " + ", ".join(parts) + " }"
