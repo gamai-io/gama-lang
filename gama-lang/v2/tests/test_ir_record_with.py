@@ -14,8 +14,8 @@ Semantics under test (mirrored from ``tests/test_record_with.py``):
   ``IRRuntimeError`` with the interpreter's wording when the AST is unchecked.
 * Namespaced records (``geo.Point`` / ``geo.origin``) work through the core
   loader's flattened aliased imports.
-* In-place field assignment ``p.x := 3`` stays out of the IR subset and is
-  rejected explicitly (``IRUnsupported``), never silently shadowed.
+* In-place field assignment ``p.x := 3`` is supported with interpreter parity
+  and mutates the receiver in place (see ``tests/test_ir_record_update.py``).
 """
 import pathlib
 import sys
@@ -180,19 +180,17 @@ class IRRecordWithMatchesInterpreter(unittest.TestCase):
         self.assertIn("unknown record Ghost", str(got.exception))
 
     # -- explicit limits --------------------------------------------------
-    def test_in_place_field_assignment_stays_unsupported(self):
+    def test_in_place_field_assignment_now_supported(self):
         for src in (
                 'record Point { x: Int, y: Int }\n'
                 'let p = Point(1, 2)\n'
-                'p.x := 3\n',
+                'p.x := 3\nprint p\n',
                 'record Point { x: Int, y: Int }\n'
                 'record Line { a: Point, b: Point }\n'
                 'let l = Line(Point(1, 2), Point(3, 4))\n'
-                'l.a.x := 5\n',
+                'l.a.x := 5\nprint l\n',
         ):
-            with self.assertRaisesRegex(
-                    IR.IRUnsupported, r"record field assignment"):
-                IR.compile_program(G.parse(src))
+            self.assert_same(src)
 
 
 class IRRecordWithNamespaced(unittest.TestCase):

@@ -121,16 +121,6 @@ class RecordUpdateTests(unittest.TestCase):
                 it.out,
                 ["geo.Point { x: 7, y: 0 }", "7",
                  "geo.Point { x: 1, y: 9 }", "True"])
-    def test_ir_rejects_field_assignment(self):
-        # The IR value model has no in-place record mutation; reject instead of
-        # silently creating a `p.x` shadow variable.
-        import gama_ir as IR
-        ast = G.check(
-            'record Point { x: Int, y: Int }\n'
-            'let p = Point(1, 2)\n'
-            'p.x := 3\n')
-        with self.assertRaisesRegex(IR.IRUnsupported, r"record field assignment"):
-            IR.compile_program(ast)
 
 
 if __name__ == "__main__":

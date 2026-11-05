@@ -24,7 +24,10 @@ Literals: ``Int``, ``Decimal``, ``Text``, ``Bool``, ``null``, list literals
 Record construction (positional ``Point(1, 2)`` and named
 ``Point { x: 1, y: 2 }``), record copy/``with`` updates
 (``p with { x = 3 }``, shallow, producing a new value of the same nominal
-type), field access ``p.x`` (walking record fields and map keys), enum
+type), in-place field assignment (``p.x := 3`` / ``l.a.x := 5``, mutating the
+receiver :class:`gamal2.RecordVal` so aliases observe the update; namespaced
+targets such as ``geo.origin.x := 7`` resolve through the longest bound dotted
+prefix), field access ``p.x`` (walking record fields and map keys), enum
 variants ``Color.Red`` and payload constructors ``Some(5)`` /
 ``Option.Some(5)`` (bare when unambiguous), unary ``!``/``-``; binary ``+ - * / %``,
 comparisons ``== != < <= > >=`` and short-circuit ``&&``/``||``; indexing
@@ -67,9 +70,12 @@ Limitations (raise ``IRUnsupported`` / documented runtime errors)
   exposes module declarations as dotted names (``math.add``, ``math.pi``,
   ``geo.Point``) and this backend resolves them against the same function,
   global and nominal-type tables it uses for local names.
-* In-place record field assignment (``p.x := 3``) is interpreter-only; the
-  compiler rejects it with :class:`IRUnsupported` instead of silently creating
-  a shadow variable. Record copy/``with`` updates *are* supported: an
+* In-place record field assignment (``p.x := 3``, ``l.a.x := 5``,
+  ``geo.origin.x := 7``) *is* supported and mutates the receiver record, so
+  aliases observe the change.  The value is evaluated before the receiver is
+  resolved, and runtime failures (non-record receiver, unknown field, unknown
+  base variable) raise :class:`IRRuntimeError` with the interpreter's wording.
+  Record copy/``with`` updates are also supported: an
   ``expr with { field = value, ... }`` compiles to a shallow copy of the
   receiver with the named fields replaced (declaration order preserved), and
   the original value is left untouched.
@@ -557,13 +563,16 @@ class _Compiler:
             self.emit("LET", stmt.name)
             return
         if isinstance(stmt, g2.Assign):
-            if "." in stmt.name:
-                # Field assignment mutates a record in place; the IR value
-                # model has no record mutation, so reject it instead of
-                # silently creating a shadow variable.
-                _unsupported(stmt, "record field assignment")
+            # Evaluate the value first, exactly like the interpreter.  A dotted
+            # target that is not itself bound mutates a record field in place
+            # (resolved at run time, since the receiver and any exact dotted
+            # binding depend on the active frames); a plain target updates the
+            # nearest binding.
             self.compile_expr(stmt.expr)
-            self.emit("ASSIGN", stmt.name)
+            if "." in stmt.name:
+                self.emit("ASSIGN_DOTTED", (stmt.name, stmt.line, stmt.col))
+            else:
+                self.emit("ASSIGN", stmt.name)
             return
         if isinstance(stmt, g2.Use):
             self.emit("NOP")
@@ -1119,6 +1128,52 @@ class _VM:
         return g2.RecordVal(
             base.type_name, {fn: updated[fn] for fn in decl})
 
+    @staticmethod
+    def _env_has(frame: Frame, name: str) -> bool:
+        """Whether ``name`` resolves to an existing binding (like ``env_has``)."""
+        try:
+            frame.get(name)
+            return True
+        except IRRuntimeError:
+            return False
+
+    def _assign_field(self, frame: Frame, name: str, value: Any,
+                      line: int, col: int) -> None:
+        """Mutate a record field in place for a dotted assignment target.
+
+        Mirrors :meth:`gamal2.Interpreter.assign_field`: the longest dotted
+        variable prefix bound in ``frame`` is the receiver, remaining segments
+        descend through nested records, and only ``RecordVal`` receivers are
+        accepted.  Because :class:`gamal2.RecordVal` stores its fields in a
+        shared dict, aliases observe the update, matching the interpreter.
+        """
+        parts = name.split(".")
+        base_n = None
+        for i in range(len(parts) - 1, 0, -1):
+            if self._env_has(frame, ".".join(parts[:i])):
+                base_n = i
+                break
+        if base_n is None:
+            raise IRRuntimeError(
+                f"unknown variable {parts[0]} in assignment target {name}",
+                line, col)
+        obj = frame.get(".".join(parts[:base_n]))
+        for part in parts[base_n:-1]:
+            if not isinstance(obj, g2.RecordVal):
+                raise IRRuntimeError(
+                    f"cannot assign field {part!r} on non-record value",
+                    line, col)
+            if part not in obj.fields:
+                raise IRRuntimeError(f"unknown field {name}", line, col)
+            obj = obj.fields[part]
+        if not isinstance(obj, g2.RecordVal):
+            raise IRRuntimeError(
+                f"cannot assign field {parts[-1]!r} on non-record value",
+                line, col)
+        if parts[-1] not in obj.fields:
+            raise IRRuntimeError(f"unknown field {name}", line, col)
+        obj.fields[parts[-1]] = value
+
     # -- interpreter loop ------------------------------------------------
     def _exec(self, code: Code, frame: Frame) -> Any:
         instrs = code.instrs
@@ -1141,6 +1196,17 @@ class _VM:
                 frames[-1].define(arg, stack.pop())
             elif op == "ASSIGN":
                 frames[-1].assign(arg, stack.pop())
+            elif op == "ASSIGN_DOTTED":
+                # ``name := value`` where ``name`` contains dots: an exact
+                # binding wins (plain assignment), otherwise mutate the record
+                # field in place, exactly like ``Interpreter.stmt``.
+                name, line, col = arg
+                value = stack.pop()
+                frame = frames[-1]
+                if self._env_has(frame, name):
+                    frame.assign(name, value)
+                else:
+                    self._assign_field(frame, name, value, line, col)
             elif op == "UNARY":
                 value = stack.pop()
                 stack.append((not _truth(value)) if arg == "!" else -value)
