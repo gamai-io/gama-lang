@@ -66,6 +66,21 @@ and hover read the imported file's direct top-level `fn` declarations
 Signature help works for known builtins, user `fn`/lambda-typed `let` values,
 and namespaced module functions.
 
+Generic named functions are reflected in hover and signature help with their
+declared type parameters (`fn id<T>(x: T) -> T`, `fn pair<A, B>(...)`) and a
+`Type parameters: ... (position N)` summary; parameters that use a type
+parameter carry a matching `type parameter` note. Completion after `id<`
+offers type parameters that are in scope from an enclosing generic function,
+then the callee's declared type parameters for context, then the built-in type
+names; `fn id<` offers the built-in type names only (type-parameter names are
+chosen by the author and cannot be inferred). The core parser still reads
+`id<Int>(1)` as comparisons and reports `unknown variable Int`; the LSP
+nevertheless recovers explicit arguments for signature help when the base
+name resolves to a generic `fn` declaration. Semantic tokens mark declared
+type-parameter names as types. This recovery is LSP-only: only `id<Int>(` is
+resolved, not nested/dotted type arguments, and the diagnostic remains
+accurate for the unsupported syntax.
+
 The core exposes a module's top-level `let` constants as `alias.name`, typed
 and evaluated at import time, and module functions see the same renamed
 binding. Any other non-declaration top-level statement under an alias

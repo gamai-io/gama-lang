@@ -324,6 +324,21 @@ MEMBER_CTX_RE = re.compile(
 MEMBER_CHAIN_RE = re.compile(
     r"([A-Za-z_][A-Za-z0-9_]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)*)"
     r"\s*\.\s*$")
+# Explicit type-argument position: `id<` or `id<Int, ` (no whitespace
+# before `<`, so ordinary comparisons such as `a < b` never match).
+TYPE_ARG_CTX_RE = re.compile(
+    r"([A-Za-z_][A-Za-z0-9_]*)<([A-Za-z0-9_,\s]*)$")
+# Type-parameter declaration position: `fn id<` or `fn id<A, `.
+TYPE_PARAM_DECL_CTX_RE = re.compile(
+    r"\bfn\s+[A-Za-z_][A-Za-z0-9_]*\s*<([A-Za-z0-9_,\s]*)$")
+# One complete explicit type argument (the core parser does not accept
+# these at call sites yet; the LSP only reasons about them).
+TYPE_ARGS_RE = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*")
+# Header of a generic named function, used to find type parameters that are
+# in scope at the cursor. Matches across line breaks inside `<...>`.
+FN_TYPE_PARAM_HEADER_RE = re.compile(
+    r"\bfn\s+[A-Za-z_][A-Za-z0-9_]*\s*<([A-Za-z0-9_,\s]*)>")
 # Tail of a line that is an incomplete member expression (`print p.x`).
 LINE_CHAIN_TAIL_RE = re.compile(
     r"([A-Za-z_][A-Za-z0-9_]*)(?:\s*\.\s*[A-Za-z0-9_]*)*"
@@ -441,6 +456,41 @@ def lambda_signature(node, prefix="fn") -> str:
                           node.ret, node.effects)
 
 
+def _type_param_names(node) -> list:
+    """Declared generic type parameters of a snippet node, in order."""
+    return [str(name) for name in (getattr(node, "type_params", None) or [])]
+
+
+def _type_param_positions(node) -> list:
+    """``[{"name": "T", "position": 0}, ...]`` for a generic function."""
+    return [{"name": name, "position": i}
+            for i, name in enumerate(_type_param_names(node))]
+
+
+def _type_param_doc(node) -> str | None:
+    positions = _type_param_positions(node)
+    if not positions:
+        return None
+    return "Type parameters: " + ", ".join(
+        "`%s` (position %d)" % (item["name"], item["position"])
+        for item in positions)
+
+
+def _fn_hover_text(node, intro=None, qualifier=None) -> str:
+    """Markdown hover text for an ``fn`` declaration, including generics."""
+    signature = fn_signature(node)
+    if qualifier:
+        signature = "%s.%s" % (qualifier, signature)
+    label = "fn %s" % signature
+    names = _type_param_names(node)
+    if names:
+        body = intro or "GAMA-L generic function `%s`." % node.name
+        return "`%s`\n\n%s\n\n%s" % (label, body, _type_param_doc(node))
+    if intro:
+        return "`%s`\n\n%s" % (label, intro)
+    return "`%s`\n\nGAMA-L function `%s`." % (label, node.name)
+
+
 def doc_names(text: str):
     """Return {name: kind} for let/fn declarations in the document."""
     out = {}
@@ -460,6 +510,21 @@ def _line_prefix(text: str, line: int, character: int) -> str:
 def _line_text(text: str, line: int) -> str:
     rows = (text or "").split("\n")
     return rows[line] if 0 <= line < len(rows) else ""
+
+
+def _document_without_line(text: str, line: int) -> str:
+    """Document text with ``line`` blanked, for parsing around a live edit.
+
+    Feature requests routinely arrive while the current line is syntactically
+    incomplete (``print id<``). Removing just that line lets the rest of the
+    declarations parse so hover/signature/completion can still resolve known
+    functions instead of falling back to builtins only.
+    """
+    rows = (text or "").split("\n")
+    if 0 <= line < len(rows):
+        rows = list(rows)
+        rows[line] = ""
+    return "\n".join(rows)
 
 
 def _imports(text: str):
@@ -988,6 +1053,127 @@ def _member_type_items(text, line, character, parts):
     return items
 
 
+def _first_open_brace(text: str, start: int) -> int:
+    """Index of the first ``{`` after ``start`` that is real code, or -1."""
+    quote = None
+    i = max(0, start)
+    while i < len(text):
+        ch = text[i]
+        if quote is not None:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch == "#":
+            newline = text.find("\n", i)
+            i = len(text) if newline == -1 else newline
+            continue
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "{":
+            return i
+        i += 1
+    return -1
+
+
+def _enclosing_type_params(text: str, line: int,
+                           character: int | None = None) -> list:
+    """Type parameters of the generic function whose body contains the cursor.
+
+    This is a lexical scan (header + matching braces) so it still works while
+    the cursor line is incomplete, which is the normal completion state.
+    """
+    rows = (text or "").split("\n")
+    target = sum(len(row) + 1 for row in rows[:max(0, line)])
+    if character is not None and 0 <= line < len(rows):
+        target += utf16_to_index(rows[line], max(0, character))
+    best = None
+    for match in FN_TYPE_PARAM_HEADER_RE.finditer(text or ""):
+        if match.start() > target:
+            continue
+        brace = _first_open_brace(text, match.end())
+        if brace == -1 or brace > target:
+            continue
+        depth = 0
+        quote = None
+        i = brace
+        end = None
+        while i < len(text):
+            ch = text[i]
+            if quote is not None:
+                if ch == "\\":
+                    i += 2
+                    continue
+                if ch == quote:
+                    quote = None
+            elif ch == "#":
+                newline = text.find("\n", i)
+                i = len(text) if newline == -1 else newline
+                continue
+            elif ch in ("'", '"'):
+                quote = ch
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+            i += 1
+        if end is None:
+            end = len(text)
+        if match.start() <= target <= end:
+            names = [name.strip() for name in match.group(1).split(",")
+                     if name.strip()]
+            best = (match.start(), names)
+    return best[1] if best else []
+
+
+def _type_completion_items(node=None, in_scope=None):
+    """Type completions for a generic declaration or explicit type argument.
+
+    In-scope type parameters come first (these are the only user-defined type
+    names valid at the call site), then the callee's declared parameters as
+    context, then built-in type names. The core parser does not infer
+    type-parameter names, so an *undeclared* ``fn f<`` can only offer the
+    built-in names.
+    """
+    items = []
+    seen = set()
+    for name in in_scope or []:
+        if name in seen:
+            continue
+        seen.add(name)
+        items.append({
+            "label": name,
+            "kind": KIND_TYPE,
+            "detail": "type parameter in scope",
+            "documentation": "Type parameter `%s` from the enclosing "
+                             "generic function." % name,
+        })
+    if node is not None:
+        names = _type_param_names(node)
+        for position, name in enumerate(names):
+            if name in seen:
+                continue
+            seen.add(name)
+            items.append({
+                "label": name,
+                "kind": KIND_TYPE,
+                "detail": "type parameter of %s" % node.name,
+                "documentation": "Generic type parameter `%s` (position %d) "
+                                 "declared by `%s`."
+                                 % (name, position, node.name),
+            })
+    for name in sorted(TYPE_NAMES):
+        if name in seen:
+            continue
+        seen.add(name)
+        items.append({"label": name, "kind": KIND_TYPE})
+    return items
+
+
 def completion(uri: str, text: str, line: int = 0, character: int = 0):
     prefix = _line_prefix(text, line, character)
 
@@ -1064,6 +1250,25 @@ def completion(uri: str, text: str, line: int = 0, character: int = 0):
                  if part.strip()]
         return {"isIncomplete": False,
                 "items": _member_type_items(text, line, character, parts)}
+
+    # Generic type-parameter declaration: ``fn id<`` / ``fn id<A, ``.
+    # Only built-in type names can be suggested because the names are chosen
+    # by the author and cannot be inferred.
+    if TYPE_PARAM_DECL_CTX_RE.search(prefix):
+        return {"isIncomplete": False, "items": _type_completion_items()}
+
+    # Explicit type arguments: ``id<`` / ``id<In``. This intentionally does
+    # not fire for ``a < b`` (no whitespace before ``<``) and only advertises
+    # types when ``id`` resolves to a generic ``fn`` declaration; otherwise
+    # the ordinary completion list is returned unchanged.
+    typed_args = TYPE_ARG_CTX_RE.search(prefix)
+    if typed_args is not None:
+        callee = typed_args.group(1)
+        node = _decl_by_name_at(text, callee, line)
+        if isinstance(node, G.Fn) and _type_param_names(node):
+            return {"isIncomplete": False,
+                    "items": _type_completion_items(
+                        node, _enclosing_type_params(text, line, character))}
 
     items = []
     seen = set()
@@ -2589,12 +2794,56 @@ def _param_by_name(text: str, name: str):
     return None
 
 
-def _decl_hover(text: str, name: str):
-    node = _decl_by_name(text, name)
+def _lookup_with_line_fallback(text: str, name: str, lookup, line=None):
+    """Run ``lookup`` on the document, tolerating one incomplete line.
+
+    Live editing requests often arrive while the current or last line is
+    syntactically incomplete. The whole-document parse then fails, so blank
+    one likely-incomplete line at a time (cursor line first, then the last
+    line, then the rest) until the rest of the declarations parse.
+    """
+    found = lookup(text, name)
+    if found is not None:
+        return found
+    # The document parsed cleanly, so the symbol is genuinely absent; do not
+    # re-parse once per line just to confirm a miss.
+    if _parse_or_none(text) is not None:
+        return None
+    rows = (text or "").split("\n")
+    candidates = []
+    if line is not None:
+        candidates.append(line)
+    if rows:
+        candidates.append(len(rows) - 1)
+    candidates.extend(range(len(rows) - 1, -1, -1))
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen or not (0 <= candidate < len(rows)):
+            continue
+        seen.add(candidate)
+        if len(seen) > 500:
+            break
+        found = lookup(_document_without_line(text, candidate), name)
+        if found is not None:
+            return found
+    return None
+
+
+def _decl_by_name_at(text: str, name: str, line: int | None = None):
+    """Look up a declaration, tolerating an incomplete line being edited."""
+    return _lookup_with_line_fallback(text, name, _decl_by_name, line)
+
+
+def _param_by_name_at(text: str, name: str, line: int | None = None):
+    return _lookup_with_line_fallback(text, name, _param_by_name, line)
+
+
+def _decl_hover(text: str, name: str, line: int | None = None):
+    node = _decl_by_name_at(text, name, line)
     if node is None:
         return None
     if isinstance(node, G.Fn):
-        return "`fn %s`\n\nGAMA-L function `%s`." % (fn_signature(node), name)
+        return _fn_hover_text(node)
     expr = getattr(node, "expr", None)
     if isinstance(expr, G.Lambda):
         return ("`let %s = %s`\n\nGAMA-L function value `%s`."
@@ -2617,8 +2866,9 @@ def _member_hover(uri: str, text: str, line: int, character: int):
         if node.name != name:
             continue
         if isinstance(node, G.Fn):
-            return ("`%s.%s`\n\nGAMA-L function from `%s`."
-                    % (alias, fn_signature(node), imp["path"]))
+            return _fn_hover_text(
+                node, intro="GAMA-L function from `%s`." % imp["path"],
+                qualifier=alias)
         if isinstance(node, G.RecordDecl):
             return ("`%s`\n\nGAMA-L record from `%s` (imported as `%s`)."
                     % (_record_signature_text(node, alias),
@@ -2661,9 +2911,9 @@ def hover(uri: str, text: str, line: int, character: int):
         else:
             value = "GAMA-L builtin `%s`" % name
     if value is None:
-        value = _decl_hover(text, name)
+        value = _decl_hover(text, name, line)
     if value is None:
-        param = _param_by_name(text, name)
+        param = _param_by_name_at(text, name, line)
         if param is not None:
             value = "GAMA-L parameter `%s`: `%s`" % (
                 name, param.type_name or "Any")
@@ -2681,7 +2931,13 @@ def hover(uri: str, text: str, line: int, character: int):
 
 
 def _call_context(prefix: str):
-    """Return (callee, argument_text) for the innermost open call, or None."""
+    """Return ``(callee, argument_text, type_args)`` for the open call.
+
+    ``type_args`` is a list of explicit type arguments when the prefix looks
+    like ``callee<T, U>(``. The core parser does not accept that syntax yet,
+    so callers must only trust ``type_args`` once the base callee resolves to
+    a generic ``fn`` declaration.
+    """
     stack = []
     quote = None
     i = 0
@@ -2708,26 +2964,50 @@ def _call_context(prefix: str):
     j = open_idx - 1
     while j >= 0 and prefix[j] in " \t":
         j -= 1
-    # Explicit call type arguments: ``id<Int>(`` or ``pair<A, B>(``.  Skip a
-    # balanced ``<...>`` clause so the callee name is still found.
+    type_args = None
     if j >= 0 and prefix[j] == ">":
         depth = 0
-        while j >= 0:
-            if prefix[j] == ">":
+        k = j
+        while k >= 0:
+            if prefix[k] == ">":
                 depth += 1
-            elif prefix[j] == "<":
+            elif prefix[k] == "<":
                 depth -= 1
                 if depth == 0:
-                    j -= 1
                     break
-            j -= 1
-        while j >= 0 and prefix[j] in " \t":
-            j -= 1
+            k -= 1
+        if k >= 0:
+            body = prefix[k + 1:j].strip()
+            if body and TYPE_ARGS_RE.fullmatch(body):
+                type_args = [part.strip() for part in body.split(",")]
+                j = k - 1
+                while j >= 0 and prefix[j] in " \t":
+                    j -= 1
+>>>>>>> 7e15a11 (feat(lsp): generic function signatures)
     end = j
     while j >= 0 and (prefix[j].isalnum() or prefix[j] in "_."):
         j -= 1
     callee = prefix[j + 1:end + 1]
-    return callee, prefix[open_idx + 1:] if callee else None
+    if not callee:
+        return None
+    return callee, prefix[open_idx + 1:], type_args
+
+
+def _node_signature(node, type_args=None):
+    """``(label, parameter labels, type parameters, parameter types)``."""
+    names = _type_param_names(node)
+    if type_args and names:
+        mapping = dict(zip(names, type_args))
+        params = ["%s: %s" % (p.name, mapping.get(p.type_name, p.type_name or "Any"))
+                  for p in node.params]
+        ret = mapping.get(node.ret, node.ret or "Any")
+        label = signature_text(
+            "%s<%s>" % (node.name, ", ".join(type_args)), params, ret,
+            node.effects)
+        return (label, params, names,
+                [mapping.get(p.type_name, p.type_name) for p in node.params])
+    return (fn_signature(node), [_param_label(p) for p in node.params],
+            names, [p.type_name for p in node.params])
 
 
 def _active_parameter(args: str) -> int:
@@ -2755,15 +3035,32 @@ def _active_parameter(args: str) -> int:
     return commas
 
 
-def _signature_help(signature, params):
-    active = 0
+def _signature_help(signature, params, type_params=None, param_types=None):
+    type_params = list(type_params or [])
+    parameter_items = []
+    for i, label in enumerate(params):
+        item = {"label": label}
+        type_name = (param_types[i]
+                     if param_types is not None and i < len(param_types)
+                     else None)
+        if type_name and type_name in type_params:
+            item["documentation"] = "type parameter `%s`" % type_name
+        parameter_items.append(item)
+    signature_info = {
+        "label": signature,
+        "parameters": parameter_items,
+    }
+    if type_params:
+        signature_info["documentation"] = {
+            "kind": "markdown",
+            "value": "Type parameters: " + ", ".join(
+                "`%s` (position %d)" % (name, i)
+                for i, name in enumerate(type_params)),
+        }
     return {
-        "signatures": [{
-            "label": signature,
-            "parameters": [{"label": p} for p in params],
-        }],
+        "signatures": [signature_info],
         "activeSignature": 0,
-        "activeParameter": active,
+        "activeParameter": 0,
     }
 
 
@@ -2772,7 +3069,7 @@ def signature_help(uri: str, text: str, line: int, character: int):
     ctx = _call_context(prefix)
     if ctx is None:
         return None
-    callee, args = ctx
+    callee, args, type_args = ctx
     active = _active_parameter(args)
     sig = None
 
@@ -2782,29 +3079,28 @@ def signature_help(uri: str, text: str, line: int, character: int):
         if imp is not None:
             for node in _module_functions(uri, imp["path"]) or []:
                 if node.name == member:
-                    sig = (fn_signature(node),
-                           [_param_label(p) for p in node.params])
+                    sig = _node_signature(node, type_args)
                     break
     elif callee in SIGNATURES:
-        sig = builtin_signature(callee)
+        label, params = builtin_signature(callee)
+        sig = (label, params, [], [])
     else:
-        node = _decl_by_name(text, callee)
+        node = _decl_by_name_at(text, callee, line)
         if isinstance(node, G.Fn):
-            sig = (fn_signature(node),
-                   [_param_label(p) for p in node.params])
+            sig = _node_signature(node, type_args)
         elif isinstance(node, G.Let) and isinstance(node.expr, G.Lambda):
             sig = (lambda_signature(node.expr, "let " + node.name),
-                   [_param_label(p) for p in node.expr.params])
+                   [_param_label(p) for p in node.expr.params], [], [])
         elif node is not None:
-            sig = ("%s(...)" % callee, [])
+            sig = ("%s(...)" % callee, [], [], [])
         else:
-            param = _param_by_name(text, callee)
+            param = _param_by_name_at(text, callee, line)
             if param is not None and param.type_name == "Function":
-                sig = ("%s(...)" % callee, [])
+                sig = ("%s(...)" % callee, [], [], [])
 
     if sig is None:
         return None
-    result = _signature_help(sig[0], sig[1])
+    result = _signature_help(sig[0], sig[1], sig[2], sig[3])
     if result["signatures"][0]["parameters"]:
         result["activeParameter"] = min(
             active, len(result["signatures"][0]["parameters"]) - 1)
@@ -2826,6 +3122,15 @@ T_KEYWORD, T_TYPE, T_FUNCTION, T_VARIABLE, T_STRING, T_NUMBER, T_OP = range(7)
 
 def _fn_names(text: str) -> set:
     return {n.name for n in _declarations(text) if isinstance(n, G.Fn)}
+
+
+def _type_param_names_in(text: str) -> set:
+    """All generic type-parameter names declared in the document."""
+    names = set()
+    for node in _declarations(text):
+        if isinstance(node, G.Fn):
+            names.update(_type_param_names(node))
+    return names
 
 
 def document_symbols(uri: str, text: str):
@@ -2882,11 +3187,11 @@ def _raw_lexeme(src: str, offsets, tok) -> str:
     return str(tok.val)
 
 
-def _token_type(tok, fns):
+def _token_type(tok, fns, type_params=None):
     if tok.kind == "KW":
         return T_KEYWORD
     if tok.kind == "IDENT":
-        if tok.val in TYPE_NAMES:
+        if tok.val in TYPE_NAMES or (type_params and tok.val in type_params):
             return T_TYPE
         if tok.val in G.BUILTINS or tok.val in fns:
             return T_FUNCTION
@@ -2910,13 +3215,14 @@ def semantic_tokens(uri: str, text: str):
     lines = src.split("\n")
     offsets = _line_offsets(src)
     fns = _fn_names(text)
+    type_params = _type_param_names_in(text)
     data = []
     prev_line = 0
     prev_start = 0
     for tok in toks:
         if tok.kind in ("NL", "EOF"):
             continue
-        ttype = _token_type(tok, fns)
+        ttype = _token_type(tok, fns, type_params)
         if ttype is None:
             continue
         line0 = max(0, int(tok.line) - 1)
