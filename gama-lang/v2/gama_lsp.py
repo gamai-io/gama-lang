@@ -430,7 +430,9 @@ def _param_label(param) -> str:
 
 
 def fn_signature(node) -> str:
-    return signature_text(node.name, [_param_label(p) for p in node.params],
+    names = getattr(node, "type_params", None) or []
+    name = node.name + (("<" + ", ".join(names) + ">") if names else "")
+    return signature_text(name, [_param_label(p) for p in node.params],
                           node.ret, node.effects)
 
 

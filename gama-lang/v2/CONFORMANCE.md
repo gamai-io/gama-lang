@@ -75,8 +75,11 @@ These are outside the T1–T10 checks or only partially covered; see
    (`tests/test_enums.py`, `tests/test_payload_enums.py`). `p with { x = 3 }`
    returns a new record and leaves the receiver and its aliases untouched;
    unchanged nested record values are shallow-copied (shared) and updating a
-   replaced field does not affect the receiver. Generics, generic enum
-   variants, record methods, and structural subtyping are missing; the IR
+   replaced field does not affect the receiver. Generics on named functions
+   are implemented with type erasure (`tests/test_generics.py`); generic
+   records/enums, bounds, explicit call type arguments, generic lambdas,
+   generic enum variants, record methods, and structural subtyping are
+   missing; the IR
    prototype supports records, nullary enums and copy/`with` updates (same
    shallow, declaration-ordered semantics) for its documented subset, while
    in-place field assignment remains interpreter-only and is rejected by the

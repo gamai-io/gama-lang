@@ -1327,6 +1327,10 @@ class _AstFormatter:
             return "make"
         return "fn"
 
+    def _type_params_text(self, s) -> str:
+        names = getattr(s, "type_params", None) or []
+        return ("<" + ", ".join(names) + ">") if names else ""
+
     def _params_text(self, params) -> str:
         parts = []
         for p in params:
@@ -1643,7 +1647,8 @@ class _AstFormatter:
         return "\n".join(lines)
 
     def _fn_header(self, s, keyword="fn", named=True) -> str:
-        name = (" " + s.name) if named else ""
+        name = ((" " + s.name + self._type_params_text(s))
+                if named else "")
         ret = (" -> " + s.ret) if s.ret else ""
         prefix = "export " if getattr(s, "exported", False) else ""
         return prefix + keyword + name + "(" + self._params_text(s.params) + ")" + \
@@ -1709,7 +1714,8 @@ class _AstFormatter:
         if self._fits(single + " {", len(ind)) \
                 and not self._effects_has_comment(s):
             return single
-        name = (" " + s.name) if named else ""
+        name = ((" " + s.name + self._type_params_text(s))
+                if named else "")
         ret = (" -> " + s.ret) if s.ret else ""
         prefix = "export " if getattr(s, "exported", False) else ""
         inner = len(ind) + 2

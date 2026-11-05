@@ -282,7 +282,7 @@ class Assign: name: str; expr: Any; line: int; col: int
 @dataclass
 class Param: name: str; type_name: str; default: Any = None
 @dataclass
-class Fn: name: str; params: list; ret: str | None; effects: set | None; body: list; line: int; col: int; exported: bool = False
+class Fn: name: str; params: list; ret: str | None; effects: set | None; body: list; line: int; col: int; type_params: list = field(default_factory=list); exported: bool = False
 @dataclass
 class Lambda: params: list; ret: str | None; effects: set | None; body: list; line: int; col: int
 @dataclass
@@ -511,7 +511,9 @@ class Parser:
         return Method(name, params, ret, effects, body, x.line, x.col,
                       end.line, end.col)
     def fn(self):
-        x = self.take(); name = self.expect("IDENT").val; self.expect("OP", "("); self.skip_nl()
+        x = self.take(); name = self.expect("IDENT").val
+        type_params = self.type_params()
+        self.expect("OP", "("); self.skip_nl()
         params = []
         if not self.at("OP", ")"):
             while True:
@@ -531,7 +533,26 @@ class Parser:
                 effects.add(self.expect("IDENT").val); self.skip_nl()
                 if self.at("OP", ","): self.take(); self.skip_nl()
             self.expect("OP", "}")
-        return Fn(name, params, ret, effects, self.block(), x.line, x.col)
+        return Fn(name, params, ret, effects, self.block(), x.line, x.col,
+                  type_params)
+    def type_params(self):
+        """Optional ``<T>`` / ``<A, B>`` after a function name.
+
+        Generic type parameters are erased to ``Any`` at runtime; parsing only
+        captures the names so the checker and formatter can round-trip them.
+        """
+        if not self.at("OP", "<"):
+            return []
+        self.take(); self.skip_nl()
+        names = []
+        while True:
+            names.append(self.expect("IDENT").val)
+            self.skip_nl()
+            if not self.at("OP", ","):
+                break
+            self.take(); self.skip_nl()
+        self.expect("OP", ">")
+        return names
     def lambda_expr(self):
         x = self.take(); self.expect("OP", "("); self.skip_nl()
         params = []
@@ -1321,8 +1342,21 @@ class Checker:
         self.effects: set[str] = set()
         self.ret_type: str | None = None
         self.loop_depth = 0
+        # Stack of generic type-parameter scopes. Names are erased to ``Any``
+        # wherever they appear as a type annotation.
+        self.type_params: list[set[str]] = []
     def push(self): self.scope.append({})
     def pop(self): self.scope.pop()
+    def _type_param_names(self):
+        out = set()
+        for scope in self.type_params:
+            out |= scope
+        return out
+    def erase_type(self, t):
+        """Map a generic type parameter to ``Any`` (type erasure)."""
+        if t is None:
+            return None
+        return "Any" if t in self._type_param_names() else t
     def get(self, n):
         for s in reversed(self.scope):
             if n in s: return s[n]
@@ -1516,18 +1550,19 @@ class Checker:
             if self.loop_depth <= 0: raise GamaTypeError("break/continue outside loop", s.line, s.col)
             return
         if isinstance(s, Let):
+            tn = self.erase_type(s.type_name)
             # Bind the name before checking a lambda body so recursive
             # lambdas can refer to themselves.
             if isinstance(s.expr, Lambda):
-                self.set(s.name, s.type_name or "Function")
+                self.set(s.name, tn or "Function")
                 t = self.expr(s.expr)
-                if s.type_name and not self.compat(t, s.type_name):
+                if tn and not self.compat(t, tn):
                     raise GamaTypeError(f"{s.name}: {t} != {s.type_name}", s.line, s.col)
-                self.set(s.name, s.type_name or t)
+                self.set(s.name, tn or t)
             else:
                 t = self.expr(s.expr)
-                if s.type_name and not self.compat(t, s.type_name): raise GamaTypeError(f"{s.name}: {t} != {s.type_name}", s.line, s.col)
-                self.set(s.name, s.type_name or t)
+                if tn and not self.compat(t, tn): raise GamaTypeError(f"{s.name}: {t} != {s.type_name}", s.line, s.col)
+                self.set(s.name, tn or t)
         elif isinstance(s, Assign):
             t = self.expr(s.expr)
             cur = self.get(s.name)
@@ -1561,16 +1596,32 @@ class Checker:
         elif isinstance(s, Print): self.expr(s.expr); self.effects.add("io.print")
         elif isinstance(s, ExprStmt): self.expr(s.expr)
     def fn(self, f: Fn):
+        type_params = list(getattr(f, "type_params", None) or [])
+        seen_tp = set()
+        for tp in type_params:
+            if tp in seen_tp:
+                raise GamaTypeError(f"duplicate type parameter {tp}", f.line, f.col)
+            seen_tp.add(tp)
+        seen_params = set()
+        for p in f.params:
+            if p.name in seen_params:
+                raise GamaTypeError(f"duplicate parameter {p.name}", f.line, f.col)
+            seen_params.add(p.name)
         self.push()
-        for p in f.params: self.set(p.name, p.type_name)
-        old = self.effects; self.effects = set()
-        old_ret = self.ret_type; self.ret_type = f.ret or "Any"
-        for s in f.body: self.stmt(s, f.effects or set())
-        used = set(self.effects); self.effects = old; self.ret_type = old_ret
-        allowed = f.effects or set()
-        bad = used - allowed
-        if bad: raise GamaEffectError(f"function {f.name} uses undeclared effects: {','.join(sorted(bad))}", f.line, f.col)
-        self.pop()
+        self.type_params.append(seen_tp)
+        try:
+            for p in f.params: self.set(p.name, self.erase_type(p.type_name))
+            old = self.effects; self.effects = set()
+            old_ret = self.ret_type
+            self.ret_type = self.erase_type(f.ret or "Any")
+            for s in f.body: self.stmt(s, f.effects or set())
+            used = set(self.effects); self.effects = old; self.ret_type = old_ret
+            allowed = f.effects or set()
+            bad = used - allowed
+            if bad: raise GamaEffectError(f"function {f.name} uses undeclared effects: {','.join(sorted(bad))}", f.line, f.col)
+        finally:
+            self.type_params.pop()
+            self.pop()
     def check_method(self, record_name, m):
         """Check one record method body with ``self`` bound to the record."""
         self.push()
@@ -1624,6 +1675,7 @@ class Checker:
                     e.line, e.col)
         self.effects |= (m.effects or set())
         return m.ret or "Any"
+
     def compat(self, got, want):
         return want in ("Any", got) or (want in NUM and got in NUM) or (want == "List" and got in ("List", "Table"))
     def check_field_assign(self, s, value_type):
@@ -1665,9 +1717,9 @@ class Checker:
         if isinstance(e, Literal): return tname(e.value)
         if isinstance(e, Lambda):
             self.push()
-            for p in e.params: self.set(p.name, p.type_name)
+            for p in e.params: self.set(p.name, self.erase_type(p.type_name))
             old = self.effects; self.effects = set()
-            old_ret = self.ret_type; self.ret_type = e.ret or "Any"
+            old_ret = self.ret_type; self.ret_type = self.erase_type(e.ret or "Any")
             for s in e.body: self.stmt(s, e.effects or set())
             used = set(self.effects); self.effects = old; self.ret_type = old_ret
             allowed = e.effects or set()
@@ -1882,6 +1934,21 @@ class Checker:
             required = sum(1 for p in f.params if p.default is None)
             if not (required <= len(e.args) <= len(f.params)):
                 raise GamaTypeError(f"{e.name} expects {required}..{len(f.params)} args", e.line, e.col)
+            if getattr(f, "type_params", None):
+                # Generic call: infer type parameters from argument types and
+                # erase them to Any. Non-type-parameter positions still get a
+                # normal compatibility check.
+                bindings = {}
+                for p, a in zip(f.params, e.args):
+                    at = self.expr(a)
+                    if p.type_name in f.type_params:
+                        if at != "Any":
+                            bindings.setdefault(p.type_name, at)
+                    elif not self.compat(at, p.type_name):
+                        raise GamaTypeError(f"{e.name}: {p.name} {at} != {p.type_name}", e.line, e.col)
+                self.effects |= (f.effects or set())
+                rt = f.ret or "Any"
+                return bindings.get(rt, "Any") if rt in f.type_params else rt
             for p, a in zip(f.params, e.args):
                 at = self.expr(a)
                 if not self.compat(at, p.type_name): raise GamaTypeError(f"{e.name}: {p.name} {at} != {p.type_name}", e.line, e.col)
@@ -1910,6 +1977,17 @@ class Checker:
                     raise GamaTypeError(
                         f"{callee.name} expects {required}..{len(f.params)} args, got {len(e.args)}",
                         e.line, e.col)
+                if getattr(f, "type_params", None):
+                    bindings = {}
+                    for p, a in zip(f.params, e.args):
+                        at = self.expr(a)
+                        if p.type_name in f.type_params:
+                            if at != "Any":
+                                bindings.setdefault(p.type_name, at)
+                        elif not self.compat(at, p.type_name):
+                            raise GamaTypeError(f"{callee.name}: {p.name} {at} != {p.type_name}", e.line, e.col)
+                    rt = f.ret or "Any"
+                    return bindings.get(rt, "Any") if rt in f.type_params else rt
                 for p, a in zip(f.params, e.args):
                     at = self.expr(a)
                     if not self.compat(at, p.type_name):
