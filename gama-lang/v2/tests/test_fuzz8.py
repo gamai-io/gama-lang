@@ -756,7 +756,6 @@ _ALIAS_MUTATORS = (
 
 _INFER_MUTATORS = (
     _infer_bad_return_type,
-    _infer_missing_effects,
     _infer_bad_effect_braces,
     _infer_missing_return_expr,
     _infer_missing_param_type,
@@ -830,10 +829,6 @@ _ALIAS_REJECT = (
 
 _INFERENCE_REJECT = (
     "fn f(x: Int) -> Text { return x + 1 }\nprint f(1)\n",
-    "fn f(x: Int) -> Int { print x\n return x }\nprint f(1)\n",
-    "fn inner(x: Int) -> Int effects { io.print } "
-    "{ print x\n return x }\n"
-    "fn outer(x: Int) -> Int { return inner(x) }\nprint outer(1)\n",
     "return 1\n",
     "let f = fn(x: Int) -> Int { print x\n return x }\nprint f(1)\n",
     "fn f(x: Int) -> Int { return x + }\nprint f(1)\n",
@@ -1198,21 +1193,18 @@ class Fuzz8RegressionPins(unittest.TestCase):
     the pin can be removed.
     """
 
-    @unittest.expectedFailure
     def test_omitted_return_type_infers_assignment_type(self):
         src = ("fn f(x: Int) { return x + 1 }\n"
                "let y: Int = f(2)\nprint y\n")
         G.check(src)
         self.assertEqual(list(G.run(src).out), ["3"])
 
-    @unittest.expectedFailure
     def test_omitted_return_type_rejects_inconsistent_returns(self):
         src = ('fn f(b: Bool) { if b { return 1 } return "s" }\n'
                "print f(true)\n")
         with self.assertRaises(G.GamaError):
             G.check(src)
 
-    @unittest.expectedFailure
     def test_omitted_effects_infers_used_effects(self):
         src = ("fn f(x: Int) -> Int { print x\n return x }\n"
                "print f(1)\n")

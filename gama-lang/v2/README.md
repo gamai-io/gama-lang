@@ -73,7 +73,7 @@ parameter carry a matching `type parameter` note. Completion after `id<`
 offers type parameters that are in scope from an enclosing generic function,
 then the callee's declared type parameters for context, then the built-in type
 names; `fn id<` offers the built-in type names only (type-parameter names are
-chosen by the author and cannot be inferred). The core parser still reads
+chosen by the author and cannot be inferred). The core parser supports
 `id<Int>(1)` for locally declared generic functions (count/name checks,
 formatter round-trip); imported/namespaced generic calls and nested type
 arguments are not recognized. LSP signature help also recovers explicit
@@ -345,6 +345,9 @@ general runtime limits exactly like ordinary statements.
 - intersection generic bounds: `fn tag<T: Named & Aged>(x: T) -> Text`; every component must be satisfied (records structurally require all fields of each bound), explicit/inferred args checked, formatter round-trips `T: A & B`, IR erases.
 - nested record `with` paths: `o with { inner.x = 9 }` deep-copies only records on the updated path; multiple paths merge, original/aliases unchanged; formatter/IR supported.
 - generic record/enum bounds: `record Box<T: Text> { value: T }`, `enum Opt<T: Int> { Some(T), None }`; annotation and constructor inference enforce the nominal bound, aliases rename bound refs, formatter/IR erase.
+- return type inference when `->` is omitted: all lexical `return` expressions merge (Int/Decimal -> Decimal; Any absorbs; incompatible -> GamaTypeError; no return -> Any; recursion -> Any); inferred results are visible to callers, methods, lambdas and forward references.
+- effect inference when `effects` is omitted: direct and callee effects are computed as a least fixpoint; explicit `effects {}` stays an empty contract and explicit sets still reject uncovered effects; inferred sets stay out-of-band so formatting is unchanged.
+- LSP inferred signatures: hover/signature help show `(inferred: T)` and inferred effects when annotations are omitted.
 - generic records with type erasure: `record Box<T> { value: T }`, `record Pair<A, B> { first: A, second: B }`, constructors `Box(5)` / `Pair("x", 2)`, annotations `Box<Int>` / `Pair<Text, Int>` (arity checked) and explicit constructor arguments `Box<Int>(5)`. Type parameters are usable in field types and method signatures (`fn get(self: Box<T>) -> T`); they erase to `Any`, while concrete fields keep their type. A `let` annotation binds type parameters for the constructor check (`let b: Box<Int> = Box("x")` is rejected, while erased `Box("x")` is accepted), nested refs (`Box<Box<Int>>`) erase to the nominal base, duplicate type parameters/field names are rejected, namespaced records work (`geo.Box<Int>`, `geo.Box(5)`), and formatter/IR erase explicitly (the IR also compiles method-bearing records). Limits: no bounds, no method-level type parameters (methods use only the record's parameters), and no explicit type arguments on namespaced constructors (`geo.Box<Int>(5)`; annotate the binding instead)
 - top-level type aliases: `type UserId = Int`, `type IntBox = Box<Int>`, `type PointList = List<Point>`; aliases are transparent and expanded recursively by the checker in `let` annotations, parameters, returns, record fields, enum payloads and generic arguments. Generic targets are arity-checked (`Box<Int, Text>` and bare `Box` are rejected), duplicate/unknown/cyclic aliases and collisions with builtin types/records/enums are rejected, aliases may be exported and renamed (`export type UserId = Int as Id`), exposed through selective `export { ... }` lists and aliased imports (`geo.Id`), the formatter round-trips them and the IR emits a `NOP` (complete erasure). Union aliases `type Scalar = Int | Decimal` / `type MaybeText = Text | Bool` expand to a union: a value is accepted when it is compatible with at least one branch for `let`, parameters, record fields and enum payloads/patterns; a union return accepts any branch. Union-to-union assignment uses branch inclusion, while narrowing a union value back to a single type is rejected (no flow-sensitive narrowing) except for the existing `Int`/`Decimal` interchangeability. Branches may be base types, records, enums, non-union aliases, or generic record refs (erased to the nominal base); unknown/duplicate branches, nested union aliases and union arity misuse are rejected. Generic aliases `type Boxed<T> = Box<T>` are supported with arity checks and substitution (`Boxed<Int>` -> `Box<Int>`, nested uses included); bounds on alias parameters are not supported
 - first-class functions and lambdas: `fn(x: Int) -> Int { ... }`, `let f = ...`, `f(41)`, passing functions as values, named functions as values after definition, IIFE `(fn...)(41)`, and recursive lambdas
@@ -431,7 +434,7 @@ samples.
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 3276/3276
+python3 -m unittest discover -s tests -v   # 3350/3350
 python3 gamal2.py doctor --json                # 8/8 checks
 ../../scripts/ci_local.sh                      # py_compile + tests + doctor + VS Code JSON/smoke
 ```
@@ -453,7 +456,7 @@ Conformance: see `CONFORMANCE.md` (SPEC 2.0 T1–T10: **PASS 10/10**, including 
 
 - deployed/public package registry (the HTTP server is implemented and testable)
 - external intent/lease registry with expiry/revocation (env-bound intent/lease receipts are implemented; there is no external registry)
-- full type inference (structural record compatibility is implemented for static checks only); higher-kinded bounds
+- full expression-level/bidirectional type inference (return/effect inference and structural compatibility are implemented); higher-kinded bounds
 - formatter remaining edges: a comment *before* a binary operator has no legal source position (the grammar only breaks after an operator), so the defensive renderer keeps it after the operator; comments in a commented `fn` effects set use source order (uncommented sets stay sorted); indivisible tokens longer than the width still overflow
 - VS Code Marketplace signing/publishing (VSIX packaging is reproducible locally)
 - publishing a built release by default: the release workflow has secret-gated,
