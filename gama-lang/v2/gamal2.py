@@ -626,7 +626,10 @@ class Parser:
         Aliases are transparent compile-time names. Optional ``export`` and
         ``as Alias`` are handled by the ``export`` wrapper, matching other
         declaration forms. Type parameters are captured so the checker can
-        substitute them into the target; union targets are still rejected.
+        substitute them into the target; a union target (``type Scalar =
+        Int | Decimal``) stores its alternatives joined by `` | `` and is
+        validated branch by branch.
+
         """
         x = self.take()  # `type`
         name_tok = self.expect("IDENT")
@@ -636,14 +639,30 @@ class Parser:
                 name_tok.line, name_tok.col)
         type_params, _bounds = self.type_params()
         self.expect("OP", "="); self.skip_nl()
-        target = self.type_ref()
         if self.at("OP", "|"):
             e = self.peek()
             raise GamaError(
-                "union types are not supported in type aliases",
+                f"union type alias {name_tok.val}: branch expected before '|'",
                 e.line, e.col)
+        branches = [self.type_ref()]
+        while True:
+            save = self.i
+            self.skip_nl()
+            if not self.at("OP", "|"):
+                self.i = save
+                break
+            self.take()
+            self.skip_nl()
+            if self.peek().kind != "IDENT":
+                e = self.peek()
+                raise GamaError(
+                    f"union type alias {name_tok.val}: expected a branch "
+                    f"after '|'", e.line, e.col)
+            branches.append(self.type_ref())
+        target = " | ".join(branches)
         return TypeAlias(name_tok.val, target, x.line, x.col,
                          type_params=type_params)
+
     def export_list(self):
         """Parse a top-level selective re-export list.
 
@@ -1262,10 +1281,15 @@ def _erase_type_ref(t, params):
     """Type erasure: a record/function type parameter becomes ``Any``.
 
     Generic type arguments are erased too: the runtime type of ``Box<Int>`` is
-    the nominal record ``Box``, so annotations lower to the base name.
+    the nominal record ``Box``, so annotations lower to the base name.  A
+    union is erased branch by branch, keeping the top-level alternatives
+    (``Box<Int> | Text`` -> ``Box | Text``).
     """
     if t is None:
         return None
+    alts = _split_bound(t)
+    if len(alts) > 1:
+        return " | ".join(_erase_type_ref(a, params) for a in alts)
     base, args = _type_ref_parts(t)
     if base in params:
         return "Any"
@@ -1894,8 +1918,15 @@ class Checker:
         ``Boxed<Int>`` becomes ``Box<Int>`` and nested uses such as
         ``Boxed<Boxed<Int>>`` become ``Box<Box<Int>>``. Generic arguments are
         expanded too, so ``type Ids = List<UserId>`` resolves the nested
-        alias. Cycles are rejected with the alias declaration's position.
+        alias. A union is expanded branch by branch. Cycles are rejected with
+        the alias declaration's position.
+
         """
+        alts = _split_bound(t)
+        if len(alts) > 1:
+            return " | ".join(
+                self._resolve_alias_ref_inner(a, params, stack)
+                for a in alts)
         base, args = _type_ref_parts(t)
         if base in params:
             if not args:
@@ -2091,6 +2122,11 @@ class Checker:
         if t is None:
             return
         params = self._type_param_names() if params is None else set(params)
+        alts = _split_bound(t)
+        if len(alts) > 1:
+            for alt in alts:
+                self._check_type_annotation(alt, line, col, params)
+            return
         base, args = _type_ref_parts(t)
         if base in params:
             if args:
@@ -2138,13 +2174,57 @@ class Checker:
             return
         if args:
             raise GamaTypeError(f"type {base} is not generic", line, col)
+    def _alias_union_name(self, name):
+        """Return the alias whose target is a union in ``name``'s chain."""
+        seen = set()
+        cur = name
+        while cur in self.type_aliases and cur not in seen:
+            seen.add(cur)
+            t = self.type_aliases[cur].type_name
+            if len(_split_bound(t)) > 1:
+                return cur
+            base, _args = _type_ref_parts(t)
+            if base not in self.type_aliases:
+                return None
+            cur = base
+        return None
+
     def _validate_alias_target(self, t, alias_name, stack, params):
         """Validate one alias target: known names, arity, nested aliases.
 
-        ``params`` are the type parameters declared by the alias whose target
-        is being validated (or by an enclosing alias); they shadow global
-        aliases and are accepted wherever a concrete type name is expected.
+        ``params`` are the alias's type parameters; they shadow global aliases
+        and are accepted wherever a concrete type name is expected. Union
+        targets are validated branch by branch; nested union aliases and
+        duplicate branches are rejected.
         """
+        alts = _split_bound(t)
+        if len(alts) > 1:
+            a = self.type_aliases[alias_name]
+            seen = set()
+            for alt in alts:
+                if len(_split_bound(alt)) > 1:
+                    raise GamaTypeError(
+                        f"type alias {alias_name}: nested union alias",
+                        a.line, a.col)
+                base, args = _type_ref_parts(alt)
+                if base in self.type_aliases:
+                    if args:
+                        raise GamaTypeError(
+                            f"type alias {base} is not generic",
+                            a.line, a.col)
+                    if base not in stack and self._alias_union_name(base):
+                        raise GamaTypeError(
+                            f"type alias {alias_name}: nested union alias "
+                            f"{base}", a.line, a.col)
+                self._validate_alias_target(alt, alias_name, stack, params)
+                key = self._resolve_alias_ref_inner(alt, params, stack)
+                if key in seen:
+                    raise GamaTypeError(
+                        f"type alias {alias_name}: duplicate union branch "
+                        f"{key}", a.line, a.col)
+                seen.add(key)
+            return
+
         base, args = _type_ref_parts(t)
         if base in params:
             if args:
@@ -2809,6 +2889,19 @@ class Checker:
         return self.resolve_field_type(rt, m.ret)
 
     def compat(self, got, want):
+        """Static compatibility, including union aliases.
+
+        A union on the ``want`` side accepts a value compatible with at least
+        one branch.  A union on the ``got`` side is only assignable when every
+        one of its branches is accepted by ``want`` (union-to-union inclusion);
+        narrowing a union back to a single branch is rejected because the
+        runtime value is not statically known (no flow-sensitive narrowing).
+        """
+        got_alts = _split_bound(got) if isinstance(got, str) else [got]
+        want_alts = _split_bound(want) if isinstance(want, str) else [want]
+        if len(got_alts) > 1 or len(want_alts) > 1:
+            return all(any(self.compat(g, w) for w in want_alts)
+                       for g in got_alts)
         return (want in ("Any", got)
                 or (want in NUM and got in NUM)
                 or (want == "List" and got in ("List", "Table"))
@@ -2850,6 +2943,12 @@ class Checker:
 
     def _structural_type_compat(self, got, want, seen):
         """Compatibility of two erased field types inside a structural match."""
+        got_alts = _split_bound(got) if isinstance(got, str) else [got]
+        want_alts = _split_bound(want) if isinstance(want, str) else [want]
+        if len(got_alts) > 1 or len(want_alts) > 1:
+            return all(any(self._structural_type_compat(g, w, seen)
+                           for w in want_alts)
+                       for g in got_alts)
         if want in ("Any", got):
             return True
         if want in NUM and got in NUM:
@@ -2906,6 +3005,10 @@ class Checker:
                     f"{base}.{fn}: {at} != {want}", call.line, call.col)
     def is_type_name(self, t):
         """True when ``t`` names a concrete type or an in-scope type param."""
+        if isinstance(t, str):
+            alts = _split_bound(t)
+            if len(alts) > 1:
+                return all(self.is_type_name(a) for a in alts)
         return (t in BASE_TYPE_NAMES or t in self._type_param_names()
                 or t in self.records or t in self.enums
                 or t in self.type_aliases)

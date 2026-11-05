@@ -13,12 +13,12 @@ parameters, return types, record fields, enum payloads and generic arguments.
 Runtime erasure is unchanged: an alias never creates a value, a ``DEF`` or a
 type check at run time, and the IR backend emits a ``NOP`` for the declaration.
 
-Limits: generic aliases are covered separately in
-``test_generic_aliases.py``, and union aliases (``type Name = Text | Bool``)
-are rejected because union types are not
-modelled in annotations.  Aliases are type-namespace declarations; they may be
+Limits: generic aliases are covered separately in ``test_generic_aliases.py``;
+union aliases (``type Name = Text | Bool``) are covered in
+``test_union_aliases.py``. Aliases are type-namespace declarations; they may be
 exported (plain, renamed, or through a selective ``export { ... }`` list) and
 are visible through plain and aliased imports (``geo.Id``).
+
 """
 import pathlib
 import sys
@@ -223,10 +223,12 @@ class TypeAliasTests(unittest.TestCase):
         self.assertEqual(alias.type_params, ["T"])
         self.assertEqual(alias.type_name, "Box<T>")
 
-    def test_union_target_is_rejected(self):
-        with self.assertRaisesRegex(
-                G.GamaError, r"union types are not supported in type aliases"):
-            G.check('type Name = Text | Bool\n')
+    def test_union_target_is_supported(self):
+        it = G.run(
+            'type Name = Text | Bool\n'
+            'let n: Name = "ana"\n'
+            'print n\n')
+        self.assertEqual(it.out, ["ana"])
 
     def test_alias_only_at_top_level(self):
         with self.assertRaisesRegex(G.GamaError, r"only allowed at top level"):
