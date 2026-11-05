@@ -2108,18 +2108,55 @@ class _VM:
         if decl is None:
             raise IRRuntimeError(f"unknown record {base.type_name}", line, col)
         updated = dict(base.fields)
-        seen: set[str] = set()
+        seen: list[str] = []
         for key, value in zip(field_names, values):
-            if key in seen:
+            for prev in seen:
+                if prev == key:
+                    raise IRRuntimeError(
+                        f"{base.type_name}: duplicate field {key} in with",
+                        line, col)
+                if prev.startswith(key + ".") or key.startswith(prev + "."):
+                    raise IRRuntimeError(
+                        f"{base.type_name}: conflicting with paths "
+                        f"{prev} and {key}", line, col)
+            seen.append(key)
+            parts = key.split(".")
+            if parts[0] not in decl:
                 raise IRRuntimeError(
-                    f"{base.type_name}: duplicate field {key} in with", line, col)
-            seen.add(key)
-            if key not in decl:
-                raise IRRuntimeError(
-                    f"{base.type_name}: unknown field {key} in with", line, col)
-            updated[key] = value
+                    f"{base.type_name}: unknown field {parts[0]} in with",
+                    line, col)
+            self._apply_with_path(
+                updated, base.type_name, parts, value, line, col)
         return g2.RecordVal(
             base.type_name, {fn: updated[fn] for fn in decl})
+
+    def _apply_with_path(self, values: dict, type_name: str, parts: list[str],
+                         value: Any, line: int, col: int) -> None:
+        """Apply one ``with`` path, copying only records along the path."""
+        decl = self.records.get(type_name)
+        if decl is None:
+            raise IRRuntimeError(f"unknown record {type_name}", line, col)
+        field = parts[0]
+        if field not in decl:
+            raise IRRuntimeError(
+                f"{type_name}: unknown field {field} in with", line, col)
+        if len(parts) == 1:
+            values[field] = value
+            return
+        child = values[field]
+        if not isinstance(child, g2.RecordVal):
+            raise IRRuntimeError(
+                f"{type_name}.{field}: {type(child).__name__} is not a "
+                f"record in with", line, col)
+        child_decl = self.records.get(child.type_name)
+        if child_decl is None:
+            raise IRRuntimeError(
+                f"unknown record {child.type_name}", line, col)
+        child_values = dict(child.fields)
+        self._apply_with_path(
+            child_values, child.type_name, parts[1:], value, line, col)
+        values[field] = g2.RecordVal(
+            child.type_name, {fn: child_values[fn] for fn in child_decl})
 
     @staticmethod
     def _env_has(frame: Frame, name: str) -> bool:

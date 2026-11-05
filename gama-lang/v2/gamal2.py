@@ -1151,8 +1151,15 @@ class Parser:
                         k = self.take()
                         if k.kind not in ("IDENT", "STRING", "KW"):
                             raise GamaError("with field name expected", k.line, k.col)
+                        path = [str(k.val)]
+                        while self.at("OP", "."):
+                            self.take(); seg = self.take()
+                            if seg.kind not in ("IDENT", "KW"):
+                                raise GamaError(
+                                    "with field name expected", seg.line, seg.col)
+                            path.append(str(seg.val))
                         self.expect("OP", "="); self.skip_nl()
-                        pairs.append((str(k.val), self.expr())); self.skip_nl()
+                        pairs.append((".".join(path), self.expr())); self.skip_nl()
                         if not self.at("OP", ","): break
                         self.take(); self.skip_nl()
                 self.expect("OP", "}")
@@ -3278,22 +3285,47 @@ class Checker:
                 raise GamaTypeError(
                     f"with expects a record receiver, got {bt}",
                     e.line, e.col)
-            decl = {fn: self.resolve_field_type(bt, ft)
-                    for fn, ft in self.record_all_fields(bt)}
-            seen = set()
+            seen = []
             for k, val in e.fields:
-                if k in seen:
-                    raise GamaTypeError(
-                        f"{bt}: duplicate field {k} in with", e.line, e.col)
-                seen.add(k)
-                if k not in decl:
-                    raise GamaTypeError(
-                        f"{bt}: unknown field {k} in with", e.line, e.col)
-                at = self.expr(val, row)
-                if not self.compat(at, decl[k]):
-                    raise GamaTypeError(
-                        f"{bt}.{k}: {at} != {decl[k]} in with",
-                        e.line, e.col)
+                for prev in seen:
+                    if prev == k:
+                        raise GamaTypeError(
+                            f"{bt}: duplicate field {k} in with",
+                            e.line, e.col)
+                    if (prev.startswith(k + ".")
+                            or k.startswith(prev + ".")):
+                        raise GamaTypeError(
+                            f"{bt}: conflicting with paths {prev} and {k}",
+                            e.line, e.col)
+                seen.append(k)
+                parts = k.split(".")
+                cur = bt
+                decl = {fn: self.resolve_field_type(cur, ft)
+                        for fn, ft in self.record_all_fields(cur)}
+                for i, seg in enumerate(parts):
+                    if seg not in decl:
+                        if i == 0:
+                            raise GamaTypeError(
+                                f"{bt}: unknown field {seg} in with",
+                                e.line, e.col)
+                        raise GamaTypeError(
+                            f"{bt}.{'.'.join(parts[:i])}: unknown field "
+                            f"{seg} in with", e.line, e.col)
+                    ft = decl[seg]
+                    if i == len(parts) - 1:
+                        at = self.expr(val, row)
+                        if not self.compat(at, ft):
+                            raise GamaTypeError(
+                                f"{bt}.{k}: {at} != {ft} in with",
+                                e.line, e.col)
+                        break
+                    if ft not in self.records:
+                        raise GamaTypeError(
+                            f"{bt}.{'.'.join(parts[:i + 1])}: {ft} is not "
+                            f"a record in with", e.line, e.col)
+                    cur = ft
+                    decl = {fn: self.resolve_field_type(cur, ftt)
+                            for fn, ftt in self.record_all_fields(cur)}
             return bt
         if isinstance(e, Attr):
             t = self.expr(e.base)
@@ -4777,6 +4809,37 @@ class Interpreter:
 
         return self.invoke(fv, e.args, env, row, e.line, e.col,
                            self_value=receiver)
+    def _with_path(self, values, type_name, parts, value, line, col):
+        """Apply one ``with`` path inside ``values`` (already a copy).
+
+        Intermediate records are copied along the path only; siblings keep
+        sharing their original values.  ``values`` is mutated in place.
+        """
+        all_fields, ok = _record_all_fields(self.records, type_name)
+        if not ok:
+            raise GamaRuntimeError(
+                f"record {type_name}: invalid inheritance chain", line, col)
+        decl = dict(all_fields)
+        field = parts[0]
+        if field not in decl:
+            raise GamaRuntimeError(
+                f"{type_name}: unknown field {field} in with", line, col)
+        if len(parts) == 1:
+            values[field] = value
+            return
+        child = values[field]
+        if not isinstance(child, RecordVal):
+            raise GamaRuntimeError(
+                f"{type_name}.{field}: {type(child).__name__} is not a "
+                f"record in with", line, col)
+        child_values = dict(child.fields)
+        self._with_path(
+            child_values, child.type_name, parts[1:], value, line, col)
+        child_fields, _ok = _record_all_fields(self.records, child.type_name)
+        values[field] = RecordVal(
+            child.type_name,
+            {fn: child_values[fn] for fn, _ft in child_fields})
+
     def expr(self, e, env, row=None):
         """Evaluate one expression node and count it as one expression step.
 
@@ -4829,19 +4892,31 @@ class Interpreter:
                     e.line, e.col)
             # Shallow copy: the field dict is new, but unchanged nested record
             # and container values are shared with the receiver (documented).
+            # A dotted path (``inner.x``) deep-copies only the records on that
+            # path, leaving siblings shared.
             values = dict(base.fields)
-            seen = set()
+            seen = []
+            decl = dict(all_fields)
             for k, val in e.fields:
-                if k in seen:
+                for prev in seen:
+                    if prev == k:
+                        raise GamaRuntimeError(
+                            f"{base.type_name}: duplicate field {k} in with",
+                            e.line, e.col)
+                    if (prev.startswith(k + ".")
+                            or k.startswith(prev + ".")):
+                        raise GamaRuntimeError(
+                            f"{base.type_name}: conflicting with paths "
+                            f"{prev} and {k}", e.line, e.col)
+                seen.append(k)
+                parts = k.split(".")
+                if parts[0] not in decl:
                     raise GamaRuntimeError(
-                        f"{base.type_name}: duplicate field {k} in with",
+                        f"{base.type_name}: unknown field {parts[0]} in with",
                         e.line, e.col)
-                seen.add(k)
-                if k not in dict(all_fields):
-                    raise GamaRuntimeError(
-                        f"{base.type_name}: unknown field {k} in with",
-                        e.line, e.col)
-                values[k] = self.expr(val, env, row)
+                self._with_path(
+                    values, base.type_name, parts, self.expr(val, env, row),
+                    e.line, e.col)
             return RecordVal(
                 base.type_name, {fn: values[fn] for fn, _ft in all_fields})
         if isinstance(e, Lambda):
