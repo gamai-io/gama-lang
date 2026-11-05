@@ -338,6 +338,8 @@ class Lambda: params: list; ret: str | None; effects: set | None; body: list; li
 @dataclass
 class Match: expr: Any; arms: list; line: int; col: int
 @dataclass
+class RecordPattern: name: str; items: list; line: int; col: int
+@dataclass
 class EnumDecl: name: str; variants: list; line: int; col: int; exported: bool = False; type_params: list = field(default_factory=list); type_param_bounds: dict = field(default_factory=dict); export_name: str | None = None
 @dataclass
 class TypeAlias: name: str; type_name: str; line: int; col: int; exported: bool = False; export_name: str | None = None; type_params: list = field(default_factory=list)
@@ -1049,29 +1051,28 @@ class Parser:
             bindings = None
             if kind == "_":
                 pass
-            else:
-                if self.at("OP", "("):
-                    self.take(); self.skip_nl()
-                    names = []
-                    while not self.at("OP", ")"):
-                        names.append(self.expect("IDENT").val)
-                        self.skip_nl()
-                        if self.at("OP", ","):
-                            self.take(); self.skip_nl()
-                        elif not self.at("OP", ")"):
-                            y = self.peek()
-                            raise GamaError(
-                                "expected ',' or ')' in match pattern",
-                                y.line, y.col)
-                    self.expect("OP", ")")
-                    if len(names) == 1:
-                        bindings = names[0]
-                    elif names:
-                        bindings = names
-                elif kind in ("Ok", "Err"):
-                    raise GamaError(
-                        f"{kind} match patterns require a binding: {kind}(x)",
-                        arm.line, arm.col)
+            elif self.at("OP", "("):
+                self.take(); self.skip_nl()
+                items = []
+                while not self.at("OP", ")"):
+                    items.append(self._match_pattern_item())
+                    self.skip_nl()
+                    if self.at("OP", ","):
+                        self.take(); self.skip_nl()
+                    elif not self.at("OP", ")"):
+                        y = self.peek()
+                        raise GamaError(
+                            "expected ',' or ')' in match pattern",
+                            y.line, y.col)
+                self.expect("OP", ")")
+                if len(items) == 1 and isinstance(items[0], str):
+                    bindings = items[0]
+                else:
+                    bindings = items
+            elif kind in ("Ok", "Err"):
+                raise GamaError(
+                    f"{kind} match patterns require a binding: {kind}(x)",
+                    arm.line, arm.col)
             if self.at("OP", "=>"):
                 self.take(); self.skip_nl()
             self.skip_nl(); body = self.block(); arms.append((kind, bindings, body))
@@ -1079,6 +1080,29 @@ class Parser:
             self.skip_seps()
         self.expect("OP", "}")
         return Match(subject, arms, x.line, x.col)
+    def _match_pattern_item(self):
+        tok = self.peek()
+        if tok.kind != "IDENT":
+            raise GamaError(
+                "expected binding name, _ or record pattern",
+                tok.line, tok.col)
+        name = self.take().val
+        if self.at("OP", "("):
+            self.take(); self.skip_nl()
+            items = []
+            while not self.at("OP", ")"):
+                items.append(self._match_pattern_item())
+                self.skip_nl()
+                if self.at("OP", ","):
+                    self.take(); self.skip_nl()
+                elif not self.at("OP", ")"):
+                    y = self.peek()
+                    raise GamaError(
+                        "expected ',' or ')' in match pattern",
+                        y.line, y.col)
+            self.expect("OP", ")")
+            return RecordPattern(name, items, tok.line, tok.col)
+        return name
     def expr(self): return self.pipe()
     def pipe(self):
         left = self.binary(0); stages = []
@@ -1485,6 +1509,21 @@ def _binding_list(bindings):
     """
     if bindings is None:
         return []
+    if isinstance(bindings, str):
+        return [bindings]
+    return list(bindings)
+
+def _pattern_items(bindings):
+    """Normalise a match pattern binding spec to a list of pattern items.
+
+    Items are binding names (``str``), ``_`` wildcards (also a ``str``), or
+    nested :class:`RecordPattern` nodes.  ``None`` is the no-binding form and a
+    lone pattern/list is accepted for convenience.
+    """
+    if bindings is None:
+        return []
+    if isinstance(bindings, RecordPattern):
+        return [bindings]
     if isinstance(bindings, str):
         return [bindings]
     return list(bindings)
@@ -2080,6 +2119,54 @@ class Checker:
             return False
         chain, _ok = _record_chain(self.records, child)
         return any(rec.name == parent for rec in chain[1:])
+    def _check_record_pattern(self, name, bindings, line, col, seen=None):
+        """Validate one record destructuring pattern and return typed bindings.
+
+        Positional items map to the flattened field list (inherited fields
+        first).  ``_`` skips a field; a nested :class:`RecordPattern` must name
+        exactly the field's record type; plain names bind to that field's type.
+        Duplicate binding names are rejected across the whole arm.
+        """
+        if name not in self.records:
+            raise GamaTypeError(
+                f"match: unknown record pattern {name}", line, col)
+        items = _pattern_items(bindings)
+        fields = self.record_all_fields(name)
+        if len(items) != len(fields):
+            raise GamaTypeError(
+                f"match: record pattern {name} expects {len(fields)} field "
+                f"binding{'s' if len(fields) != 1 else ''}, got {len(items)}",
+                line, col)
+        if seen is None:
+            seen = set()
+        out = []
+        for (fname, ft), item in zip(fields, items):
+            ftype = self.resolve_field_type(name, ft)
+            if isinstance(item, RecordPattern):
+                if ftype not in self.records:
+                    raise GamaTypeError(
+                        f"match: field {name}.{fname} has type {ftype}, not a "
+                        f"record; cannot destructure {item.name}",
+                        item.line, item.col)
+                if item.name != ftype:
+                    raise GamaTypeError(
+                        f"match: record pattern {item.name} does not match "
+                        f"field {name}.{fname} of type {ftype}",
+                        item.line, item.col)
+                out.extend(self._check_record_pattern(
+                    item.name, item.items, item.line, item.col, seen=seen))
+            elif item == "_":
+                continue
+            elif isinstance(item, str):
+                if item in seen:
+                    raise GamaTypeError(
+                        f"match: duplicate binding {item}", line, col)
+                seen.add(item)
+                out.append((item, ftype or "Any"))
+            else:
+                raise GamaTypeError(
+                    "match: invalid record pattern item", line, col)
+        return out
     @staticmethod
     def _override_compatible(child_m, base_m):
         """An override must keep the exact parameter list and return type.
@@ -2945,8 +3032,10 @@ class Checker:
             return
         if isinstance(s, Match):
             t = self.expr(s.expr)
-            if t not in ("Result", "Any") and t not in self.enums:
-                raise GamaTypeError("match expects Result or enum", s.line, s.col)
+            if (t not in ("Result", "Any") and t not in self.enums
+                    and t not in self.records):
+                raise GamaTypeError(
+                    "match expects Result, enum or record", s.line, s.col)
             for kind, bindings, body in s.arms:
                 names = _binding_list(bindings)
                 payload_types = ()
@@ -2955,6 +3044,20 @@ class Checker:
                         raise GamaTypeError(
                             "match: _ pattern cannot bind a payload",
                             s.line, s.col)
+                elif kind in self.records:
+                    if t not in ("Any", kind):
+                        raise GamaTypeError(
+                            f"match: {kind} record pattern does not match "
+                            f"subject type {t}", s.line, s.col)
+                    seen = set()
+                    record_bindings = self._check_record_pattern(
+                        kind, bindings, s.line, s.col, seen=seen)
+                    self.push()
+                    for name, ptype in record_bindings:
+                        self.set(name, ptype or "Any")
+                    [self.stmt(x, allowed) for x in body]
+                    self.pop()
+                    continue
                 elif kind in ("Ok", "Err"):
                     if t not in ("Result", "Any"):
                         raise GamaTypeError(
@@ -2966,6 +3069,12 @@ class Checker:
                             f"{kind}(x)", s.line, s.col)
                     payload_types = ("Any",)
                 else:
+                    for item in _pattern_items(bindings):
+                        if isinstance(item, RecordPattern):
+                            raise GamaTypeError(
+                                f"match: nested record pattern under {kind} "
+                                "is only supported for record fields",
+                                s.line, s.col)
                     try:
                         resolved = find_enum_variant(self.enums, kind)
                     except _AmbiguousVariantError:
@@ -4882,6 +4991,34 @@ class Interpreter:
         except PropagateSignal:
             raise GamaRuntimeError("? outside function") from None
         return self
+    def _match_record_value(self, rv, name, bindings, local):
+        """Bind one record pattern positionally into ``local``.
+
+        Matching is exact-nominal: ``rv.type_name`` must equal ``name`` (a
+        subclass does not match its parent's pattern, since the arity differs).
+        Fields are taken in flattened declaration order (inherited first).
+        Returns ``False`` without binding when the value is not that record or
+        a nested pattern fails; the caller then tries the next arm.
+        """
+        if not isinstance(rv, RecordVal) or rv.type_name != name:
+            return False
+        fields, _ok = _record_all_fields(self.records, name)
+        items = _pattern_items(bindings)
+        if len(items) != len(fields):
+            raise GamaRuntimeError(
+                f"match: record pattern {name} expects {len(fields)} field "
+                f"binding{'s' if len(fields) != 1 else ''}, got {len(items)}")
+        for (fname, _ft), item in zip(fields, items):
+            value = rv.fields.get(fname)
+            if isinstance(item, RecordPattern):
+                if not self._match_record_value(value, item.name,
+                                                item.items, local):
+                    return False
+            elif item == "_":
+                continue
+            else:
+                local.set(item, value)
+        return True
     def stmt(self, s, env):
         self._tick(s.line, s.col)
         if isinstance(s, Let): env.set(s.name, self.expr(s.expr, env))
@@ -4927,14 +5064,22 @@ class Interpreter:
                 except BreakSignal: break
         elif isinstance(s, Match):
             rv = self.expr(s.expr, env)
-            if not isinstance(rv, (ResultVal, EnumVal)):
+            if not isinstance(rv, (ResultVal, EnumVal, RecordVal)):
                 # Keep the historical message for non-Result subjects; the
                 # IR-subset parity tests compare this text byte-for-byte.
                 raise GamaRuntimeError(
                     "match expects Result", s.line, s.col)
             for kind, bindings, body in s.arms:
+                local = None
                 if kind == "_":
                     hit = True
+                elif isinstance(rv, RecordVal):
+                    if kind in self.records:
+                        local = Env(env)
+                        hit = self._match_record_value(
+                            rv, kind, bindings, local)
+                    else:
+                        hit = False
                 elif kind in ("Ok", "Err"):
                     hit = (isinstance(rv, ResultVal)
                            and (kind == "Ok") == rv.ok)
@@ -4951,7 +5096,8 @@ class Interpreter:
                 else:
                     hit = False
                 if hit:
-                    local = Env(env)
+                    if local is None:
+                        local = Env(env)
                     names = _binding_list(bindings)
                     if names and isinstance(rv, ResultVal):
                         if len(names) != 1:

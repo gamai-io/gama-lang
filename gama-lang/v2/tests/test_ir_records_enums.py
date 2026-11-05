@@ -198,9 +198,9 @@ class IRRecordEnumRuntimeErrorsMatchInterpreter(unittest.TestCase):
         self.assert_same_runtime_error(
             'record Point { x: Int }\nlet p = Point { x: 1, x: 2 }\n')
 
-    def test_match_on_record_needs_result(self):
+    def test_match_on_non_record_scalar_needs_result(self):
         self.assert_same_runtime_error(
-            'record Point { x: Int }\nlet p = Point(1)\n'
+            'let p = 1\n'
             'match p { _ { print 1 } }\n')
 
     def test_enum_match_no_arm(self):

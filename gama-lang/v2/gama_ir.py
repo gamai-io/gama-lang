@@ -177,9 +177,9 @@ Limitations (raise ``IRUnsupported`` / documented runtime errors)
   (``sql``, ``ask``, ``upper``, result/text/collection helpers, ``mail``,
   ``remember``/``recall``, ``wait_user``, ...).
 * ``match`` is supported for ``Ok``/``Err`` results and enum variants
-  (nullary, one-payload and multi-payload, bare or qualified).  There is no
-  structural pattern matching beyond those arms (records cannot be
-  destructured).
+  (nullary, one-payload and multi-payload, bare or qualified).  Record
+  destructuring patterns (``Point(x, y)``, including nested forms) are
+  interpreter-only: the IR compiler raises :class:`IRUnsupported` for them.
 * Map literals are JSON values: dotted field access (``m.k``) follows the
   reference fallback (it also works on maps), and ``m[0]`` uses the reference
   ``int`` coercion, so text-keyed maps are not indexable in either runtime.
@@ -1283,6 +1283,15 @@ class _Compiler:
 
         end_jumps: list[int] = []
         for kind, bindings, body in stmt.arms:
+            if kind != "_" and kind in self.records:
+                raise IRUnsupported(
+                    f"record destructuring pattern {kind} is not supported "
+                    "by the IR backend", stmt.line, stmt.col)
+            for item in _binding_names(bindings):
+                if isinstance(item, g2.RecordPattern):
+                    raise IRUnsupported(
+                        "nested record pattern is not supported by the IR "
+                        "backend", stmt.line, stmt.col)
             names = _binding_names(bindings)
             next_arm = None
             if kind != "_":

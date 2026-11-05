@@ -136,6 +136,24 @@ try:  # normal package-relative import (tests put v2/ on sys.path)
 except Exception:  # pragma: no cover - only when imported oddly
     _G = None
 
+
+def _pattern_item_text(p) -> str:
+    """Render one match pattern item (name, ``_`` or nested record pattern)."""
+    if _G is not None and isinstance(p, _G.RecordPattern):
+        body = ", ".join(_pattern_item_text(x) for x in p.items)
+        return p.name + "(" + body + ")"
+    return str(p)
+
+
+def _pattern_label(name, bindings) -> str:
+    """Render a match arm label, including nested record patterns."""
+    if name == "_" or bindings is None:
+        return name
+    items = _G._pattern_items(bindings) if _G is not None else list(bindings)
+    if not items:
+        return name
+    return name + "(" + ", ".join(_pattern_item_text(x) for x in items) + ")"
+
 __all__ = ["format_source"]
 
 # ---------------------------------------------------------------------------
@@ -2575,7 +2593,7 @@ class _AstFormatter:
                 elif isinstance(bindings, str):
                     label = name + "(" + bindings + ")"
                 else:
-                    label = name + "(" + ", ".join(bindings) + ")"
+                    label = _pattern_label(name, bindings)
                 label += " {"
                 self._emit(_UNIT * (indent + 1) + label,
                            [pair[0].line] if pair else [s.line])
@@ -2789,7 +2807,7 @@ class _AstFormatter:
         if isinstance(s, G.Match):
             arms = []
             for name, var, body in s.arms:
-                label = name if name == "_" or var is None else name + "(" + var + ")"
+                label = _pattern_label(name, var)
                 inner = self._inline_block(body)
                 arms.append(label + " { " + inner + " }")
             return "match " + self._expr(s.expr) + " { " + " ".join(arms) + " }"
