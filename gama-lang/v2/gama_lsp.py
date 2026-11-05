@@ -2176,6 +2176,300 @@ def _member_type_items(text, line, character, parts, uri=None):
     return items
 
 
+# ------------------------------------------------- record `with` updates
+# Receiver immediately before the `with` keyword: a dotted chain or a
+# best-effort constructor call (``Point(1, 2) with { ... }``).
+_WITH_RECEIVER_TAIL_RE = re.compile(
+    r"(?:(?P<chain>[A-Za-z_][A-Za-z0-9_]*"
+    r"(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)*)"
+    r"|(?P<call>[A-Za-z_][A-Za-z0-9_]*\s*\([^()]*\)))\s*$")
+
+
+def _with_block_at(text, line, character):
+    """Describe the enclosing ``receiver with { ... }`` at the cursor.
+
+    Parse-free so it keeps working while the update is being typed. The
+    nearest unmatched ``{`` must be directly preceded by ``with``; the
+    returned ``field_position`` is true at a top-level field-name slot
+    (after ``{``/``,`` and before any ``=``).
+    """
+    rows = (text or "").split("\n")
+    if line < 0 or line >= len(rows):
+        return None
+    cursor = (sum(len(row) + 1 for row in rows[:line])
+              + utf16_to_index(rows[line], max(0, character)))
+    masked = _masked_text(text)
+    depth = 0
+    open_idx = None
+    i = min(cursor, len(masked)) - 1
+    while i >= 0:
+        ch = masked[i]
+        if ch == "}":
+            depth += 1
+        elif ch == "{":
+            if depth == 0:
+                open_idx = i
+                break
+            depth -= 1
+        i -= 1
+    if open_idx is None:
+        return None
+    before = masked[:open_idx]
+    keyword = re.search(r"\bwith\s*$", before)
+    if keyword is None:
+        return None
+    recv_match = _WITH_RECEIVER_TAIL_RE.search(before[:keyword.start()])
+    if recv_match is None:
+        return None
+    receiver = recv_match.group(0).strip()
+    receiver_line = masked[:recv_match.start()].count("\n")
+    segment = masked[open_idx + 1:cursor]
+    depth = 0
+    field_position = True
+    for ch in segment:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        elif depth == 0 and ch == ",":
+            field_position = True
+        elif depth == 0 and ch in "=;":
+            field_position = False
+    return {"receiver": receiver, "receiver_line": receiver_line,
+            "block_start": open_idx, "cursor": cursor,
+            "field_position": field_position}
+
+
+def _with_receiver_ref(uri, text, receiver, line, records, aliases):
+    """Best-effort record ref for a ``with`` receiver expression."""
+    receiver = (receiver or "").strip()
+    if not receiver:
+        return None
+    call = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(.*\)", receiver,
+                        re.S)
+    if call is not None:
+        name = call.group(1)
+        type_name = name if name in records else _var_type_name(
+            text, name, line, records, aliases)
+        return _resolve_record_ref(uri, text, type_name, records, aliases)
+    parts = [part.strip() for part in receiver.split(".") if part.strip()]
+    if not parts:
+        return None
+    if uri:
+        ref = _resolve_member_owner(uri, text, parts, line, records, aliases)
+        if ref is not None:
+            return ref
+    target = _chain_target_type(text, parts, records, _enum_decls(text),
+                                aliases, line, uri)
+    if target is not None and target[0] == "record":
+        return _resolve_record_ref(uri, text, target[1], records, aliases)
+    return None
+
+
+def _has_local_binding(text, name, line):
+    """True when ``name`` is visibly a local variable or parameter.
+
+    Used to keep the ordinary member resolver in charge of real locals while
+    unresolved ``with`` receivers stay quiet; the raw-text fallback in
+    :func:`_var_type_name` also matches record field declarations, which must
+    not make ``nope with { a.`` look like a local record value.
+    """
+    prefix = "\n".join((text or "").split("\n")[:max(0, line) + 1])
+    escaped = re.escape(name)
+    if name == "self":
+        return True
+    if re.search(r"\blet\s+%s\b" % escaped, prefix):
+        return True
+    return re.search(
+        r"\bfn\b[^\n]*\([^)]*\b%s\s*:" % escaped, prefix) is not None
+
+
+def _member_items_for_ref(uri, context, ref, records, aliases, prefix):
+    """Completion items for every field/method reachable through ``ref``."""
+    scopes = _record_scopes(uri, context, ref, records, aliases)
+    target_owner = ref.get("owner")
+    items = []
+    seen = set()
+    for info in _aggregate_members(scopes).values():
+        name = info["name"]
+        if name in seen:
+            continue
+        seen.add(name)
+        inherited = info.get("owner") != target_owner
+        suffix = (" (inherited from %s)" % info["owner"]
+                  if inherited else "")
+        if info["kind"] == "field":
+            items.append({
+                "label": name,
+                "kind": KIND_FIELD,
+                "detail": "field %s: %s%s"
+                          % (name, info["type"], suffix),
+                "documentation": "Field `%s` of record `%s`%s."
+                                 % (name, info["owner"],
+                                    (" (inherited by `%s`)" % target_owner
+                                     if inherited else "")),
+            })
+        else:
+            method = info["method"]
+            items.append({
+                "label": name,
+                "kind": KIND_METHOD,
+                "detail": "method "
+                          + _method_signature_text(method, info["owner"])
+                          + suffix,
+                "documentation": "Method `%s` of record `%s`%s; call as "
+                                 "`%s.%s(...)` (self is the receiver)."
+                                 % (name, info["owner"],
+                                    (" (inherited by `%s`)" % target_owner
+                                     if inherited else ""),
+                                    prefix, name),
+            })
+    return items
+
+
+def _with_field_items(uri, text, line, character, with_ctx):
+    """Field-only completions for ``receiver with { <cursor>``."""
+    context = _context_text(text, line, character)
+    records = _record_decls(context)
+    aliases = _alias_map(text)
+    ref = _with_receiver_ref(uri, context, with_ctx["receiver"],
+                             with_ctx["receiver_line"], records, aliases)
+    if ref is None:
+        return []
+    scopes = _record_scopes(uri, context, ref, records, aliases)
+    target_owner = ref.get("owner")
+    items = []
+    seen = set()
+    for info in _aggregate_members(scopes).values():
+        if info["kind"] != "field":
+            continue
+        name = info["name"]
+        if name in seen:
+            continue
+        seen.add(name)
+        inherited = info.get("owner") != target_owner
+        suffix = (" (inherited from %s)" % info["owner"]
+                  if inherited else "")
+        items.append({
+            "label": name,
+            "kind": KIND_FIELD,
+            "detail": "field %s: %s%s" % (name, info["type"], suffix),
+            "documentation": "Field `%s` of record `%s`%s."
+                             % (name, info["owner"],
+                                (" (inherited by `%s`)" % target_owner
+                                 if inherited else "")),
+        })
+    return items
+
+
+def _with_member_items(uri, text, line, character, parts, with_ctx):
+    """Member completions after ``inner.`` inside a ``with`` update.
+
+    Returns ``None`` when the chain head is an ordinary local/imported
+    expression so the standard member resolver keeps precedence.
+    """
+    if not parts or with_ctx is None:
+        return None
+    context = _context_text(text, line, character)
+    records = _record_decls(context)
+    enums = _enum_decls(context)
+    aliases = _alias_map(text)
+    if _has_local_binding(context, parts[0], line):
+        if _chain_target_type(context, parts, records, enums, aliases,
+                              line, uri) is not None:
+            return None
+        if uri and _resolve_member_owner(uri, context, parts, line, records,
+                                         aliases) is not None:
+            return None
+    recv_ref = _with_receiver_ref(uri, context, with_ctx["receiver"],
+                                  with_ctx["receiver_line"], records, aliases)
+    if recv_ref is None:
+        return None if _has_local_binding(context, parts[0], line) else []
+    base_ctx = _document_context(uri, records, aliases)
+    ref = recv_ref
+    ctx = base_ctx
+    for part in parts:
+        if ref is None:
+            return []
+        decl_ctx = _context_for_ref(ref, ctx)
+        if decl_ctx is None:
+            return []
+        info = _context_member(decl_ctx, ref["owner"], part)
+        if info is None or info.get("kind") != "field":
+            return []
+        ctx = decl_ctx
+        ref = _resolve_type_in_context(ctx, info.get("type"))
+    if ref is None:
+        return []
+    return _member_items_for_ref(uri, context, ref, records, aliases,
+                                 ".".join(parts))
+
+
+def _with_field_at(text, line, character):
+    """``(receiver, receiver_line, field)`` for a key in a with update."""
+    with_ctx = _with_block_at(text, line, character)
+    if with_ctx is None:
+        return None
+    span = _word_span_at(text, line, character)
+    if span is None:
+        return None
+    start, word = span
+    rows = (text or "").split("\n")
+    word_abs = (sum(len(row) + 1 for row in rows[:line]) + start)
+    if word_abs <= with_ctx["block_start"]:
+        return None
+    masked = _masked_text(text)
+    if masked[word_abs:word_abs + len(word)].strip() != word:
+        return None
+    before_word = _with_block_at(text, line, _utf16_pos(rows[line], start))
+    if (before_word is None
+            or before_word.get("block_start") != with_ctx["block_start"]
+            or not before_word.get("field_position")):
+        return None
+    depth = 0
+    j = word_abs + len(word)
+    while j < len(masked):
+        ch = masked[j]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and ch == ",":
+            break
+        elif depth == 0 and ch == "=":
+            if j + 1 < len(masked) and masked[j + 1] == "=":
+                break
+            return (with_ctx["receiver"], with_ctx["receiver_line"], word)
+        j += 1
+    return None
+
+
+def _with_field_hover(uri, text, line, character):
+    """Hover for a field key inside ``receiver with { field = ... }``."""
+    found = _with_field_at(text, line, character)
+    if found is None:
+        return None
+    receiver, receiver_line, field = found
+    context = _context_text(text, line, character)
+    records = _record_decls(context)
+    aliases = _alias_map(text)
+    ref = _with_receiver_ref(uri, context, receiver, receiver_line,
+                             records, aliases)
+    if ref is None:
+        return None
+    scopes = _record_scopes(uri, context, ref, records, aliases)
+    info = _member_info(scopes, field)
+    if info is None or info.get("kind") != "field":
+        return None
+    inherited = (" (inherited by `%s`)" % ref.get("owner")
+                 if info.get("owner") != ref.get("owner") else "")
+    return ("`%s.%s`\n\nGAMA-L field `%s: %s` of record `%s`%s."
+            % (receiver.strip(), field, field, info["type"],
+               info["owner"], inherited))
+
+
 def _first_open_brace(text: str, start: int) -> int:
     """Index of the first ``{`` after ``start`` that is real code, or -1."""
     quote = None
@@ -2434,12 +2728,28 @@ def completion(uri: str, text: str, line: int = 0, character: int = 0):
                     })
             return {"isIncomplete": False, "items": items}
 
-    # Record fields (``p.<cursor>``) and enum variants (``Color.<cursor>``).
-    # The chain form also covers nested records such as ``line.a.``.
+    # Record update field slot: ``p with { <cursor>``. Only fields can be
+    # replaced by an update, so methods are intentionally not offered. A
+    # trailing ``.`` is a nested field path (``p with { inner.``) and is
+    # handled by the member chain branch below instead.
+    with_ctx = _with_block_at(text, line, character)
     chain = MEMBER_CHAIN_RE.search(prefix)
+    if (with_ctx is not None and with_ctx["field_position"]
+            and chain is None):
+        return {"isIncomplete": False,
+                "items": _with_field_items(uri, text, line, character,
+                                           with_ctx)}
+
+    # Record fields (``p.<cursor>``) and enum variants (``Color.<cursor>``).
+    # The chain form also covers nested records such as ``line.a.`` and field
+    # paths inside a with update (``p with { inner.``).
     if chain is not None:
         parts = [part.strip() for part in chain.group(1).split(".")
                  if part.strip()]
+        items = _with_member_items(uri, text, line, character, parts,
+                                   with_ctx)
+        if items is not None:
+            return {"isIncomplete": False, "items": items}
         return {"isIncomplete": False,
                 "items": _member_type_items(text, line, character, parts,
                                              uri)}
@@ -4342,6 +4652,8 @@ def hover(uri: str, text: str, line: int, character: int):
     value = _member_hover(uri, text, line, character)
     if value is None:
         value = _local_member_hover(text, line, character, uri)
+    if value is None:
+        value = _with_field_hover(uri, text, line, character)
     if value is None:
         value = _structural_hover(text, name, uri)
     if value is None:
