@@ -80,6 +80,16 @@ arguments are not recognized. LSP signature help also recovers explicit
 arguments when the base name resolves to a generic `fn` declaration, and
 semantic tokens mark declared type-parameter names as types.
 
+Match-arm patterns get best-effort LSP support even when the core parser
+rejects the pattern: arm-head completion offers records, enums and variants,
+`Point { ... }` offers the record's fields (inherited ones included), hover on
+a pattern record name shows its fields/arity, and hover on a bound variable
+infers the field type (record patterns) or the `List<T>` element type. These
+record-struct, record-constructor, list and `if`-guard forms are LSP-only and
+remain parse errors in the core; a guard after `if` falls back to normal
+expression completion, and malformed or unclosed matches stay quiet instead
+of crashing.
+
 The core exposes a module's top-level `let` constants as `alias.name`, typed
 and evaluated at import time, and module functions see the same renamed
 binding. Any other non-declaration top-level statement under an alias

@@ -2949,6 +2949,847 @@ def _with_field_hover(uri, text, line, character):
                info["owner"], inherited))
 
 
+# --------------------------------------------------- match arm patterns
+_MATCH_KW_RE = re.compile(r"\bmatch\b")
+_PATTERN_NAME_RE = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)*")
+
+
+def _cursor_offset(text, line, character):
+    rows = (text or "").split("\n")
+    if line < 0 or line >= len(rows):
+        return None
+    return (sum(len(row) + 1 for row in rows[:line])
+            + utf16_to_index(rows[line], max(0, character)))
+
+
+def _skip_ws(masked, i, limit):
+    while i < limit and masked[i] in " \t\r\n":
+        i += 1
+    return i
+
+
+def _masked_word(masked, i, limit, word):
+    if i < 0 or i >= limit or not masked.startswith(word, i):
+        return False
+    if i > 0 and (masked[i - 1].isalnum() or masked[i - 1] == "_"):
+        return False
+    end = i + len(word)
+    if end < limit and (masked[end].isalnum() or masked[end] == "_"):
+        return False
+    return True
+
+
+def _first_top_level_open(masked, start):
+    paren = 0
+    bracket = 0
+    i = start
+    limit = len(masked)
+    while i < limit:
+        ch = masked[i]
+        if ch == "(":
+            paren += 1
+        elif ch == ")":
+            paren = max(0, paren - 1)
+        elif ch == "[":
+            bracket += 1
+        elif ch == "]":
+            bracket = max(0, bracket - 1)
+        elif ch == "{" and paren == 0 and bracket == 0:
+            return i
+        elif ch == "}" and paren == 0 and bracket == 0:
+            return None
+        i += 1
+    return None
+
+
+def _match_block_for_cursor(masked, cursor):
+    """``(match_start, open, close|None)`` for the match containing cursor.
+
+    The innermost containing match wins, so completion inside a match nested
+    in another arm's body still sees the inner patterns.  A record/map literal
+    used as the subject is skipped: the body is the next top-level ``{``.
+    """
+    best = None
+    limit = len(masked or "")
+    for match in _MATCH_KW_RE.finditer(masked or ""):
+        if match.start() > cursor:
+            break
+        open_idx = _first_top_level_open(masked, match.end())
+        if open_idx is None:
+            continue
+        close = _matching_delim(masked, open_idx)
+        if close is not None:
+            after = _skip_ws(masked, close + 1, limit)
+            if masked.startswith("{", after):
+                body = after
+                body_close = _matching_delim(masked, body)
+                if body_close is not None or body < cursor:
+                    open_idx, close = body, body_close
+        if close is None:
+            if open_idx < cursor and (best is None or open_idx > best[1]):
+                best = (match.start(), open_idx, None)
+        elif open_idx < cursor <= close and (
+                best is None or open_idx > best[1]):
+            best = (match.start(), open_idx, close)
+    return best
+
+
+def _enum_variant_names(enums):
+    names = set()
+    for decl in (enums or {}).values():
+        for entry in getattr(decl, "variants", None) or ():
+            names.add(entry[0])
+    return names
+
+
+def _is_record_pattern_head(name, records, enums):
+    if not name:
+        return False
+    base = name.split(".")[-1].strip()
+    if name in records or base in records:
+        return True
+    if base in _enum_variant_names(enums) or base in ("Ok", "Err"):
+        return False
+    return bool(base) and base[0].isupper()
+
+
+def _split_pattern_spans(masked, start, end):
+    parts = []
+    depth = 0
+    last = start
+    i = start
+    while i < end:
+        ch = masked[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        elif ch == "," and depth == 0:
+            if masked[last:i].strip():
+                parts.append((last, i))
+            last = i + 1
+        i += 1
+    if masked[last:end].strip():
+        parts.append((last, end))
+    return parts
+
+
+def _top_level_char(masked, start, end, target):
+    depth = 0
+    i = start
+    while i < end:
+        ch = masked[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        elif ch == target and depth == 0:
+            return i
+        i += 1
+    return None
+
+
+def _parse_pattern_fields(masked, start, end, records, enums, depth=0):
+    fields = []
+    for seg_start, seg_end in _split_pattern_spans(masked, start, end):
+        raw = masked[seg_start:seg_end]
+        if raw.strip() in ("..", "..."):
+            fields.append({"field": None,
+                           "pattern": {"kind": "rest", "start": seg_start,
+                                       "end": seg_end}})
+            continue
+        head = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)", raw)
+        if head is None:
+            continue
+        field = head.group(1)
+        field_start = seg_start + head.start(1)
+        colon = _top_level_char(masked, seg_start, seg_end, ":")
+        if colon is not None:
+            _sub_end, sub = _parse_pattern(
+                masked, colon + 1, seg_end, records, enums, depth + 1)
+            fields.append({"field": field, "pattern": sub,
+                           "field_start": field_start,
+                           "field_end": field_start + len(field)})
+        else:
+            fields.append({
+                "field": field,
+                "pattern": {"kind": "name", "name": field,
+                            "start": field_start,
+                            "end": field_start + len(field),
+                            "name_end": field_start + len(field),
+                            "args": [], "open": None, "close": None},
+                "field_start": field_start,
+                "field_end": field_start + len(field),
+                "shorthand": True,
+            })
+    return fields
+
+
+def _generic_end(masked, start, limit):
+    depth = 0
+    i = start
+    while i < limit:
+        ch = masked[i]
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None
+
+
+def _parse_pattern(masked, start, limit, records, enums, depth=0):
+    i = _skip_ws(masked, start, limit)
+    if i >= limit or depth > 32:
+        return i, {"kind": "unknown", "start": i, "end": i}
+    ch = masked[i]
+    if (ch == "_" and (i + 1 >= limit
+                       or not (masked[i + 1].isalnum()
+                               or masked[i + 1] == "_"))):
+        return i + 1, {"kind": "wild", "start": i, "end": i + 1}
+    if ch == "[":
+        close = _matching_delim(masked, i)
+        inner_end = close if close is not None and close < limit else limit
+        end = inner_end + 1 if inner_end < limit else limit
+        items = []
+        for seg_start, seg_end in _split_pattern_spans(
+                masked, i + 1, inner_end):
+            _sub_end, sub = _parse_pattern(
+                masked, seg_start, seg_end, records, enums, depth + 1)
+            items.append(sub)
+        return end, {"kind": "list", "start": i, "end": end, "items": items,
+                     "open": i, "close": close}
+    match = _PATTERN_NAME_RE.match(masked, i)
+    if match is None:
+        return i + 1, {"kind": "unknown", "start": i, "end": i + 1}
+    name = re.sub(r"\s+", "", match.group(0))
+    name_end = match.end()
+    end = name_end
+    type_args = []
+    j = _skip_ws(masked, name_end, limit)
+    if j < limit and masked[j] == "<":
+        gen_end = _generic_end(masked, j, limit)
+        if gen_end is not None:
+            inner = masked[j + 1:gen_end - 1]
+            type_args = [part.strip() for part in _split_top_level(inner)
+                         if part.strip()]
+            j2 = _skip_ws(masked, gen_end, limit)
+            if j2 < limit and masked[j2] in "({":
+                j = j2
+                end = gen_end
+            elif j2 >= limit:
+                end = gen_end
+    if j < limit and masked[j] == "(":
+        close = _matching_delim(masked, j)
+        inner_end = close if close is not None and close < limit else limit
+        body_end = inner_end + 1 if inner_end < limit else limit
+        args = []
+        for seg_start, seg_end in _split_pattern_spans(
+                masked, j + 1, inner_end):
+            _sub_end, sub = _parse_pattern(
+                masked, seg_start, seg_end, records, enums, depth + 1)
+            args.append(sub)
+        return body_end, {"kind": "name", "name": name, "start": i,
+                          "end": body_end, "name_end": name_end,
+                          "args": args, "open": j, "close": close,
+                          "type_args": type_args}
+    if j < limit and masked[j] == "{" and _is_record_pattern_head(
+            name, records, enums):
+        close = _matching_delim(masked, j)
+        inner_end = close if close is not None and close < limit else limit
+        body_end = inner_end + 1 if inner_end < limit else limit
+        fields = _parse_pattern_fields(
+            masked, j + 1, inner_end, records, enums, depth + 1)
+        return body_end, {"kind": "record", "name": name, "start": i,
+                          "end": body_end, "name_end": name_end,
+                          "fields": fields, "open": j, "close": close,
+                          "type_args": type_args}
+    return end, {"kind": "name", "name": name, "start": i, "end": end,
+                 "name_end": name_end, "args": [], "open": None,
+                 "close": None, "type_args": type_args}
+
+
+def _guard_end(masked, start, limit, records):
+    depth = 0
+    i = start
+    while i < limit:
+        ch = masked[i]
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth = max(0, depth - 1)
+        elif depth == 0 and masked.startswith("=>", i):
+            return i
+        elif depth == 0 and ch in "},,":
+            return i
+        elif depth == 0 and ch == "{":
+            before = masked[:i].rstrip()
+            word = re.search(r"([A-Za-z_][A-Za-z0-9_.]*)$", before)
+            if word is not None and _is_record_pattern_head(
+                    word.group(1), records, {}):
+                close = _matching_delim(masked, i)
+                if close is not None and close < limit:
+                    i = close + 1
+                    continue
+            return i
+        i += 1
+    return limit
+
+
+def _scan_body_end(masked, start, limit):
+    depth = 0
+    i = start
+    while i < limit:
+        ch = masked[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                return i
+            depth -= 1
+        elif ch == "," and depth == 0:
+            return i
+        i += 1
+    return limit
+
+
+def _parse_match_arms(masked, open_idx, limit, records, enums):
+    arms = []
+    i = open_idx + 1
+    while i < limit and len(arms) < 2000:
+        i = _skip_ws(masked, i, limit)
+        if i >= limit:
+            break
+        if masked[i] == ",":
+            i += 1
+            continue
+        pattern_start = i
+        pattern_end, node = _parse_pattern(
+            masked, i, limit, records, enums)
+        if pattern_end <= i:
+            break
+        j = _skip_ws(masked, pattern_end, limit)
+        guard_start = guard_end = None
+        if _masked_word(masked, j, limit, "if"):
+            guard_start = j
+            guard_end = _guard_end(masked, j + 2, limit, records)
+            j = _skip_ws(masked, guard_end, limit)
+        if masked.startswith("=>", j):
+            j = _skip_ws(masked, j + 2, limit)
+        if j < limit and masked[j] == "{":
+            close = _matching_delim(masked, j)
+            body_end = close + 1 if close is not None and close < limit \
+                else limit
+            body_close = close
+        else:
+            body_close = None
+            body_end = _scan_body_end(masked, j, limit)
+        arms.append({
+            "pattern_start": pattern_start,
+            "pattern_end": pattern_end,
+            "pattern_node": node,
+            "guard_start": guard_start,
+            "guard_end": guard_end,
+            "body_start": j,
+            "body_end": body_end,
+            "body_close": body_close,
+        })
+        i = body_end
+        i = _skip_ws(masked, i, limit)
+        if i < limit and masked[i] == ",":
+            i += 1
+    return arms
+
+
+def _pattern_node_path(node, cursor):
+    if not node:
+        return []
+    start = node.get("start", 0)
+    end = node.get("end", start)
+    if not (start <= cursor <= end):
+        return []
+    path = [node]
+    for child in node.get("args") or []:
+        found = _pattern_node_path(child, cursor)
+        if found:
+            return path + found
+    for field in node.get("fields") or []:
+        found = _pattern_node_path(field.get("pattern"), cursor)
+        if found:
+            return path + found
+    for child in node.get("items") or []:
+        found = _pattern_node_path(child, cursor)
+        if found:
+            return path + found
+    return path
+
+
+def _record_pattern_field_slot(masked, node, cursor):
+    if node.get("kind") != "record":
+        return None
+    open_idx = node.get("open")
+    close = node.get("close")
+    if open_idx is None:
+        return None
+    inner_end = close if close is not None else node.get("end", open_idx)
+    if not (open_idx < cursor <= inner_end):
+        return None
+    depth = 0
+    last_sep = open_idx + 1
+    colon = False
+    i = open_idx + 1
+    while i < cursor:
+        ch = masked[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        elif depth == 0 and ch == ",":
+            last_sep = i + 1
+            colon = False
+        elif depth == 0 and ch == ":":
+            colon = True
+        i += 1
+    if colon or depth > 0:
+        return None
+    segment = masked[last_sep:cursor]
+    if segment.strip().startswith(".."):
+        return None
+    return {"node": node, "segment_start": last_sep}
+
+
+def _match_pattern_context(text, line, character):
+    cursor = _cursor_offset(text, line, character)
+    if cursor is None:
+        return None
+    masked = _masked_text(text)
+    block = _match_block_for_cursor(masked, cursor)
+    if block is None:
+        return None
+    match_start, open_idx, close_idx = block
+    limit = close_idx if close_idx is not None else len(masked)
+    records = _record_decls(text or "")
+    enums = _enum_decls(text or "")
+    arms = _parse_match_arms(masked, open_idx, limit, records, enums)
+    base = {
+        "cursor": cursor,
+        "masked": masked,
+        "match_start": match_start,
+        "open": open_idx,
+        "close": close_idx,
+        "subject": masked[match_start + 5:open_idx].strip(),
+    }
+    for arm in arms:
+        if arm["pattern_start"] <= cursor <= arm["pattern_end"]:
+            path = _pattern_node_path(arm["pattern_node"], cursor)
+            return dict(base, position="pattern", arm=arm,
+                        root=arm["pattern_node"], path=path)
+        if (arm["guard_start"] is not None
+                and arm["guard_start"] <= cursor <= arm["guard_end"]):
+            return dict(base, position="guard", arm=arm, path=[])
+        if arm["body_start"] < cursor <= arm["body_end"]:
+            return dict(base, position="body", arm=arm, path=[])
+    if not arms:
+        if cursor > open_idx:
+            return dict(base, position="head", arm=None, path=[])
+        return None
+    if cursor < arms[0]["pattern_start"] or cursor >= arms[-1]["body_end"]:
+        return dict(base, position="head", arm=None, path=[])
+    return None
+
+
+def _annotated_type_for(text, name):
+    if not name:
+        return None
+    match = re.search(
+        r"\blet\s+%s\s*:\s*([A-Za-z_][A-Za-z0-9_.]*"
+        r"(?:\s*<[^>\n]*>)?)" % re.escape(name), text or "")
+    if match is not None:
+        return match.group(1).strip()
+    if re.search(r"\blet\s+%s\s*=\s*\[" % re.escape(name), text or ""):
+        return "List"
+    return None
+
+
+def _match_subject_type(text, context, masked, match_start, open_idx, line):
+    subject = masked[match_start + 5:open_idx].strip()
+    if not subject:
+        return None
+    records = _record_decls(context)
+    aliases = _alias_map(text)
+    if ALIAS_RE.match(subject):
+        return (_var_type_name(context, subject, line, records, aliases)
+                or _annotated_type_for(text or context, subject))
+    call = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_.]*)\s*\(.*\)", subject,
+                        re.S)
+    if call is not None:
+        return call.group(1)
+    literal = re.match(r"([A-Za-z_][A-Za-z0-9_.]*)\s*\{", subject)
+    if literal is not None:
+        return literal.group(1)
+    if subject.startswith("["):
+        return "List"
+    return None
+
+
+def _list_element_type(type_name):
+    match = re.match(r"\s*List\s*<\s*(.+?)\s*>", type_name or "")
+    if match is None:
+        return None
+    return match.group(1).strip() or None
+
+
+def _record_decl_for_pattern(uri, context, name, records, aliases):
+    ref = None
+    if uri:
+        ref = _resolve_record_ref(uri, context, name, records, aliases)
+    if ref is not None and ref.get("decl") is not None:
+        return ref["decl"], ref
+    base = (name or "").split(".")[-1]
+    decl = records.get(base)
+    return decl, None
+
+
+def _decl_field_type(decl, field, records):
+    if decl is None:
+        return None
+    for name, type_name in getattr(decl, "fields", None) or []:
+        if name == field:
+            return type_name
+    parent = _base_type_name(_record_extends(decl))
+    if parent in records:
+        return _decl_field_type(records[parent], field, records)
+    return None
+
+
+def _enum_decl_for_pattern(name, enums):
+    base, sep, variant = (name or "").rpartition(".")
+    if sep:
+        decl = (enums or {}).get(base)
+        return decl, variant
+    matches = [decl for decl in (enums or {}).values()
+               if any(entry[0] == name
+                      for entry in getattr(decl, "variants", None) or ())]
+    return (matches[0], name) if len(matches) == 1 else (None, name)
+
+
+def _enum_payload_types(name, enums):
+    if name in ("Ok", "Err"):
+        return ["Any"]
+    decl, variant = _enum_decl_for_pattern(name, enums)
+    if decl is None:
+        return []
+    for entry in getattr(decl, "variants", None) or ():
+        if entry[0] != variant:
+            continue
+        payload = entry[1] if len(entry) > 1 else None
+        if payload is None:
+            return []
+        if isinstance(payload, tuple):
+            return [item for item in payload]
+        return [payload]
+    return []
+
+
+def _pattern_type_mapping(decl, node):
+    params = list(getattr(decl, "type_params", None) or [])
+    args = list(node.get("type_args") or [])
+    if not params or len(params) != len(args):
+        return {}
+    return dict(zip(params, args))
+
+
+def _pattern_binding_list(node, uri, text, context, line, records, enums,
+                          aliases, expected=None):
+    out = []
+    if not node:
+        return out
+    kind = node.get("kind")
+    if kind == "list":
+        element = _list_element_type(expected)
+        for item in node.get("items") or []:
+            if (item.get("kind") == "name" and not item.get("args")
+                    and not item.get("open")):
+                out.append({"name": item.get("name"), "type": element,
+                            "start": item.get("start"),
+                            "end": item.get("end"),
+                            "source": "list element"})
+            else:
+                out.extend(_pattern_binding_list(
+                    item, uri, text, context, line, records, enums, aliases,
+                    element))
+        return out
+    if kind == "record":
+        decl, _ref = _record_decl_for_pattern(
+            uri, context, node.get("name"), records, aliases)
+        mapping = _pattern_type_mapping(decl, node)
+        for field in node.get("fields") or []:
+            field_name = field.get("field")
+            if field_name is None:
+                continue
+            field_type = _decl_field_type(decl, field_name, records)
+            if mapping and field_type:
+                field_type = _substitute_type_params(field_type, mapping)
+            sub = field.get("pattern")
+            if sub is None:
+                continue
+            if sub.get("kind") == "name" and not sub.get("args"):
+                out.append({
+                    "name": sub.get("name"),
+                    "type": field_type,
+                    "start": sub.get("start"),
+                    "end": sub.get("end"),
+                    "source": ("field `%s` of `%s`"
+                               % (field_name, node.get("name"))),
+                })
+            else:
+                out.extend(_pattern_binding_list(
+                    sub, uri, text, context, line, records, enums, aliases,
+                    field_type))
+        return out
+    if kind == "name":
+        args = node.get("args") or []
+        if not args:
+            return out
+        payloads = _enum_payload_types(node.get("name"), enums)
+        decl, _ref = _record_decl_for_pattern(
+            uri, context, node.get("name"), records, aliases)
+        mapping = _pattern_type_mapping(decl, node)
+        for index, sub in enumerate(args):
+            if decl is not None:
+                fields = list(getattr(decl, "fields", None) or [])
+                expected_type = fields[index][1] if index < len(fields) \
+                    else None
+                if mapping and expected_type:
+                    expected_type = _substitute_type_params(
+                        expected_type, mapping)
+                source = ("field `%s` of `%s`"
+                          % (fields[index][0], node.get("name"))) \
+                    if index < len(fields) else ("pattern of `%s`"
+                                                 % node.get("name"))
+            else:
+                expected_type = payloads[index] if index < len(payloads) \
+                    else None
+                source = "payload of `%s`" % node.get("name")
+            if sub.get("kind") == "name" and not sub.get("args"):
+                out.append({"name": sub.get("name"),
+                            "type": expected_type,
+                            "start": sub.get("start"),
+                            "end": sub.get("end"),
+                            "source": source})
+            else:
+                out.extend(_pattern_binding_list(
+                    sub, uri, text, context, line, records, enums, aliases,
+                    expected_type))
+        return out
+    for child in node.get("items") or []:
+        out.extend(_pattern_binding_list(
+            child, uri, text, context, line, records, enums, aliases,
+            expected))
+    return out
+
+
+def _pattern_head_items(uri, text, line, character):
+    context = _context_text(text, line, character)
+    records = _record_decls(context)
+    enums = _enum_decls(context)
+    aliases = _alias_map(text)
+    items = [{"label": "_", "kind": KIND_KEYWORD,
+              "detail": "wildcard pattern",
+              "documentation": "Matches any value and binds nothing."}]
+    for name, decl in sorted(records.items()):
+        items.append({
+            "label": name,
+            "kind": KIND_CLASS,
+            "detail": _record_signature_text(decl),
+            "documentation": "Record pattern for `%s`; use `%s { field, ... }`."
+                             % (name, name),
+        })
+    for name, decl in sorted(enums.items()):
+        items.append({
+            "label": name,
+            "kind": KIND_ENUM,
+            "detail": _enum_signature_text(decl),
+            "documentation": "Enum `%s`; qualify a variant as `%s.Variant`."
+                             % (name, name),
+        })
+        seen = set()
+        for entry in getattr(decl, "variants", None) or ():
+            variant = entry[0]
+            if variant in seen:
+                continue
+            seen.add(variant)
+            items.append({
+                "label": variant,
+                "kind": KIND_ENUM_MEMBER,
+                "detail": "%s.%s" % (name, variant),
+                "documentation": "Variant `%s` of enum `%s`."
+                                 % (variant, name),
+            })
+    for name, decl in sorted(_type_alias_decls(context).items()):
+        items.append({
+            "label": name,
+            "kind": KIND_TYPE,
+            "detail": _alias_signature(decl),
+            "documentation": "Type alias `%s` for `%s`."
+                             % (name, decl.target or "Any"),
+        })
+    for name in ("Ok", "Err"):
+        items.append({
+            "label": name,
+            "kind": KIND_ENUM_MEMBER,
+            "detail": "%s(value)" % name,
+            "documentation": "Result pattern `%s(value)`." % name,
+        })
+    for alias, imp in sorted(aliases.items()):
+        items.append({
+            "label": alias,
+            "kind": KIND_VARIABLE,
+            "detail": "namespace alias for %s" % imp["path"],
+        })
+    return items
+
+
+def _pattern_field_items(uri, text, line, character, name):
+    context = _context_text(text, line, character)
+    records = _record_decls(context)
+    aliases = _alias_map(text)
+    decl, ref = _record_decl_for_pattern(uri, context, name, records, aliases)
+    if decl is None:
+        return []
+    if ref is None:
+        ref = _local_record_ref(decl.name, decl)
+    scopes = _record_scopes(uri, context, ref, records, aliases)
+    target_owner = ref.get("owner")
+    items = []
+    seen = set()
+    for info in _aggregate_members(scopes).values():
+        if info["kind"] != "field":
+            continue
+        field = info["name"]
+        if field in seen:
+            continue
+        seen.add(field)
+        items.append({
+            "label": field,
+            "kind": KIND_FIELD,
+            "detail": "field %s: %s" % (field, info["type"]),
+            "documentation": "Pattern field `%s` of record `%s`."
+                             % (field, info["owner"]),
+        })
+    if not items:
+        for field, field_type in getattr(decl, "fields", None) or []:
+            if field in seen:
+                continue
+            seen.add(field)
+            items.append({
+                "label": field,
+                "kind": KIND_FIELD,
+                "detail": "field %s: %s" % (field, field_type),
+                "documentation": "Pattern field `%s` of record `%s`."
+                                 % (field, decl.name),
+            })
+    return items
+
+
+def _pattern_completion_items(uri, text, line, character, ctx):
+    if ctx.get("position") == "head":
+        return _pattern_head_items(uri, text, line, character)
+    if ctx.get("position") != "pattern":
+        return None
+    masked = ctx["masked"]
+    cursor = ctx["cursor"]
+    path = ctx.get("path") or []
+    for node in reversed(path):
+        if node.get("kind") == "list":
+            return None
+        if node.get("kind") == "record":
+            slot = _record_pattern_field_slot(masked, node, cursor)
+            if slot is not None:
+                return _pattern_field_items(
+                    uri, text, line, character, node.get("name"))
+    if path:
+        inner = path[-1]
+        head_end = inner.get("name_end", inner.get("end", 0))
+        if inner.get("kind") == "name" and cursor <= head_end:
+            return _pattern_head_items(uri, text, line, character)
+        if inner.get("kind") == "record" and cursor <= head_end:
+            return _pattern_head_items(uri, text, line, character)
+    return None
+
+
+def _match_pattern_hover(uri, text, line, character):
+    ctx = _match_pattern_context(text, line, character)
+    if ctx is None or ctx.get("position") != "pattern":
+        return None
+    name = word_at(text, line, character)
+    if not name:
+        return None
+    path = ctx.get("path") or []
+    root = ctx.get("root")
+    cursor = ctx["cursor"]
+    context = _context_text(text, line, character)
+    records = _record_decls(context)
+    enums = _enum_decls(context)
+    aliases = _alias_map(text)
+    for node in reversed(path):
+        head_end = node.get("name_end", node.get("end", 0))
+        node_name = node.get("name") or ""
+        base = node_name.split(".")[-1]
+        if cursor > head_end:
+            continue
+        if node.get("kind") in ("record", "name") and name in (
+                node_name, base):
+            if node.get("kind") == "record" or base in records:
+                decl, ref = _record_decl_for_pattern(
+                    uri, context, node_name, records, aliases)
+                if decl is not None:
+                    if ref is not None:
+                        scopes = _record_scopes(
+                            uri, context, ref, records, aliases)
+                        value = _record_hover_text(
+                            decl, qualifier=ref.get("qualifier"),
+                            scopes=scopes, text=context)
+                        arity = sum(
+                            1 for info in _aggregate_members(scopes).values()
+                            if info.get("kind") == "field")
+                    else:
+                        value = _record_hover_text(decl, text=context)
+                        arity = len(decl.fields)
+                    return (value + "\n\nRecord pattern arity: %d field(s)."
+                            % arity)
+            decl, variant = _enum_decl_for_pattern(node_name, enums)
+            if decl is not None:
+                return _enum_hover_text(decl)
+    if root is not None:
+        subject_type = _match_subject_type(
+            text, context, ctx["masked"], ctx["match_start"], ctx["open"],
+            line)
+        bindings = _pattern_binding_list(
+            root, uri, text, context, line, records, enums, aliases,
+            subject_type)
+        for binding in bindings:
+            if binding.get("name") != name:
+                continue
+            start = binding.get("start")
+            end = binding.get("end")
+            if start is not None and end is not None and not (
+                    start <= cursor <= end):
+                continue
+            type_name = binding.get("type")
+            suffix = ""
+            if binding.get("source"):
+                suffix = " (%s)" % binding["source"]
+            if type_name:
+                return ("GAMA-L pattern binding `%s`: `%s`%s."
+                        % (name, type_name, suffix))
+            return "GAMA-L pattern binding `%s`%s." % (name, suffix)
+    return None
+
+
 def _first_open_brace(text: str, start: int) -> int:
     """Index of the first ``{`` after ``start`` that is real code, or -1."""
     quote = None
@@ -3232,6 +4073,13 @@ def completion(uri: str, text: str, line: int = 0, character: int = 0):
         return {"isIncomplete": False,
                 "items": _member_type_items(text, line, character, parts,
                                              uri)}
+
+    pattern_ctx = _match_pattern_context(text, line, character)
+    if pattern_ctx is not None:
+        items = _pattern_completion_items(
+            uri, text, line, character, pattern_ctx)
+        if items is not None:
+            return {"isIncomplete": False, "items": items}
 
     # Generic type-parameter declaration: ``fn id<`` / ``fn id<A, ``.
     # Only built-in type names can be suggested because the names are chosen
@@ -5130,7 +5978,9 @@ def hover(uri: str, text: str, line: int, character: int):
     name = word_at(text, line, character)
     if not name:
         return None
-    value = _member_hover(uri, text, line, character)
+    value = _match_pattern_hover(uri, text, line, character)
+    if value is None:
+        value = _member_hover(uri, text, line, character)
     if value is None:
         value = _local_member_hover(text, line, character, uri)
     if value is None:
