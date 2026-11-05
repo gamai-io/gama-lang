@@ -134,16 +134,30 @@ Limitations (raise ``IRUnsupported`` / documented runtime errors)
   messages. Named record construction with a dotted type name
   (``geo.Point { ... }``) is not accepted by the parser; positional
   construction ``geo.Point(1, 2)`` works.
-* First-class functions are supported for IR-compiled functions only: lambdas
-  and named IR functions (including namespaced ones) can be stored, passed,
-  returned and called.  A value injected through ``run_program(env=...)`` must
-  be an IR function closure; host callables are never invoked.  Calls are
-  checked for callability and arity *before* their arguments are evaluated and
-  raise :class:`IRRuntimeError` with the interpreter's messages
+* First-class functions are supported for lambdas, named IR functions
+  (including namespaced ones) and **host-injected Python callables**: all
+  three can be stored, aliased, passed as arguments, returned and called
+  through a variable or expression callee.  Host callables are seeded with
+  ``run_program(ast, env={...})`` (or ``run_file``); a call to such a name
+  evaluates its arguments on the VM and then invokes the Python callable with
+  those values, returning the Python result as an IR value unchanged.  Positional
+  arity is read from the callable's ``inspect.signature`` when available and
+  checked *before* the arguments are evaluated; calls that cannot be
+  pre-validated (C builtins, required keyword-only parameters) defer to the
+  real call.  Any Python exception raised by the callable is wrapped in
+  :class:`IRRuntimeError` with the call site's line/col
+  (``host callable NAME raised TypeError: ...``); an ``IRRuntimeError`` raised
+  by the host is re-raised unchanged.  Host calls increment
+  ``GAMA_L_MAX_CALL_DEPTH`` like any other call; Python-side work inside the
+  callable is not instrumented by the IR step/expression counters.  No
+  ``gamal2.Interpreter`` is created or used.  Calls are checked for
+  callability and arity *before* their arguments are evaluated and raise
+  :class:`IRRuntimeError` with the interpreter's messages
   (``expression is not callable (...)``, ``... is not callable (...)``,
-  ``<lambda> expects N..M args, got K``).  Pipe expressions are supported for
-  the six documented stages; a hand-built AST with an unknown stage keyword
-  (or a stage missing its required argument) is rejected with
+  ``<lambda> expects N..M args, got K``); a non-callable value stays an error
+  even when it is a host object.  Pipe expressions are supported for the six
+  documented stages; a hand-built AST with an unknown stage keyword (or a
+  stage missing its required argument) is rejected with
   :class:`IRUnsupported` rather than silently ignored.
 * ``?`` is accepted only inside a named function whose declared return type is
   ``Result`` or ``Any``. Using it at the top level, in a function returning a
@@ -162,8 +176,13 @@ Limitations (raise ``IRUnsupported`` / documented runtime errors)
 * Map literals are JSON values: dotted field access (``m.k``) follows the
   reference fallback (it also works on maps), and ``m[0]`` uses the reference
   ``int`` coercion, so text-keyed maps are not indexable in either runtime.
-* Lambdas, first-class function values and expression callees (``f()`` where
-  ``f`` is a variable).  Calling such a value fails with a clear runtime error.
+* Host callables are invoked positionally only (the language has no keyword
+  arguments); arity that cannot be read from ``inspect.signature`` is left to
+  the call and reported as a wrapped ``TypeError``.  Host objects are not
+  traversed for methods: bind the callable itself in the environment (for
+  example ``{"greet": obj.greet}``) rather than expecting ``obj.greet()`` to
+  dispatch.  ``compile_file`` only compiles; pass ``env`` to
+  :func:`run_program` or :func:`run_file` when running.
 * ``break``/``continue`` outside a loop and ``return`` outside a function are
   rejected at compile time.
 * Runtime limits are enforced with interpreter parity:
@@ -195,6 +214,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import inspect
 import json
 import os
 import time
@@ -391,6 +411,74 @@ def _binop(op: str, left: Any, right: Any):
         }[op]()
     except (ZeroDivisionError, ArithmeticError, TypeError, ValueError) as exc:
         raise IRRuntimeError(f"{op}: {exc}") from None
+
+
+# ------------------------------------------------------- host callables
+def _host_name(fn: Any) -> str:
+    """Human-readable name for a host-injected callable."""
+    name = getattr(fn, "__name__", None)
+    if isinstance(name, str) and name:
+        return name
+    return type(fn).__name__
+
+
+def _host_arity(fn: Any):
+    """Return ``(required, maximum)`` positional bounds for a host callable.
+
+    ``maximum`` is ``None`` when the callable accepts ``*args``.  ``None`` is
+    returned when the signature cannot be inspected (many C builtins) or when a
+    required keyword-only parameter makes a positional call impossible.  In
+    those cases arity is left to the call itself and any ``TypeError`` is
+    wrapped at the call site.
+    """
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return None
+    required = 0
+    maximum: int | None = 0
+    for param in sig.parameters.values():
+        kind = param.kind
+        if kind in (inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD):
+            if param.default is inspect.Parameter.empty:
+                required += 1
+            if maximum is not None:
+                maximum += 1
+        elif kind is inspect.Parameter.VAR_POSITIONAL:
+            maximum = None
+        elif (kind is inspect.Parameter.KEYWORD_ONLY
+              and param.default is inspect.Parameter.empty):
+            # Cannot be supplied positionally: defer the exact failure to the
+            # call so it is reported as a wrapped TypeError.
+            return None
+    return required, maximum
+
+
+def _arity_text(required: int, maximum: int | None) -> str:
+    """Render positional arity bounds in the IR's existing call-error style."""
+    if maximum is None:
+        return f"at least {required}"
+    return f"{required}..{maximum}"
+
+
+def _check_host_arity(fn: Any, name: str, argc: int,
+                      line: int, col: int) -> None:
+    """Raise :class:`IRRuntimeError` when ``argc`` cannot fit ``fn``.
+
+    This runs before argument evaluation (it uses only the signature), matching
+    the IR's normal call-check order.  Callables whose signature is unavailable
+    are accepted here and produce a wrapped error only if the call really
+    fails.
+    """
+    bounds = _host_arity(fn)
+    if bounds is None:
+        return
+    required, maximum = bounds
+    if argc < required or (maximum is not None and argc > maximum):
+        raise IRRuntimeError(
+            f"{name} expects {_arity_text(required, maximum)} args, got {argc}",
+            line, col)
 
 
 # Core builtins the IR implements with reference semantics.
@@ -1555,6 +1643,26 @@ class _MethodTarget:
         self.col = col
 
 
+class _HostTarget:
+    """A host-injected Python callable awaiting its evaluated arguments.
+
+    Host callables are seeded through ``run_program(env=...)`` (or a
+    :class:`Frame`) and stay regular values in the VM: they can be bound,
+    aliased, passed as arguments, returned and called through a variable.  A
+    call site wraps the callable in this target after callability/arity checks
+    so ``CALL``/``CALL_VALUE`` can dispatch it without knowing how it was
+    reached.
+    """
+
+    __slots__ = ("fn", "name", "line", "col")
+
+    def __init__(self, fn: Any, name: str, line: int = 0, col: int = 0):
+        self.fn = fn
+        self.name = name
+        self.line = line
+        self.col = col
+
+
 class _VM:
     def __init__(self, initial: Any = None, records=None, enums=None,
                  methods=None, record_parents=None):
@@ -1700,6 +1808,55 @@ class _VM:
                 line, col) from None
         finally:
             self.call_depth -= 1
+
+    def _host_invoke(self, fn: Any, name: str, args: list,
+                     line: int = 0, col: int = 0) -> Any:
+        """Invoke a host Python callable with already-evaluated IR values.
+
+        Host calls count as normal calls for ``GAMA_L_MAX_CALL_DEPTH``.  Any
+        Python exception (``TypeError`` for a bad call, ``ValueError`` from the
+        body, ...) is wrapped in :class:`IRRuntimeError` with the call site's
+        line/col so no raw host exception escapes the VM.  ``IRRuntimeError``
+        is re-raised unchanged (a host may deliberately raise a language-level
+        error).  No ``gamal2.Interpreter`` is involved.
+        """
+        configured = self._env_int("GAMA_L_MAX_CALL_DEPTH", g2.DEFAULT_CALL_DEPTH)
+        depth_limit = min(configured, g2._call_depth_cap())
+        self.call_depth += 1
+        try:
+            if self.call_depth > depth_limit:
+                raise IRRuntimeError(
+                    f"call depth limit exceeded: {self.call_depth} > "
+                    f"GAMA_L_MAX_CALL_DEPTH={configured} "
+                    f"(effective cap {depth_limit})",
+                    line, col)
+            return fn(*args)
+        except IRRuntimeError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - deliberately wrapped
+            raise IRRuntimeError(
+                f"host callable {name} raised {type(exc).__name__}: {exc}",
+                line, col) from None
+        finally:
+            self.call_depth -= 1
+
+    def _dispatch_call(self, target: Any, args: list) -> Any:
+        """Run an already-validated call target with its evaluated args."""
+        if isinstance(target, _HostTarget):
+            return self._host_invoke(
+                target.fn, target.name, args, target.line, target.col)
+        if isinstance(target, _EnumCtorTarget):
+            return g2.EnumVal(
+                target.enum, target.variant, payloads=tuple(args))
+        if isinstance(target, _MethodTarget):
+            return self._invoke(
+                target.proto, target.closure, args,
+                self_value=target.receiver,
+                line=target.line, col=target.col)
+        return self._invoke(
+            target.proto, target.closure, args,
+            line=getattr(target, "line", 0),
+            col=getattr(target, "col", 0))
 
     # -- dotted names / records / enums ----------------------------------
     def _enum_value(self, name: str, line: int, col: int):
@@ -2335,19 +2492,27 @@ class _VM:
                     except IRRuntimeError:
                         fnval = None
                     if fnval is not None:
-                        if not isinstance(fnval, _FuncValue):
+                        if isinstance(fnval, _FuncValue):
+                            proto = fnval.proto
+                            required = sum(
+                                1 for p in proto.params if p.default is None)
+                            if not (required <= argc <= len(proto.params)):
+                                raise IRRuntimeError(
+                                    f"{fnval.name} expects {required}.."
+                                    f"{len(proto.params)} args, got {argc}",
+                                    line, col)
+                            stack.append(
+                                _CallTarget(proto, fnval.closure, line, col))
+                        elif callable(fnval):
+                            # Host-injected Python callable: check positional
+                            # arity from its signature before evaluating the
+                            # arguments, then dispatch through ``_HostTarget``.
+                            _check_host_arity(fnval, name, argc, line, col)
+                            stack.append(_HostTarget(fnval, name, line, col))
+                        else:
                             raise IRRuntimeError(
                                 f"{name} is not callable ({g2.tname(fnval)})",
                                 line, col)
-                        proto = fnval.proto
-                        required = sum(
-                            1 for p in proto.params if p.default is None)
-                        if not (required <= argc <= len(proto.params)):
-                            raise IRRuntimeError(
-                                f"{fnval.name} expects {required}.."
-                                f"{len(proto.params)} args, got {argc}",
-                                line, col)
-                        stack.append(_CallTarget(proto, fnval.closure, line, col))
                     else:
                         # Functions first, then enum constructors: the
                         # reference interpreter resolves ``Call`` through
@@ -2393,49 +2558,43 @@ class _VM:
                 if argc:
                     del stack[-argc:]
                 target = stack.pop()
-                if isinstance(target, _EnumCtorTarget):
-                    stack.append(g2.EnumVal(
-                        target.enum, target.variant, payloads=tuple(args)))
-                elif isinstance(target, _MethodTarget):
-                    stack.append(self._invoke(
-                        target.proto, target.closure, args,
-                        self_value=target.receiver,
-                        line=target.line, col=target.col))
-                else:
-                    stack.append(self._invoke(
-                        target.proto, target.closure, args,
-                        line=getattr(target, "line", 0),
-                        col=getattr(target, "col", 0)))
+                stack.append(self._dispatch_call(target, args))
             elif op == "CHECK_CALL_VALUE":
                 # Expression callee (``(fn ...)(2)``, ``make()(2)``): validate
                 # the already-evaluated callee before arguments run, matching
                 # ``Interpreter.expr(CallExpr)`` plus ``invoke``'s arity check.
                 argc, line, col = arg
                 target = stack[-1]
-                if not isinstance(target, _FuncValue):
+                if isinstance(target, _FuncValue):
+                    proto = target.proto
+                    required = sum(
+                        1 for p in proto.params if p.default is None)
+                    if not (required <= argc <= len(proto.params)):
+                        raise IRRuntimeError(
+                            f"{target.name} expects {required}.."
+                            f"{len(proto.params)} args, got {argc}",
+                            line, col)
+                    # Carry the call site so depth/limit errors match the
+                    # interpreter's line/col.
+                    stack[-1] = _CallTarget(
+                        proto, target.closure, line, col)
+                elif callable(target):
+                    # Expression callee resolving to a host callable: e.g.
+                    # ``(host)(1)`` or ``makeHost()(2)``.
+                    host_name = _host_name(target)
+                    _check_host_arity(target, host_name, argc, line, col)
+                    stack[-1] = _HostTarget(target, host_name, line, col)
+                else:
                     raise IRRuntimeError(
                         f"expression is not callable ({g2.tname(target)})",
                         line, col)
-                proto = target.proto
-                required = sum(1 for p in proto.params if p.default is None)
-                if not (required <= argc <= len(proto.params)):
-                    raise IRRuntimeError(
-                        f"{target.name} expects {required}.."
-                        f"{len(proto.params)} args, got {argc}",
-                        line, col)
-                # Carry the call site so depth/limit errors match the
-                # interpreter's line/col.
-                stack[-1] = _CallTarget(proto, target.closure, line, col)
             elif op == "CALL_VALUE":
                 argc = arg
                 args = stack[-argc:] if argc else []
                 if argc:
                     del stack[-argc:]
                 target = stack.pop()
-                stack.append(self._invoke(
-                    target.proto, target.closure, args,
-                    line=getattr(target, "line", 0),
-                    col=getattr(target, "col", 0)))
+                stack.append(self._dispatch_call(target, args))
             elif op == "MAKE_FUNC":
                 # A lambda/function value captures the *current* frame, so
                 # later mutations of captured variables are visible, exactly
@@ -2494,12 +2653,46 @@ def _top_level_decls(stmts: list) -> tuple[dict, dict, dict]:
     return records, enums, parents
 
 
-def compile_program(ast: Any) -> Program:
+def _host_binding_names(env: Any) -> list[str]:
+    """Names in ``env`` bound to a Python callable (accepted as host calls)."""
+    if isinstance(env, Frame):
+        values = env.vars
+    elif isinstance(env, dict):
+        values = env
+    else:
+        return []
+    return [name for name, value in values.items() if callable(value)]
+
+
+def _check_with_host_names(ast: list, env: Any) -> list:
+    """Type-check ``ast``, declaring host-bound callables as ``Function``.
+
+    The checker has no declaration for environment-injected values, so a
+    checked program that calls ``add`` from ``env={"add": ...}`` would fail with
+    ``unknown variable add``.  Seed the outer scope for exactly those names as
+    ``Function``; callers get ``Any`` results and dispatch is still resolved by
+    the VM at run time (a host name that is shadowed by an IR declaration keeps
+    the IR declaration, matching runtime precedence).
+    """
+    names = _host_binding_names(env)
+    checker = g2.Checker()
+    for name in names:
+        checker.scope[0][name] = "Function"
+    checker.program(ast)
+    return ast
+
+
+def compile_program(ast: Any, env: Any = None) -> Program:
     """Compile a parsed (optionally checked) ``gamal2`` AST into a :class:`Program`.
 
     ``ast`` is the list of statement nodes returned by ``gamal2.parse`` or
     ``gamal2.check``.  Passing a :class:`Program` returns it unchanged; passing
     a source string is a convenience that parses and checks it first.
+
+    ``env`` (optional) is the same initial environment later passed to
+    :func:`run_program`.  When compiling a source string it only affects
+    checking: callable bindings are treated as ``Function`` so the source may
+    refer to host-injected names.  An already-parsed/checked AST is unchanged.
 
     Imports cannot be resolved from a source string; use :func:`compile_file`
     for a ``.gm`` file (plain imports are flattened by the core loader).
@@ -2507,7 +2700,7 @@ def compile_program(ast: Any) -> Program:
     if isinstance(ast, Program):
         return ast
     if isinstance(ast, str):
-        ast = g2.check(ast)
+        ast = _check_with_host_names(list(g2.parse(ast)), env)
     if not isinstance(ast, (list, tuple)):
         raise TypeError("compile_program expects a statement list, Program or source string")
     stmts = list(ast)
@@ -2525,7 +2718,7 @@ def compile_program(ast: Any) -> Program:
                    methods=top_methods, record_parents=top_parents)
 
 
-def compile_file(path: Any) -> Program:
+def compile_file(path: Any, env: Any = None) -> Program:
     """Compile a ``.gm`` file, resolving imports first via the core loader.
 
     ``gamal2.check_file`` is the same front end ``gamal2 run`` uses: it applies
@@ -2541,15 +2734,28 @@ def compile_file(path: Any) -> Program:
   backend resolves them through the same tables it uses for local
   declarations.  Nullary and payload enum declarations (constructors and
   match bindings) compile through the same path.
+
+  ``env`` is the initial environment later passed to :func:`run_program`; when
+  given, callable bindings are declared to the checker as ``Function`` so the
+  file may call host-injected Python callables.  ``compile_file`` itself only
+  compiles; pass the same ``env`` to :func:`run_file` (or ``run_program``) to
+  run it.
   """
-    return compile_program(g2.check_file(str(path)))
+    ast = g2.load_file(str(path))
+    _check_with_host_names(ast, env)
+    return compile_program(ast)
 
 
 def run_program(ast: Any, env: Any = None) -> RunResult:
     """Compile (if needed) and run a program, returning printed output + globals.
 
     ``env`` seeds the global frame: a ``dict`` of initial bindings, a
-    :class:`Frame`, or ``None``.
+    :class:`Frame`, or ``None``.  Values may be plain Python callables; calling
+    such a name/alias/parameter dispatches to the Python function with the
+    already-evaluated IR arguments and returns its result as an IR value.
+    Exceptions raised by the host callable become :class:`IRRuntimeError` with
+    the call site's line/col.  Host calls count against
+    ``GAMA_L_MAX_CALL_DEPTH`` like IR calls.
     """
     program = ast if isinstance(ast, Program) else compile_program(ast)
     vm = _VM(env, program.records, program.enums, program.methods,
@@ -2565,5 +2771,7 @@ def run_file(path: Any, env: Any = None) -> RunResult:
 
     This is the file-aware counterpart of :func:`run_program`, so plain imports
     (and missing/cyclic import errors) behave exactly like the interpreter.
+    ``env`` is forwarded to :func:`compile_file` so checked files may call
+    host-injected Python callables, and then to the VM.
     """
-    return run_program(compile_file(path), env=env)
+    return run_program(compile_file(path, env=env), env=env)
