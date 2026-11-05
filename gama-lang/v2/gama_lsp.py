@@ -440,9 +440,22 @@ def _effects_text(effects) -> str:
     return (" effects { " + " ".join(items) + " }") if items else ""
 
 
-def signature_text(name: str, params, ret: str, effects) -> str:
-    return "%s(%s) -> %s%s" % (
-        name, ", ".join(params), ret or "Any", _effects_text(effects))
+def signature_text(name: str, params, ret: str, effects,
+                   inferred_ret=None, inferred_effects=None,
+                   ret_omitted=False, effects_omitted=False) -> str:
+    label = "%s(%s)" % (name, ", ".join(params))
+    if ret_omitted:
+        if inferred_ret:
+            label += " (inferred: %s)" % inferred_ret
+    else:
+        label += " -> %s" % (ret or "Any")
+    if effects_omitted:
+        if inferred_effects:
+            label += " (inferred effects { %s })" % " ".join(
+                sorted(inferred_effects))
+    else:
+        label += _effects_text(effects)
+    return label
 
 
 def builtin_signature(name: str):
@@ -458,19 +471,48 @@ def _param_label(param) -> str:
     return "%s: %s" % (param.name, type_name)
 
 
-def fn_signature(node) -> str:
+def fn_signature(node, text=None) -> str:
     names = getattr(node, "type_params", None) or []
     bounds = getattr(node, "type_param_bounds", None) or {}
     parts = [(str(n) + (": " + str(bounds[n]) if n in bounds else ""))
              for n in names]
     name = node.name + (("<" + ", ".join(parts) + ">") if parts else "")
-    return signature_text(name, [_param_label(p) for p in node.params],
-                          node.ret, node.effects)
+    ret_omitted = text is not None and getattr(node, "ret", None) is None
+    effects_omitted = text is not None and getattr(node, "effects", None) is None
+    inferred_ret = inferred_effects = None
+    if text and (ret_omitted or effects_omitted):
+        try:
+            ctx = _inference_context(text)
+            if ret_omitted:
+                inferred_ret = _infer_return_type(node, ctx)
+            if effects_omitted:
+                inferred_effects = _infer_effects(node, ctx)
+        except Exception:
+            inferred_ret = inferred_effects = None
+    return signature_text(
+        name, [_param_label(p) for p in node.params], node.ret, node.effects,
+        inferred_ret=inferred_ret, inferred_effects=inferred_effects,
+        ret_omitted=ret_omitted, effects_omitted=effects_omitted)
 
 
-def lambda_signature(node, prefix="fn") -> str:
-    return signature_text(prefix, [_param_label(p) for p in node.params],
-                          node.ret, node.effects)
+def lambda_signature(node, prefix="fn", text=None) -> str:
+    ret_omitted = text is not None and getattr(node, "ret", None) is None
+    effects_omitted = text is not None and getattr(node, "effects", None) is None
+    inferred_ret = inferred_effects = None
+    if text and (ret_omitted or effects_omitted):
+        try:
+            ctx = _inference_context(text)
+            if ret_omitted:
+                inferred_ret = _infer_return_type(node, ctx)
+            if effects_omitted:
+                inferred_effects = _infer_effects(node, ctx)
+        except Exception:
+            inferred_ret = inferred_effects = None
+    return signature_text(
+        prefix, [_param_label(p) for p in node.params], node.ret,
+        node.effects, inferred_ret=inferred_ret,
+        inferred_effects=inferred_effects, ret_omitted=ret_omitted,
+        effects_omitted=effects_omitted)
 
 
 def _type_param_names(node) -> list:
@@ -493,9 +535,9 @@ def _type_param_doc(node) -> str | None:
         for item in positions)
 
 
-def _fn_hover_text(node, intro=None, qualifier=None) -> str:
+def _fn_hover_text(node, intro=None, qualifier=None, text=None) -> str:
     """Markdown hover text for an ``fn`` declaration, including generics."""
-    signature = fn_signature(node)
+    signature = fn_signature(node, text)
     if qualifier:
         signature = "%s.%s" % (qualifier, signature)
     label = "fn %s" % signature
@@ -542,6 +584,30 @@ def _document_without_line(text: str, line: int) -> str:
         rows = list(rows)
         rows[line] = ""
     return "\n".join(rows)
+
+
+def _parseable_text(text, line=None):
+    """``text`` if it parses, else a copy with one incomplete line blanked."""
+    if _parse_or_none(text) is not None:
+        return text
+    rows = (text or "").split("\n")
+    candidates = []
+    if line is not None:
+        candidates.append(line)
+    if rows:
+        candidates.append(len(rows) - 1)
+    candidates.extend(range(len(rows) - 1, -1, -1))
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen or not (0 <= candidate < len(rows)):
+            continue
+        seen.add(candidate)
+        if len(seen) > 200:
+            break
+        candidate_text = _document_without_line(text, candidate)
+        if _parse_or_none(candidate_text) is not None:
+            return candidate_text
+    return text
 
 
 def _imports(text: str):
@@ -1259,6 +1325,17 @@ def _module_functions(uri: str, path: str):
     return [node for node in declarations if isinstance(node, G.Fn)]
 
 
+def _module_source(uri: str, path: str):
+    """Raw text of an imported module, or ``None`` when unreadable."""
+    target = _resolve_module(uri, path)
+    if target is None:
+        return None
+    try:
+        return target.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+
+
 def _expr_type(expr):
     """Best-effort static type for a literal-ish constant expression."""
     if isinstance(expr, G.Literal):
@@ -1271,6 +1348,388 @@ def _expr_type(expr):
     if isinstance(expr, G.MapExpr):
         return "Json"
     return None
+
+
+# ------------------------------------------------------- inferred signatures
+# The core erases an omitted ``->``/``effects`` to ``Any``/empty and checks
+# bodies against that erasure; it does not expose inferred return types or
+# effect sets on the AST.  The helpers below recompute a conservative subset
+# from the parsed body so hover/signature help can show ``(inferred: T)`` and
+# ``(inferred effects { ... })``.  Anything they cannot prove stays quiet.
+NUMERIC_TYPES = {"Int", "Decimal"}
+_COMPARISON_OPS = {"<", "<=", ">", ">=", "&&", "||", "==", "!="}
+
+
+def _inference_context(text):
+    """Declaration maps for best-effort inference over one document."""
+    ctx = {"funcs": {}, "records": {}, "enums": {}}
+    if not text:
+        return ctx
+    program = _parse_or_none(text)
+    if program is None:
+        # Live edits routinely leave one line incomplete; blank lines (last
+        # first) until the declarations around the cursor parse again.
+        rows = text.split("\n")
+        for index in list(range(len(rows) - 1, -1, -1))[:200]:
+            program = _parse_or_none(_document_without_line(text, index))
+            if program is not None:
+                break
+    if program is None:
+        return ctx
+    for node in _walk(program):
+        if isinstance(node, G.Fn) and node.name not in ctx["funcs"]:
+            ctx["funcs"][node.name] = node
+        elif isinstance(node, G.RecordDecl) and node.name not in ctx["records"]:
+            ctx["records"][node.name] = node
+        elif isinstance(node, G.EnumDecl) and node.name not in ctx["enums"]:
+            ctx["enums"][node.name] = node
+    return ctx
+
+
+def _base_type_name(type_name):
+    if not type_name:
+        return None
+    return str(type_name).split("<", 1)[0].strip() or None
+
+
+def _record_field_type(decl, field, ctx, depth=0):
+    """Declared type of ``field`` on ``decl`` (inherited fields included)."""
+    if decl is None or depth > 64:
+        return None
+    for name, type_name in getattr(decl, "fields", None) or []:
+        if name == field:
+            return type_name
+    parent = _base_type_name(_record_extends(decl))
+    if parent in ctx["records"]:
+        return _record_field_type(ctx["records"][parent], field, ctx, depth + 1)
+    return None
+
+
+def _resolve_record_type(type_name, ctx):
+    base = _base_type_name(type_name)
+    return base if base in ctx["records"] else None
+
+
+def _resolve_receiver_type(receiver, ctx, env):
+    """Record type for a receiver expression path, or None."""
+    if not receiver:
+        return None
+    if receiver in env:
+        return _resolve_record_type(env.get(receiver), ctx)
+    if "." not in receiver:
+        return None
+    head, _, tail = receiver.partition(".")
+    current = _resolve_record_type(env.get(head), ctx)
+    for part in tail.split("."):
+        if current is None:
+            return None
+        decl = ctx["records"].get(current)
+        current = _resolve_record_type(
+            _record_field_type(decl, part, ctx), ctx)
+    return current
+
+
+def _find_method(decl, name):
+    for method in getattr(decl, "methods", None) or []:
+        if method.name == name:
+            return method
+    return None
+
+
+def _enum_variant_type(name, ctx):
+    """Enum name for an (optionally qualified) variant reference, or None."""
+    if not name:
+        return None
+    base, sep, variant = name.rpartition(".")
+    if sep:
+        if base in ctx["enums"]:
+            return base
+        return None
+    matches = [enum for enum, decl in ctx["enums"].items()
+               if any(item[0] == variant for item in decl.variants)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _infer_call_type(name, args, ctx, env, seen, self_type=None):
+    """Best-effort type of a call expression."""
+    if name in ctx["records"]:
+        return name
+    builtin = G.BUILTINS.get(name) if hasattr(G, "BUILTINS") else None
+    if builtin is not None:
+        ret = builtin[1]
+        return ret if ret not in (None, "Any") else None
+    func = ctx["funcs"].get(name)
+    if func is not None:
+        tparams = set(getattr(func, "type_params", None) or [])
+        if tparams:
+            bindings = {}
+            for param, arg in zip(func.params, args):
+                if param.type_name in tparams:
+                    arg_type = _infer_expr_type(
+                        arg, ctx, env, seen, self_type)
+                    if arg_type and arg_type != "Any":
+                        bindings.setdefault(param.type_name, arg_type)
+            ret = getattr(func, "ret", None)
+            if ret:
+                return bindings.get(ret, ret)
+        return _infer_return_type(func, ctx, seen, self_type=None)
+    if "." in name:
+        receiver, _, member = name.rpartition(".")
+        record = _resolve_receiver_type(receiver, ctx, env)
+        if record is not None:
+            method = _find_method(ctx["records"][record], member)
+            if method is not None:
+                return _infer_return_type(
+                    method, ctx, seen, self_type=record)
+        enum = _enum_variant_type(name, ctx)
+        if enum is not None:
+            return enum
+        return None
+    return _enum_variant_type(name, ctx)
+
+
+def _resolve_var_type(name, ctx, env):
+    """Type of a variable reference, including dotted field paths."""
+    if not name:
+        return None
+    if name in env:
+        return env.get(name)
+    if name in ctx["funcs"]:
+        return "Function"
+    parts = name.split(".")
+    current = _base_type_name(env.get(parts[0]))
+    if current is None:
+        return _enum_variant_type(name, ctx)
+    for part in parts[1:]:
+        if current not in ctx["records"]:
+            return None
+        decl = ctx["records"][current]
+        current = _base_type_name(_record_field_type(decl, part, ctx))
+        if current is None:
+            return None
+    return current
+
+
+def _infer_expr_type(expr, ctx, env=None, seen=None, self_type=None):
+    """Conservative static type for an expression (None when not provable)."""
+    env = env or {}
+    if seen is None:
+        seen = set()
+    if expr is None:
+        return None
+    if isinstance(expr, G.Literal):
+        return G.tname(expr.value)
+    if isinstance(expr, G.Lambda):
+        return "Function"
+    if isinstance(expr, G.ListExpr):
+        kinds = {_infer_expr_type(item, ctx, env, seen, self_type)
+                 for item in expr.items}
+        if not kinds or None in kinds:
+            return None
+        return "Table" if kinds <= {"Json"} else "List"
+    if isinstance(expr, G.MapExpr):
+        return "Json"
+    if isinstance(expr, G.Var):
+        return _resolve_var_type(expr.name, ctx, env)
+    if isinstance(expr, G.Unary):
+        inner = _infer_expr_type(expr.right, ctx, env, seen, self_type)
+        if expr.op == "!":
+            return "Bool"
+        return inner if inner in NUMERIC_TYPES else None
+    if isinstance(expr, G.Binary):
+        left = _infer_expr_type(expr.left, ctx, env, seen, self_type)
+        right = _infer_expr_type(expr.right, ctx, env, seen, self_type)
+        if expr.op in ("+", "-", "*", "/", "%"):
+            if expr.op == "+" and left == right == "Text":
+                return "Text"
+            if left in NUMERIC_TYPES and right in NUMERIC_TYPES:
+                return ("Decimal" if "Decimal" in (left, right)
+                        or expr.op == "/" else "Int")
+            return None
+        if expr.op in _COMPARISON_OPS:
+            return "Bool"
+        return None
+    if isinstance(expr, G.Index):
+        base = _infer_expr_type(expr.base, ctx, env, seen, self_type)
+        if base == "Text":
+            return "Text"
+        if base == "Table":
+            return "Json"
+        return None
+    if isinstance(expr, G.RecordLit):
+        return expr.name if expr.name in ctx["records"] else None
+    if isinstance(expr, G.RecordUpdate):
+        return _infer_expr_type(expr.base, ctx, env, seen, self_type)
+    if isinstance(expr, G.Call):
+        return _infer_call_type(expr.name, expr.args, ctx, env, seen, self_type)
+    if isinstance(expr, G.CallExpr):
+        callee = expr.callee
+        if isinstance(callee, G.Lambda):
+            return _infer_return_type(callee, ctx, seen)
+        if isinstance(callee, G.Var) and callee.name in ctx["funcs"]:
+            return _infer_call_type(
+                callee.name, expr.args, ctx, env, seen, self_type)
+        return None
+    if isinstance(expr, G.Pipe):
+        current = _infer_expr_type(expr.base, ctx, env, seen, self_type)
+        for stage, _args in expr.stages:
+            if stage == "sum":
+                current = "Decimal"
+            elif stage == "count":
+                current = "Int"
+            elif stage == "map":
+                current = "List"
+            elif current not in ("List", "Table", "Any", None):
+                return None
+        return current if current in ("List", "Table", "Int", "Decimal") \
+            else None
+    return None
+
+
+def _infer_returns_in(stmts, ctx, env, seen, self_type, out):
+    """Collect inferred types of every ``return`` reachable in ``stmts``."""
+    local = dict(env)
+    for stmt in stmts or []:
+        if isinstance(stmt, G.Let):
+            if isinstance(stmt.expr, G.Lambda):
+                local[stmt.name] = "Function"
+            elif stmt.type_name:
+                local[stmt.name] = stmt.type_name
+            else:
+                inferred = _infer_expr_type(
+                    stmt.expr, ctx, local, seen, self_type)
+                if inferred:
+                    local[stmt.name] = inferred
+        elif isinstance(stmt, G.Assign):
+            inferred = _infer_expr_type(
+                stmt.expr, ctx, local, seen, self_type)
+            if stmt.name not in local and inferred:
+                local[stmt.name] = inferred
+        elif isinstance(stmt, G.Return):
+            out.append(_infer_expr_type(
+                stmt.expr, ctx, local, seen, self_type))
+        elif isinstance(stmt, G.If):
+            _infer_returns_in(stmt.then, ctx, local, seen, self_type, out)
+            other = stmt.other
+            if isinstance(other, list):
+                _infer_returns_in(other, ctx, local, seen, self_type, out)
+            elif other is not None:
+                _infer_returns_in([other], ctx, local, seen, self_type, out)
+        elif isinstance(stmt, (G.For, G.While)):
+            inner = dict(local)
+            if isinstance(stmt, G.For):
+                inner.pop(getattr(stmt, "name", None), None)
+            _infer_returns_in(stmt.body, ctx, inner, seen, self_type, out)
+        elif isinstance(stmt, G.Match):
+            for _kind, bindings, body in stmt.arms:
+                inner = dict(local)
+                for binding in bindings or []:
+                    if isinstance(binding, str):
+                        inner.pop(binding, None)
+                _infer_returns_in(body, ctx, inner, seen, self_type, out)
+
+
+def _infer_return_type(node, ctx, seen=None, self_type=None):
+    """Inferred return type for a fn/method/lambda with no annotation."""
+    declared = getattr(node, "ret", None)
+    if declared:
+        return declared
+    if ctx is None:
+        return None
+    if seen is None:
+        seen = set()
+    key = id(node)
+    if key in seen:
+        return None
+    seen = seen | {key}
+    env = {}
+    if self_type:
+        env["self"] = self_type
+    for param in getattr(node, "params", None) or []:
+        if param.type_name and param.type_name != "Any":
+            env[param.name] = param.type_name
+    out = []
+    _infer_returns_in(getattr(node, "body", None), ctx, env, seen,
+                      self_type, out)
+    if not out or any(item is None for item in out):
+        return None
+    kinds = set(out)
+    if len(kinds) != 1:
+        return None
+    inferred = next(iter(kinds))
+    return None if inferred == "Any" else inferred
+
+
+def _effect_nodes(node):
+    """Like ``_walk`` but does not descend into nested fn/lambda bodies."""
+    if isinstance(node, (G.Fn, G.Method, G.Lambda)):
+        return
+    if dataclasses.is_dataclass(node) and not isinstance(node, type):
+        yield node
+        for field in dataclasses.fields(node):
+            yield from _effect_nodes(getattr(node, field.name, None))
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            yield from _effect_nodes(item)
+    elif isinstance(node, dict):
+        for item in node.values():
+            yield from _effect_nodes(item)
+
+
+def _call_effects(name, ctx, env, seen, self_type, effects):
+    if name in G.BUILTINS:
+        effects.update(G.BUILTINS[name][0] or ())
+        return
+    if name in ctx["records"]:
+        return
+    func = ctx["funcs"].get(name)
+    if func is not None:
+        effects.update(_infer_effects(func, ctx, seen))
+        return
+    if "." in name:
+        receiver, _, member = name.rpartition(".")
+        record = _resolve_receiver_type(receiver, ctx, env)
+        if record is not None:
+            method = _find_method(ctx["records"][record], member)
+            if method is not None:
+                effects.update(_infer_effects(
+                    method, ctx, seen, self_type=record))
+        return
+
+
+def _infer_effects(node, ctx, seen=None, self_type=None):
+    """Inferred effects for a fn/method/lambda with no ``effects`` clause."""
+    declared = getattr(node, "effects", None)
+    if declared is not None:
+        return set(declared)
+    if ctx is None:
+        return None
+    if seen is None:
+        seen = set()
+    key = id(node)
+    if key in seen:
+        return set()
+    seen = seen | {key}
+    env = {}
+    if self_type:
+        env["self"] = self_type
+    for param in getattr(node, "params", None) or []:
+        if param.type_name and param.type_name != "Any":
+            env[param.name] = param.type_name
+    effects = set()
+    for item in _effect_nodes(getattr(node, "body", None)):
+        if isinstance(item, G.Print):
+            effects.add("io.print")
+        elif isinstance(item, G.Prove):
+            effects.add("proof.write")
+        elif isinstance(item, G.Verify):
+            effects.add("proof.read")
+        elif isinstance(item, G.Call):
+            _call_effects(item.name, ctx, env, seen, self_type, effects)
+        elif isinstance(item, G.CallExpr) \
+                and isinstance(item.callee, G.Lambda):
+            effects.update(_infer_effects(item.callee, ctx, seen))
+    return effects
 
 
 def _const_type(node):
@@ -1864,7 +2323,7 @@ def _context_text(text, line, character):
 
 
 def _method_signature_text(method, owner=None, qualifier=None,
-                          include_self=True):
+                          include_self=True, text=None):
     """Signature text for a record method.
 
     ``self`` is included by default so completion/hover show the declared
@@ -1876,17 +2335,34 @@ def _method_signature_text(method, owner=None, qualifier=None,
     params = list(getattr(method, "params", None) or [])
     if not include_self and params and params[0].name == "self":
         params = params[1:]
-    return signature_text(name, [_param_label(p) for p in params],
-                          getattr(method, "ret", None) or "Any",
-                          getattr(method, "effects", None))
+    ret_omitted = text is not None and getattr(method, "ret", None) is None
+    effects_omitted = text is not None and \
+        getattr(method, "effects", None) is None
+    inferred_ret = inferred_effects = None
+    if text and (ret_omitted or effects_omitted):
+        try:
+            ctx = _inference_context(text)
+            if ret_omitted:
+                inferred_ret = _infer_return_type(method, ctx,
+                                                  self_type=owner)
+            if effects_omitted:
+                inferred_effects = _infer_effects(method, ctx,
+                                                  self_type=owner)
+        except Exception:
+            inferred_ret = inferred_effects = None
+    return signature_text(
+        name, [_param_label(p) for p in params], method.ret, method.effects,
+        inferred_ret=inferred_ret, inferred_effects=inferred_effects,
+        ret_omitted=ret_omitted, effects_omitted=effects_omitted)
 
 
 def _record_methods(decl):
     return list(getattr(decl, "methods", None) or [])
 
 
-def _method_hover_text(method, owner, receiver=None):
-    signature = _method_signature_text(method, owner, qualifier=owner)
+def _method_hover_text(method, owner, receiver=None, text=None):
+    signature = _method_signature_text(method, owner, qualifier=owner,
+                                       text=text)
     self_type = owner
     if getattr(method, "params", None):
         self_type = method.params[0].type_name or owner
@@ -1902,15 +2378,16 @@ def _method_decl_hover(text, name, line):
         for method in _record_methods(decl):
             if method.name == name and int(getattr(method, "line", 0) or 0) \
                     == int(line) + 1:
-                return _method_hover_text(method, decl.name)
+                return _method_hover_text(method, decl.name, text=text)
     return None
 
 
-def _record_signature_text(decl, qualifier=None):
+def _record_signature_text(decl, qualifier=None, text=None):
     parts = ["%s: %s" % (name, type_name)
              for name, type_name in decl.fields]
     for method in _record_methods(decl):
-        parts.append("fn " + _method_signature_text(method, decl.name))
+        parts.append("fn " + _method_signature_text(method, decl.name,
+                                                    text=text))
     body = ", ".join(parts)
     if qualifier:
         head = "%s.%s" % (qualifier, decl.name)
@@ -1922,9 +2399,10 @@ def _record_signature_text(decl, qualifier=None):
     return head + (" { %s }" % body if body else " { }")
 
 
-def _record_hover_text(decl, qualifier=None, scopes=None):
+def _record_hover_text(decl, qualifier=None, scopes=None, text=None):
     fields = ", ".join("`%s: %s`" % pair for pair in decl.fields)
-    methods = ", ".join("`%s`" % _method_signature_text(method, decl.name)
+    methods = ", ".join("`%s`" % _method_signature_text(method, decl.name,
+                                                        text=text)
                         for method in _record_methods(decl))
     inherited = []
     if scopes:
@@ -1943,10 +2421,10 @@ def _record_hover_text(decl, qualifier=None, scopes=None):
             for info in inherited))
     if facts:
         return ("`%s`\n\nGAMA-L record `%s` with %s."
-                % (_record_signature_text(decl, qualifier), decl.name,
-                   " and ".join(facts)))
+                % (_record_signature_text(decl, qualifier, text=text),
+                   decl.name, " and ".join(facts)))
     return ("`%s`\n\nGAMA-L record `%s` (no fields)."
-            % (_record_signature_text(decl, qualifier), decl.name))
+            % (_record_signature_text(decl, qualifier, text=text), decl.name))
 
 
 def _enum_signature_text(decl):
@@ -1970,7 +2448,7 @@ def _structural_hover(text, name, uri=None):
     if name in records:
         ref = _local_record_ref(name, records[name])
         scopes = _record_scopes(uri, text, ref, records, _alias_map(text))
-        return _record_hover_text(records[name], scopes=scopes)
+        return _record_hover_text(records[name], scopes=scopes, text=text)
     enums = _enum_decls(text)
     if name in enums:
         return _enum_hover_text(enums[name])
@@ -2010,8 +2488,9 @@ def _local_member_hover(text, line, character, uri=None):
         return None
     parts, member = found
     context = _context_text(text, line, character)
-    records = _record_decls(context)
-    enums = _enum_decls(context)
+    parseable = _parseable_text(context, line)
+    records = _record_decls(parseable)
+    enums = _enum_decls(parseable)
     aliases = _alias_map(text)
     if len(parts) == 1:
         enum = enums.get(parts[0])
@@ -2068,7 +2547,7 @@ def _local_member_hover(text, line, character, uri=None):
                    inherited))
     if info["kind"] == "method":
         value = _method_hover_text(info["method"], info["owner"],
-                                   receiver=receiver)
+                                   receiver=receiver, text=parseable)
         if info.get("inherited"):
             value += "\n\nInherited by record `%s`." % ref["owner"]
         return value
@@ -4576,11 +5055,11 @@ def _decl_hover(text: str, name: str, line: int | None = None):
     if node is None:
         return None
     if isinstance(node, G.Fn):
-        return _fn_hover_text(node)
+        return _fn_hover_text(node, text=text)
     expr = getattr(node, "expr", None)
     if isinstance(expr, G.Lambda):
         return ("`let %s = %s`\n\nGAMA-L function value `%s`."
-                % (name, lambda_signature(expr), name))
+                % (name, lambda_signature(expr, text=text), name))
     type_name = getattr(node, "type_name", None)
     if type_name:
         return "GAMA-L let `%s`: `%s`" % (name, type_name)
@@ -4595,6 +5074,7 @@ def _member_hover(uri: str, text: str, line: int, character: int):
     imp = _alias_map(text).get(alias)
     if imp is None:
         return None
+    module_text = _module_source(uri, imp["path"])
     for node in _module_declarations(uri, imp["path"]) or []:
         if node.name != name:
             continue
@@ -4604,7 +5084,7 @@ def _member_hover(uri: str, text: str, line: int, character: int):
         if isinstance(node, G.Fn):
             return _fn_hover_text(
                 node, intro="GAMA-L function from `%s`." % imp["path"],
-                qualifier=alias) + renamed
+                qualifier=alias, text=module_text) + renamed
         if isinstance(node, G.RecordDecl):
             original = _original_name(node)
             scope = _module_record_scope(uri, imp, original)
@@ -4615,7 +5095,8 @@ def _member_hover(uri: str, text: str, line: int, character: int):
                     ref = dict(ref, owner=node.name, decl=node)
                 scopes = _record_scopes(scope["uri"], scope["text"], ref,
                                         scope["records"], scope["aliases"])
-            hover = _record_hover_text(node, alias, scopes=scopes)
+            hover = _record_hover_text(node, alias, scopes=scopes,
+                                       text=module_text)
             return ("%s\n\nGAMA-L record from `%s` (imported as `%s`).%s"
                     % (hover, imp["path"], alias, renamed))
         if isinstance(node, G.EnumDecl):
@@ -4755,20 +5236,36 @@ def _call_context(prefix: str):
     return callee, prefix[open_idx + 1:], type_args
 
 
-def _node_signature(node, type_args=None):
+def _node_signature(node, type_args=None, text=None):
     """``(label, parameter labels, type parameters, parameter types)``."""
     names = _type_param_names(node)
     if type_args and names:
         mapping = dict(zip(names, type_args))
         params = ["%s: %s" % (p.name, mapping.get(p.type_name, p.type_name or "Any"))
                   for p in node.params]
+        ret_omitted = text is not None and node.ret is None
+        effects_omitted = text is not None and node.effects is None
+        inferred_ret = inferred_effects = None
+        if text and (ret_omitted or effects_omitted):
+            try:
+                ctx = _inference_context(text)
+                if ret_omitted:
+                    inferred = _infer_return_type(node, ctx)
+                    inferred_ret = mapping.get(inferred, inferred) \
+                        if inferred else None
+                if effects_omitted:
+                    inferred_effects = _infer_effects(node, ctx)
+            except Exception:
+                inferred_ret = inferred_effects = None
         ret = mapping.get(node.ret, node.ret or "Any")
         label = signature_text(
             "%s<%s>" % (node.name, ", ".join(type_args)), params, ret,
-            node.effects)
+            node.effects, inferred_ret=inferred_ret,
+            inferred_effects=inferred_effects, ret_omitted=ret_omitted,
+            effects_omitted=effects_omitted)
         return (label, params, names,
                 [mapping.get(p.type_name, p.type_name) for p in node.params])
-    return (fn_signature(node), [_param_label(p) for p in node.params],
+    return (fn_signature(node, text), [_param_label(p) for p in node.params],
             names, [p.type_name for p in node.params])
 
 
@@ -4852,7 +5349,7 @@ def _method_call_signature(uri, text, callee, line):
         params = params[1:]
     owner = ref["owner"]
     label = _method_signature_text(method, owner, qualifier=owner,
-                                   include_self=False)
+                                   include_self=False, text=text)
     self_type = (method.params[0].type_name
                  if getattr(method, "params", None) else owner)
     doc = "`self` is the receiver (`self: %s`)." % (self_type or owner)
@@ -4867,27 +5364,32 @@ def signature_help(uri: str, text: str, line: int, character: int):
         return None
     callee, args, type_args = ctx
     active = _active_parameter(args)
+    # Inference needs bodies, so use a copy that parses when the live line is
+    # still being typed (e.g. ``print pair(``).
+    inference_text = _parseable_text(text, line)
     sig = None
 
     if "." in callee:
         alias, member = callee.split(".", 1)
         imp = _alias_map(text).get(alias)
         if imp is not None:
+            module_text = _module_source(uri, imp["path"])
             for node in _module_functions(uri, imp["path"]) or []:
                 if node.name == member:
-                    sig = _node_signature(node, type_args)
+                    sig = _node_signature(node, type_args, text=module_text)
                     break
         else:
-            sig = _method_call_signature(uri, text, callee, line)
+            sig = _method_call_signature(uri, inference_text, callee, line)
     elif callee in SIGNATURES:
         label, params = builtin_signature(callee)
         sig = (label, params, [], [])
     else:
         node = _decl_by_name_at(text, callee, line)
         if isinstance(node, G.Fn):
-            sig = _node_signature(node, type_args)
+            sig = _node_signature(node, type_args, text=inference_text)
         elif isinstance(node, G.Let) and isinstance(node.expr, G.Lambda):
-            sig = (lambda_signature(node.expr, "let " + node.name),
+            sig = (lambda_signature(node.expr, "let " + node.name,
+                                    text=inference_text),
                    [_param_label(p) for p in node.expr.params], [], [])
         elif node is not None:
             sig = ("%s(...)" % callee, [], [], [])
