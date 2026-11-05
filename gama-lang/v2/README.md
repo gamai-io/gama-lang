@@ -306,7 +306,7 @@ Conformance: see `CONFORMANCE.md` (SPEC 2.0 T1–T10: **PASS 10/10**, including 
 - renamed exports (`export fn a as b`), `export enum`, and selective re-exports; explicit export lists mark the alias surface, but modules without any `export` keep the legacy all-visible alias behaviour
 - external intent/lease registry with expiry/revocation (env-bound intent/lease receipts are implemented; there is no external registry)
 - full type inference and generics; generic enum variants; record methods/structural subtyping
-- formatter remaining edges: comments that have no legal line-break position (after `|` before a stage keyword, before a binary operator, between `let x =` and its expression), inside a `fn` effects set, or inside an inline lambda may move to a safe position; indivisible tokens longer than the width still overflow
+- formatter remaining edges: a comment *before* a binary operator has no legal source position (the grammar only breaks after an operator), so the defensive renderer keeps it after the operator; comments in a commented `fn` effects set use source order (uncommented sets stay sorted); indivisible tokens longer than the width still overflow
 - VS Code Marketplace signing/publishing (VSIX packaging is reproducible locally)
 - publishing a built release to PyPI (build/checksums/verify work)
 

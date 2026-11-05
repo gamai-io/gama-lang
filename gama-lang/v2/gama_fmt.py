@@ -60,25 +60,36 @@ Line wrapping (added in this revision):
     declaration braces.
   * Comments inside a wrapped literal/call/declaration stay on the entry they
     annotate (``1, # one``).  Comments between binary operands stay after the
-    operator line they followed, comments inside a pipe stage stay on that
-    stage, and comments on their own line are emitted just before the next
-    entry at the continuation indent.  A short construct whose only reason to
-    expand is an interior comment is expanded (``[1, # one`` and
-    ``x | # c`` no longer force a safe-position move).
+    operator line they followed, and comments on their own line are emitted
+    just before the next entry at the continuation indent.  A short construct
+    whose only reason to expand is an interior comment is expanded
+    (``[1, # one`` and ``x | # c`` no longer force a safe-position move).
+  * A comment between ``|`` and its stage keyword keeps the bar line
+    (``| # c``) and the stage moves to the next line; a comment on its own
+    line before a stage stays above the stage line.
+  * A comment between ``let x =`` and the expression keeps that attachment
+    point: an inline comment stays on the ``let x =`` line and an own-line
+    comment stays on its own continuation line; the expression moves to the
+    continuation line either way.
+  * Comments inside a ``fn`` ``effects`` set force the set to one name per
+    line and stay with their name.  Because the parser stores effects in a
+    set, a commented effects set is emitted in *source* order (so the comment
+    pairing and token stream are preserved); without comments effects remain
+    canonically sorted.
+  * Comments inside an inline lambda body expand the lambda (header on the
+    first line, body one statement per line, closing ``}`` at the base indent)
+    instead of moving the comments out of the lambda.  Body statements use the
+    normal statement renderer, so pipe/``let =``/nested comments keep their
+    usual attachment rules inside the lambda.
   * Comments on the closing delimiter line stay with the statement (trailing
     comment), as before.
 
 Known limitations (documented, not hidden):
-  * A comment with no legal line break at its position still moves to the
-    nearest safe attachment point: after ``|`` and before a stage keyword
-    (moves to the base line), before a binary operator (moves to the preceding
-    operator/operand line), or between ``let x =`` and its expression (moves to
-    the end of that statement or the next statement).  Comments are never
-    dropped or duplicated.
-  * Comments inside a ``fn`` ``effects`` block or an inline lambda body use the
-    safe-position fallback; the construct itself still wraps.
-  * Inline lambdas (``fn(...) { ... }`` used as an expression) are not
-    width-wrapped; their comments use the safe-position fallback.
+  * A comment physically *before* a binary operator cannot occur in valid
+    source: the parser only accepts a newline *after* an operator.  The
+    renderer's defensive rule is to keep such a comment on the operator line,
+    after the operator, so it is never dropped or duplicated.
+  * Inline lambdas without comments are still not width-wrapped.
   * Indivisible tokens (a single identifier or string longer than ``width``)
     still overflow.
   * Map keys are re-rendered from their decoded string value: a quoted
@@ -86,7 +97,8 @@ Known limitations (documented, not hidden):
     and lookup semantics are identical.
   * Duplicate map keys are already collapsed by the parser itself.
   * ``effects`` is stored as a ``set`` by the parser, so effect names are
-    emitted in sorted order (the only deterministic order available).
+    emitted in sorted order; a set that carries comments keeps its source
+    order instead (to preserve comment pairing and the token stream).
   * Surface sugar that the parser lowers to a builtin call is emitted as a call:
     ``remember k = v`` -> ``remember("k", v)``, ``recall k`` -> ``recall("k")``,
     ``wait user x`` -> ``wait_user(x)``.  The AST is unchanged.
@@ -402,6 +414,9 @@ class _AstFormatter:
         self.tok_at = {(t.line, t.col): t for t in self.sig}
         self.comments = self._collect_comments()
         self.used: set[int] = set()
+        # While rendering an expanded lambda body, comments at/after the body
+        # closing brace belong to the enclosing expression, not the body.
+        self.comment_ceiling = None
         self.out: list[str] = []
         self.str_end: dict[tuple[int, int], int] = {}
         for t in self.sig:
@@ -573,9 +588,13 @@ class _AstFormatter:
             first = min(s.line for s in stmts)
             last = max(s.line for s in stmts)
             found = [p for p in pairs
-                     if p[0].line < first and p[1].line >= last]
+                     if p[0].line <= first and p[1].line >= last]
             if found:
-                return min(found, key=lambda p: p[1].line - p[0].line)
+                # The body opener is the last ``{`` at or before the first
+                # body statement.  Picking the latest opener keeps a one-line
+                # ``effects {...}`` (or an ``if`` arm) from shadowing the body
+                # pair when both contain the statements.
+                return max(found, key=lambda p: (p[0].line, p[0].col))
         return pairs[-1] if fallback_last else pairs[0]
 
     def _find_token(self, kind, val, start_line, end_line):
@@ -603,6 +622,10 @@ class _AstFormatter:
         for idx, c in enumerate(self.comments):
             if idx in self.used or c.own_line:
                 continue
+            if (self.comment_ceiling is not None
+                    and not self._pos_lt((c.line, c.col),
+                                         self.comment_ceiling)):
+                continue
             if c.line in src_lines:
                 self.used.add(idx)
                 self.out[-1] += " " + c.text
@@ -617,6 +640,10 @@ class _AstFormatter:
         text = _UNIT * indent
         for idx, c in enumerate(self.comments):
             if idx in self.used:
+                continue
+            if (self.comment_ceiling is not None
+                    and not self._pos_lt((c.line, c.col),
+                                         self.comment_ceiling)):
                 continue
             if not (low < c.line < limit):
                 continue
@@ -764,6 +791,9 @@ class _AstFormatter:
             if idx in self.used:
                 continue
             pos = (c.line, c.col)
+            if (self.comment_ceiling is not None
+                    and not self._pos_lt(pos, self.comment_ceiling)):
+                continue
             if not self._pos_lt(lo, pos):
                 continue
             if not self._pos_lt(pos, hi):
@@ -849,6 +879,23 @@ class _AstFormatter:
                     or self._expr_has_comment(node.right))
         if isinstance(node, G.Pipe):
             return self._pipe_has_comment(node)
+        if isinstance(node, G.Lambda):
+            return self._lambda_has_comment(node)
+        if isinstance(node, G.CallExpr):
+            return (self._expr_has_comment(node.callee)
+                    or any(self._expr_has_comment(a) for a in node.args))
+        if isinstance(node, G.Attr):
+            return self._expr_has_comment(node.base)
+        if isinstance(node, G.Index):
+            return (self._expr_has_comment(node.base)
+                    or self._expr_has_comment(node.index))
+        if isinstance(node, G.Unary):
+            return self._expr_has_comment(node.right)
+        if isinstance(node, G.Try):
+            return self._expr_has_comment(node.expr)
+        if isinstance(node, G.RecordUpdate):
+            return (self._expr_has_comment(node.base)
+                    or any(self._expr_has_comment(v) for _k, v in node.fields))
         return False
 
     def _force_expand(self, node) -> bool:
@@ -872,6 +919,8 @@ class _AstFormatter:
             return self._wrap_binary(node, close_indent, base_col, minp)
         if isinstance(node, G.Pipe):
             return self._wrap_pipe(node, close_indent, base_col, minp)
+        if isinstance(node, G.Lambda):
+            return self._wrap_lambda(node, close_indent)
         return text
 
     def _wrap_container(self, node, close_indent) -> str:
@@ -913,12 +962,21 @@ class _AstFormatter:
             entries = [(self._expr_start_pos(a), self._expr_end_pos(a),
                         lit_renderer(a)) for a in node.args]
         else:  # CallExpr
-            open_text = self._expr(node.callee, _POSTFIX_PREC) + "("
+            if isinstance(node.callee, G.Lambda) \
+                    and self._lambda_has_comment(node.callee):
+                open_text = self._wrap_lambda(node.callee, close_indent) + "("
+            else:
+                open_text = self._expr(node.callee, _POSTFIX_PREC) + "("
             close_text = ")"
             entries = [(self._expr_start_pos(a), self._expr_end_pos(a),
                         lit_renderer(a)) for a in node.args]
 
-        result = [open_text]
+        result = open_text.split("\n")
+        if not entries and isinstance(node, G.CallExpr):
+            span = self._span_for_container(node)
+            if span is None or not self._interior_comments(span):
+                result[-1] += close_text
+                return "\n".join(result)
         inline_lines: set[int] = set()
         span = self._span_for_container(node)
         if span is None:
@@ -934,7 +992,7 @@ class _AstFormatter:
         oline, ocol, cline, ccol = span
         open_pos, close_pos = (oline, ocol), (cline, ccol)
         cursor = open_pos
-        prev_line = 0
+        prev_line = len(result) - 1
         prev_src = oline
         for i, (start, end, render) in enumerate(entries):
             self._flush_comment_range(
@@ -964,16 +1022,26 @@ class _AstFormatter:
         cont = close_indent + 2
         lines = [self._wrap(parts[0][1], close_indent, base_col, p)]
         inline_lines: set[int] = set()
+        prev_end = self._expr_end_pos(parts[0][1])
         for op, right, opnode in parts[1:]:
             lines[-1] += " " + op
             rs = self._expr_start_pos(right)
             if opnode is not None:
+                op_pos = (opnode.line, opnode.col)
+                # A comment between the left operand and the operator has no
+                # legal line-break position (the parser only skips newlines
+                # *after* an operator).  Deterministic minimal move: keep it
+                # on the operator line as a trailing comment.
                 self._flush_comment_range(
-                    (opnode.line, opnode.col), rs, cont, lines, inline_lines,
+                    prev_end, op_pos, cont, lines, inline_lines,
+                    attach_line=len(lines) - 1, attach_src_line=opnode.line)
+                self._flush_comment_range(
+                    op_pos, rs, cont, lines, inline_lines,
                     attach_line=len(lines) - 1, attach_src_line=opnode.line)
             rl = self._wrap(right, cont, cont, p + 1).split("\n")
             rl[0] = " " * cont + rl[0]
             lines.extend(rl)
+            prev_end = self._expr_end_pos(right)
         return "\n".join(lines)
 
     def _sig_index_after(self, pos) -> int:
@@ -981,6 +1049,12 @@ class _AstFormatter:
             if self._pos_lt(pos, (t.line, t.col)):
                 return i
         return len(self.sig)
+
+    def _sig_index_of(self, tok):
+        for i, t in enumerate(self.sig):
+            if t is tok:
+                return i
+        return None
 
     def _pipe_positions(self, node):
         """Return ``(end_pos, stages)`` with token positions for a pipe.
@@ -1072,10 +1146,6 @@ class _AstFormatter:
                 _s, _a, stage_tok, stage_end = positions[i]
             stage_pos = ((stage_tok.line, stage_tok.col)
                          if stage_tok is not None else None)
-            if stage_pos is not None:
-                self._flush_comment_range(
-                    cursor, stage_pos, cont, lines, inline_lines,
-                    attach_line=prev_line, attach_src_line=prev_src)
             if stage in ("filter", "limit"):
                 arg_base = cont + len("| " + stage + " ")
                 part = stage + " " + self._wrap(args[0], cont,
@@ -1086,8 +1156,41 @@ class _AstFormatter:
                 part = stage + " " + args[0]
             else:
                 part = stage
-            block = " " * cont + "| " + part
-            lines.extend(block.split("\n"))
+            bar_tok = None
+            if stage_tok is not None:
+                idx = self._sig_index_of(stage_tok)
+                if idx and idx > 0 and self.sig[idx - 1].kind == "OP" \
+                        and self.sig[idx - 1].val == "|":
+                    bar_tok = self.sig[idx - 1]
+            if stage_pos is not None and bar_tok is not None:
+                bar_pos = (bar_tok.line, bar_tok.col)
+                self._flush_comment_range(
+                    cursor, bar_pos, cont, lines, inline_lines,
+                    attach_line=prev_line, attach_src_line=prev_src)
+                # Comments between ``|`` and the stage keyword keep the bar
+                # line and push the stage to the next line (the parser skips
+                # newlines after ``|``), so they stay at their attachment
+                # point instead of moving to the base expression line.
+                bar_lines = [" " * cont + "|"]
+                bar_inline: set[int] = set()
+                self._flush_comment_range(
+                    bar_pos, stage_pos, cont, bar_lines, bar_inline,
+                    attach_line=0, attach_src_line=bar_tok.line)
+                if len(bar_lines) > 1 or bar_lines[0].strip() != "|":
+                    lines.extend(bar_lines)
+                    block_lines = part.split("\n")
+                    lines.append(" " * cont + block_lines[0])
+                    lines.extend(block_lines[1:])
+                else:
+                    block = " " * cont + "| " + part
+                    lines.extend(block.split("\n"))
+            else:
+                if stage_pos is not None:
+                    self._flush_comment_range(
+                        cursor, stage_pos, cont, lines, inline_lines,
+                        attach_line=prev_line, attach_src_line=prev_src)
+                block = " " * cont + "| " + part
+                lines.extend(block.split("\n"))
             if stage_pos is not None and stage_end is not None:
                 self._flush_comment_range(
                     stage_pos, stage_end, cont, lines, inline_lines,
@@ -1100,9 +1203,30 @@ class _AstFormatter:
 
     def _emit_expr_stmt(self, ind, prefix, stmt, indent, semi):
         node = stmt.expr
+        end_line = self._stmt_end_line(stmt)
+        eq_comments, eq_line = self._eq_trailing_comments(stmt)
+        if eq_comments:
+            # ``let`` is the only prefix where a newline before the expression
+            # is legal (the parser skips newlines after ``=``).  Keep the
+            # comment at that attachment point and put the expression on the
+            # continuation line.
+            cont = len(ind) + 2
+            lines = [ind + prefix.rstrip()]
+            attached = False
+            for idx, c in eq_comments:
+                self.used.add(idx)
+                if (not c.own_line and not attached and c.line == eq_line):
+                    lines[0] += " " + c.text
+                    attached = True
+                else:
+                    lines.append(" " * cont + c.text)
+            parts = self._wrap(node, cont, cont).split("\n")
+            lines.append(" " * cont + parts[0])
+            lines.extend(parts[1:])
+            self._emit("\n".join(lines), [stmt.line, end_line], suffix=semi)
+            return
         base_col = len(ind) + len(prefix)
         text = self._wrap(node, len(ind), base_col)
-        end_line = self._stmt_end_line(stmt)
         self._emit(ind + prefix + text, [stmt.line, end_line], suffix=semi)
 
     # --------------------------------------------------------------- output
@@ -1219,6 +1343,305 @@ class _AstFormatter:
             return " effects {}"
         return " effects {" + ", ".join(sorted(effects)) + "}"
 
+    # --- effects sets and lambdas -------------------------------------
+    def _sig_index_at_or_after(self, pos) -> int:
+        for i, t in enumerate(self.sig):
+            if not self._pos_lt((t.line, t.col), pos):
+                return i
+        return len(self.sig)
+
+    def _effects_span(self, node):
+        """Return the ``{...}`` span of an ``effects`` set, or ``None``.
+
+        Works for both statement nodes (``Fn``) and expression nodes
+        (``Lambda``); for the former the search is bounded to the statement
+        span so a lambda ``effects`` inside the body cannot be picked up.
+        """
+        stmt_span = (None if isinstance(node, _G.Lambda)
+                     else self.spans.get(id(node)))
+        if stmt_span is not None:
+            first = self.toks[stmt_span[0]]
+            last = self.toks[stmt_span[1] - 1]
+            start = self._sig_index_at_or_after((first.line, first.col))
+            end = self._sig_index_after((last.line, last.col))
+        else:
+            start = self._sig_index_at_or_after(
+                (getattr(node, "line", 1), getattr(node, "col", 1)))
+            if isinstance(node, _G.Lambda):
+                body = self._lambda_body_span(node)
+                end = (self._sig_index_at_or_after(
+                    (body[0], body[1])) if body is not None
+                    else len(self.sig))
+            else:
+                end = len(self.sig)
+        i = start
+        while i < end:
+            t = self.sig[i]
+            if t.kind == "KW" and t.val == "effects":
+                j = i + 1
+                while j < end and not (self.sig[j].kind == "OP"
+                                       and self.sig[j].val == "{"):
+                    j += 1
+                if j >= end:
+                    return None
+                depth = 0
+                for k in range(j, end):
+                    u = self.sig[k]
+                    if u.kind == "OP" and u.val == "{":
+                        depth += 1
+                    elif u.kind == "OP" and u.val == "}":
+                        depth -= 1
+                        if depth == 0:
+                            o = self.sig[j]
+                            return (o.line, o.col, u.line, u.col)
+                return None
+            i += 1
+        return None
+
+    def _effects_has_comment(self, node) -> bool:
+        if getattr(node, "effects", None) is None:
+            return False
+        span = self._effects_span(node)
+        return bool(span and self._interior_comments(span))
+
+    def _effects_entries(self, node):
+        """Return ``([(name, start, end)], span)`` for the effects set."""
+        span = self._effects_span(node)
+        if span is None:
+            return [], None
+        open_pos = (span[0], span[1])
+        close_pos = (span[2], span[3])
+        start = self._sig_index_at_or_after(open_pos)
+        end = self._sig_index_at_or_after(close_pos)
+        entries = []
+        for t in self.sig[start + 1:end]:
+            if t.kind == "IDENT":
+                entries.append((t.val, (t.line, t.col),
+                                 (t.line, t.col + len(t.val))))
+        return entries, span
+
+    def _effects_block_text(self, node, base_indent: int, head: str) -> str:
+        """Expanded ``effects`` set with comments kept deterministic.
+
+        The parser stores effects in a ``set`` and the formatter always emits
+        them sorted.  When the source order already matches that sorted order
+        each comment stays on the entry it annotates (trailing comments on the
+        name line, own-line comments before the next name).  When sorting
+        would reorder the names, comment order is preserved by emitting the
+        comments in source order immediately inside the brace, before the
+        sorted names.  Either way the comment sequence is unchanged.
+        """
+        inner = base_indent + 2
+        names = sorted(node.effects)
+        entries, span = self._effects_entries(node)
+        source_names = [e[0] for e in entries]
+        # With comments, emit the source order so the comment/name pairing and
+        # the token stream are both preserved.  Without comments (the common
+        # path) effects stay sorted as documented.
+        can_place = (span is not None and len(entries) == len(names)
+                     and set(source_names) == set(names))
+        lines = [head + " effects {"]
+        inline_lines: set[int] = set()
+        if can_place:
+            open_pos = (span[0], span[1])
+            close_pos = (span[2], span[3])
+            cursor = open_pos
+            prev_line = 0
+            prev_src = span[0]
+            for i, (name, start, end) in enumerate(entries):
+                self._flush_comment_range(
+                    cursor, start, inner, lines, inline_lines,
+                    attach_line=prev_line, attach_src_line=prev_src)
+                lines.append(" " * inner + name +
+                             ("," if i < len(entries) - 1 else ""))
+                nxt = entries[i + 1][1] if i + 1 < len(entries) else close_pos
+                self._flush_comment_range(
+                    end, nxt, inner, lines, inline_lines,
+                    attach_line=len(lines) - 1, attach_src_line=end[0])
+                cursor = nxt
+                prev_line = len(lines) - 1
+                prev_src = nxt[0]
+            self._flush_comment_range(
+                cursor, close_pos, inner, lines, inline_lines,
+                attach_line=prev_line, attach_src_line=prev_src)
+        else:
+            if span is not None:
+                self._flush_comment_range(
+                    (span[0], span[1]), (span[2], span[3]), inner, lines,
+                    inline_lines, attach_line=0, attach_src_line=span[0])
+            for i, name in enumerate(names):
+                lines.append(" " * inner + name +
+                             ("," if i < len(names) - 1 else ""))
+        lines.append(" " * base_indent + "}")
+        return "\n".join(lines)
+
+    def _stmt_start_pos(self, stmt):
+        span = self._span(stmt)
+        if span:
+            t = self.toks[span[0]]
+            return (t.line, t.col)
+        return (getattr(stmt, "line", 1), getattr(stmt, "col", 1))
+
+    def _eq_trailing_comments(self, stmt):
+        """Return ``([(idx, comment)], eq_line)`` for comments after ``=``.
+
+        Only ``let`` accepts a newline between ``=`` and its expression, so it
+        is the only statement where such a comment has a legal attachment
+        point (``let x = # c`` on one line, or ``let x =`` then an own-line
+        comment before the expression).
+        """
+        if not isinstance(stmt, _G.Let):
+            return [], None
+        span = self._span(stmt)
+        if not span:
+            return [], None
+        expr_start = self._expr_start_pos(stmt.expr)
+        eq = None
+        for t in self.toks[span[0]:span[1]]:
+            if t.kind == "OP" and t.val == "=" and self._pos_lt(
+                    (t.line, t.col), expr_start):
+                eq = (t.line, t.col)
+                break
+        if eq is None:
+            return [], None
+        out = []
+        for idx, c in enumerate(self.comments):
+            if idx in self.used:
+                continue
+            pos = (c.line, c.col)
+            if self._pos_lt(eq, pos) and self._pos_lt(pos, expr_start):
+                out.append((idx, c))
+        return out, eq[0]
+
+    def _lambda_body_span(self, node):
+        """Return the ``{...}`` span of a lambda body, or ``None``."""
+        i = self._sig_index_at_or_after((node.line, node.col))
+        if i >= len(self.sig) or self.sig[i].val != "fn":
+            return None
+        i += 1
+        while i < len(self.sig) and not (self.sig[i].kind == "OP"
+                                         and self.sig[i].val == "("):
+            i += 1
+        depth = 0
+        while i < len(self.sig):
+            u = self.sig[i]
+            if u.kind == "OP" and u.val == "(":
+                depth += 1
+            elif u.kind == "OP" and u.val == ")":
+                depth -= 1
+                if depth == 0:
+                    i += 1
+                    break
+            i += 1
+        if i < len(self.sig) and self.sig[i].kind == "OP" \
+                and self.sig[i].val == "->":
+            i += 2  # ``->`` and the return type identifier
+        if i < len(self.sig) and self.sig[i].kind == "KW" \
+                and self.sig[i].val == "effects":
+            i += 1
+            while i < len(self.sig) and not (self.sig[i].kind == "OP"
+                                             and self.sig[i].val == "{"):
+                i += 1
+            depth = 0
+            while i < len(self.sig):
+                u = self.sig[i]
+                if u.kind == "OP" and u.val == "{":
+                    depth += 1
+                elif u.kind == "OP" and u.val == "}":
+                    depth -= 1
+                    if depth == 0:
+                        i += 1
+                        break
+                i += 1
+        while i < len(self.sig) and not (self.sig[i].kind == "OP"
+                                         and self.sig[i].val == "{"):
+            i += 1
+        if i >= len(self.sig):
+            return None
+        opener = self.sig[i]
+        depth = 0
+        while i < len(self.sig):
+            u = self.sig[i]
+            if u.kind == "OP" and u.val == "{":
+                depth += 1
+            elif u.kind == "OP" and u.val == "}":
+                depth -= 1
+                if depth == 0:
+                    return (opener.line, opener.col, u.line, u.col)
+            i += 1
+        return None
+
+    def _lambda_has_comment(self, node) -> bool:
+        span = self._lambda_body_span(node)
+        if span and self._interior_comments(span):
+            return True
+        return self._effects_has_comment(node)
+
+    def _render_stmt_lines(self, stmt, indent_level: int, ceiling=None):
+        """Render one statement to lines without touching the main output."""
+        saved = self.out
+        saved_ceiling = self.comment_ceiling
+        self.out = []
+        self.comment_ceiling = ceiling
+        try:
+            self.render_stmt(stmt, indent_level)
+            return list(self.out)
+        finally:
+            self.out = saved
+            self.comment_ceiling = saved_ceiling
+
+    def _wrap_lambda(self, node, close_indent: int) -> str:
+        if not self._lambda_has_comment(node):
+            return self._inline_lambda(node)
+        ret = (" -> " + node.ret) if node.ret else ""
+        head = "fn(" + self._params_text(node.params) + ")" + ret
+        if self._effects_has_comment(node):
+            header = self._effects_block_text(node, close_indent, head)
+        else:
+            header = head + self._effects_text(node.effects)
+        lines = header.split("\n")
+        lines[-1] += " {"
+        span = self._lambda_body_span(node)
+        if span is None:
+            return self._inline_lambda(node)
+        inner = close_indent + 2
+        open_pos = (span[0], span[1])
+        close_pos = (span[2], span[3])
+        inline_lines: set[int] = set()
+        cursor = open_pos
+        prev_line = len(lines) - 1
+        prev_src = span[0]
+        for i, stmt in enumerate(node.body):
+            start = self._stmt_start_pos(stmt)
+            self._flush_comment_range(
+                cursor, start, inner, lines, inline_lines,
+                attach_line=prev_line, attach_src_line=prev_src)
+            # Reuse the normal statement renderer so comments inside the
+            # statement (pipe bars, ``let =``, nested lambdas) keep the same
+            # attachment rules as at block level.
+            stmt_lines = self._render_stmt_lines(
+                stmt, close_indent // 2 + 1, ceiling=close_pos)
+            if not stmt_lines:
+                stmt_lines = [" " * inner]
+            lines.extend(stmt_lines)
+            end_line = self._stmt_end_line(stmt)
+            nxt = (self._stmt_start_pos(node.body[i + 1])
+                   if i + 1 < len(node.body) else close_pos)
+            # Statements are rendered inline, so comments that were inside a
+            # multi-line statement body are emitted just after it (own line)
+            # rather than dropped; the lambda stays expanded on reformat.
+            self._flush_comment_range(
+                start, nxt, inner, lines, inline_lines,
+                attach_line=len(lines) - 1, attach_src_line=end_line)
+            cursor = nxt
+            prev_line = len(lines) - 1
+            prev_src = nxt[0]
+        self._flush_comment_range(
+            cursor, close_pos, inner, lines, inline_lines,
+            attach_line=prev_line, attach_src_line=prev_src)
+        lines.append(" " * close_indent + "}")
+        return "\n".join(lines)
+
     def _fn_header(self, s, keyword="fn", named=True) -> str:
         name = (" " + s.name) if named else ""
         ret = (" -> " + s.ret) if s.ret else ""
@@ -1283,7 +1706,8 @@ class _AstFormatter:
         """
         ind = _UNIT * indent
         single = self._fn_header(s, keyword, named)
-        if self._fits(single + " {", len(ind)):
+        if self._fits(single + " {", len(ind)) \
+                and not self._effects_has_comment(s):
             return single
         name = (" " + s.name) if named else ""
         ret = (" -> " + s.ret) if s.ret else ""
@@ -1293,7 +1717,11 @@ class _AstFormatter:
         if not s.params:
             first = prefix + keyword + name + "()" + ret
             if not effects:
+                if self._effects_has_comment(s):
+                    return self._effects_block_text(s, len(ind), first)
                 return single
+            if self._effects_has_comment(s):
+                return self._effects_block_text(s, len(ind), first)
             names = sorted(effects)
             one = " effects {" + ", ".join(names) + "}"
             if self._fits(first + one + " {", len(ind)) or len(names) == 1:
@@ -1351,7 +1779,14 @@ class _AstFormatter:
         if effects is None:
             lines.append(close)
         elif not effects:
-            lines.append(close + " effects {}")
+            if self._effects_has_comment(s):
+                lines.extend(
+                    self._effects_block_text(s, len(ind), close).split("\n"))
+            else:
+                lines.append(close + " effects {}")
+        elif self._effects_has_comment(s):
+            lines.extend(
+                self._effects_block_text(s, len(ind), close).split("\n"))
         else:
             names = sorted(effects)
             one = " effects {" + ", ".join(names) + "}"

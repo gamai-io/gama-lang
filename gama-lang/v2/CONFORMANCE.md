@@ -86,10 +86,15 @@ These are outside the T1–T10 checks or only partially covered; see
    `fmt --width`): expressions (list/map/record literals, calls, binary chains,
    pipes), `record`/`enum` declarations, `fn`/`make` headers and parameters,
    `if`/`while`/`for`/`match` headers, and `prove`. Comments stay on their
-   entry/stage/parameter/declaration line where a legal line break exists;
-   comments with no legal position (after `|` before a stage keyword, before a
-   binary operator, between `let x =` and its expression), comments inside a
-   `fn` effects set, or inside inline lambdas still move to a safe position.
+   entry/stage/parameter/declaration line where a legal line break exists.
+   A comment between `|` and a stage keeps the bar line (`| # c`) with the
+   stage on the next line; a comment between `let x =` and its expression stays
+   at that point (`let x = # c` or an own continuation line); comments in a
+   `fn` effects set force one name per line (source order while comments are
+   present, sorted otherwise); comments in an inline lambda body expand the
+   lambda body. The only inherently unreachable position is *before* a binary
+   operator (the grammar only skips newlines after an operator); the renderer's
+   defensive rule puts such a comment after the operator and never drops it.
    Indivisible tokens longer than the width still overflow (T10 still passes).
 6. **Deployed public registry, marketplace signing, published release.**
    Build/checksums and a local HTTP registry exist; publishing does not.

@@ -428,8 +428,9 @@ class PipeStageCommentTests(WrapBase):
         src = "let r = [1, 2, 3] | # bar note\n count\nprint r\n"
         out = self.roundtrip(src)
         self.assertEqual(out.count("# bar note"), 1)
-        self.assertIn("  | count", out)
-        self.assertIn("# bar note", out)
+        # The comment stays between ``|`` and the stage keyword, so the bar
+        # line keeps the comment and the stage moves to the next line.
+        self.assertIn("  | # bar note\n  count", out)
 
     def test_comment_inside_filter_stage_stays_on_operator(self):
         src = (
@@ -456,8 +457,192 @@ class PipeStageCommentTests(WrapBase):
         )
         out = self.roundtrip(src, width=40)
         self.assertIn("  # inner stage", out)
-        self.assertIn("| filter neto > 0) # outer stage", out)
-        self.assertIn("  | count", out)
+        self.assertIn("| filter neto > 0)", out)
+        # The outer comment sits after ``|`` and before ``count``; it stays
+        # on the bar line and the stage moves down.
+        self.assertIn("  | # outer stage\n  count", out)
+
+
+class PipeBarCommentTests(WrapBase):
+    """Comments between ``|`` and the stage keyword keep the bar line."""
+
+    def test_short_pipe_bar_comment_moves_stage_to_next_line(self):
+        src = "let r = [1, 2, 3] | # bar\n count\nprint r\n"
+        out = self.roundtrip(src)
+        self.assertIn("let r = [1, 2, 3]\n  | # bar\n  count", out)
+
+    def test_wrapped_pipe_bar_comment_keeps_attachment(self):
+        src = ('let r = sql("select neto from customers where neto > 0") '
+               "| # bar\n filter neto > 100000 | select neto, konto "
+               "| sum neto\nprint r\n")
+        out = self.roundtrip(src)
+        self.assertIn("  | # bar\n  filter neto > 100000", out)
+        self.assertIn("  | select neto, konto", out)
+        self.assertIn("  | sum neto", out)
+
+    def test_own_line_comment_between_bar_and_stage_stays_own_line(self):
+        src = "let r = [1, 2, 3] |\n # before count\n count\nprint r\n"
+        out = self.roundtrip(src)
+        self.assertIn("  |\n  # before count\n  count", out)
+
+    def test_multiple_stage_bar_comments(self):
+        src = ('let r = sql("select neto from customers where neto > 0")'
+               " | # one\n filter neto > 1 | # two\n count\nprint r\n")
+        out = self.roundtrip(src)
+        self.assertIn("  | # one\n  filter neto > 1", out)
+        self.assertIn("  | # two\n  count", out)
+
+    def test_nested_pipe_inner_and_outer_bar_comments(self):
+        src = ('let r = (sql("select neto from customers where neto > 0")\n'
+               "| # inner bar\nfilter neto > 0) | # outer bar\ncount\n"
+               "print r\n")
+        out = self.roundtrip(src, width=40)
+        self.assertIn("  | # inner bar\n  filter neto > 0", out)
+        self.assertIn("  | # outer bar\n  count", out)
+
+
+class LetEqualsCommentTests(WrapBase):
+    """Comments between ``let x =`` and the expression stay there."""
+
+    def test_own_line_comment_after_equals(self):
+        src = "let x =\n # before value\n 1\nprint x\n"
+        out = self.roundtrip(src)
+        self.assertIn("let x =\n  # before value\n  1", out)
+
+    def test_inline_comment_on_equals_line(self):
+        src = "let x = # tail\n 1\nprint x\n"
+        out = self.roundtrip(src)
+        self.assertIn("let x = # tail\n  1", out)
+
+    def test_multiple_comments_after_equals(self):
+        src = "let x =\n # one\n # two\n 1 + 2\nprint x\n"
+        out = self.roundtrip(src)
+        self.assertIn("let x =\n  # one\n  # two\n  1 + 2", out)
+
+    def test_long_expression_after_equals_comment_wraps(self):
+        src = ("let x =\n # before long\n 100000 + 200000 + 300000 + "
+               "400000 + 500000 + 600000 + 700000 + 800000 + 900000\n"
+               "print x\n")
+        out = self.roundtrip(src, width=40)
+        self.assertIn("let x =\n  # before long\n  100000 +\n    200000 +", out)
+        for line in out.splitlines():
+            self.assertLessEqual(len(line), 40, line)
+
+    def test_comment_after_equals_and_trailing_comment(self):
+        src = "let x =\n # before\n 1 + 2 # after\nprint x\n"
+        out = self.roundtrip(src)
+        self.assertIn("let x =\n  # before\n  1 + 2 # after", out)
+
+    def test_comment_after_equals_with_interior_container_comment(self):
+        src = "let x =\n # before list\n [1, # one\n 2]\nprint x\n"
+        out = self.roundtrip(src)
+        self.assertIn("let x =\n  # before list\n  [", out)
+        self.assertIn("1, # one", out)
+
+
+class EffectsCommentTests(WrapBase):
+    """Comments inside a ``fn`` effects set expand the set."""
+
+    def test_own_line_and_trailing_effect_comments(self):
+        src = ("fn f() -> Int effects {\n # eff note\n io,\n"
+               " net # net tail\n} { return 1 }\nprint f()\n")
+        out = self.roundtrip(src)
+        self.assertIn("effects {\n  # eff note\n  io,\n  net # net tail\n}",
+                      out)
+
+    def test_inline_comment_on_effects_open_line(self):
+        src = ("fn f() -> Int effects { # header note\n io, net\n}"
+               " { return 1 }\nprint f()\n")
+        out = self.roundtrip(src)
+        self.assertIn("effects { # header note\n  io,\n  net\n}", out)
+
+    def test_unsorted_effects_keep_source_order_with_comments(self):
+        src = ("fn f() -> Int effects {\n # note one\n net,\n"
+               " io # note two\n} { return 1 }\nprint f()\n")
+        out = self.roundtrip(src)
+        self.assertIn("effects {\n  # note one\n  net,\n  io # note two\n}",
+                      out)
+
+    def test_empty_effects_with_comment_expands(self):
+        src = "fn f() -> Int effects {\n # only\n} { return 1 }\nprint f()\n"
+        out = self.roundtrip(src)
+        self.assertIn("effects {\n  # only\n}", out)
+
+    def test_long_fn_header_and_effects_comments(self):
+        src = ("fn long_function_name(a: Int, b: Int, c: Int, d: Int, "
+               "e: Int, f: Int) -> Int effects {\n # eff note\n"
+               " io, net, fs\n} { return a }\n"
+               "print long_function_name(1, 2, 3, 4, 5, 6)\n")
+        out = self.roundtrip(src)
+        self.assertIn(") -> Int effects {\n  # eff note\n  io,\n  net,\n  fs\n}",
+                      out)
+
+    def test_multiple_effect_comments(self):
+        src = ("fn f() -> Int effects {\n # a\n io,\n # b\n net,\n"
+               " # c\n fs\n} { return 1 }\nprint f()\n")
+        out = self.roundtrip(src)
+        self.assertIn("  # a\n  io,\n  # b\n  net,\n  # c\n  fs", out)
+
+
+class LambdaBodyCommentTests(WrapBase):
+    """Comments inside an inline lambda body expand the lambda."""
+
+    def test_lambda_body_header_and_trailing_comments(self):
+        src = ("let f = fn(a: Int) -> Int { # body note\n"
+               " return a # ret tail\n }\nprint f(1)\n")
+        out = self.roundtrip(src)
+        self.assertIn("fn(a: Int) -> Int { # body note\n", out)
+        self.assertIn("  return a # ret tail\n}", out)
+
+    def test_empty_lambda_body_with_comment(self):
+        src = "let f = fn() -> Int { # only\n }\nprint 1\n"
+        out = self.roundtrip(src)
+        self.assertIn("fn() -> Int { # only\n}", out)
+
+    def test_lambda_inside_container_expands(self):
+        src = "let fs = [fn(a: Int) -> Int { # c\n return a\n }]\nprint 1\n"
+        out = self.roundtrip(src)
+        self.assertIn("[\n  fn(a: Int) -> Int { # c\n    return a\n  }\n]",
+                      out)
+
+    def test_lambda_effects_and_body_comments(self):
+        src = ("let f = fn(x: Int) -> Int effects { # eff\n io\n}"
+               " { # body\n return x\n}\nprint f(1)\n")
+        out = self.roundtrip(src)
+        self.assertIn("effects { # eff\n  io\n} { # body\n  return x\n}", out)
+
+    def test_comment_inside_lambda_body_statement_keeps_attachment(self):
+        src = ("let f = fn(x: Int) -> Int {\n"
+               " let y = [1, 2, 3] | # inner\n count\n return y\n}\n"
+               "print f(1)\n")
+        out = self.roundtrip(src)
+        self.assertIn("  let y = [1, 2, 3]\n    | # inner\n    count", out)
+        self.assertIn("  return y", out)
+
+
+class BeforeBinaryOperatorCommentTests(unittest.TestCase):
+    """A comment before a binary operator has no legal source position.
+
+    The grammar only skips newlines *after* an operator, so a comment cannot
+    be written between an operand and its operator in valid source.  The
+    renderer still has a deterministic rule (keep it on the operator line,
+    after the operator) for robustness; the tests document both facts.
+    """
+
+    def test_source_before_operator_is_not_valid(self):
+        with self.assertRaises(gama_fmt._G.GamaError):
+            gama_fmt._G.parse("let x = 1\n # c\n + 2\nprint x\n")
+
+    def _operator_rule(self, own_line):
+        f = gama_fmt._AstFormatter("let x = 1 + 2\n")
+        node = dataclasses.replace(f.ast[0].expr, line=2, col=1)
+        f.comments = [gama_fmt._Comment(1, 11, "# c", own_line)]
+        f.used = set()
+        return f._wrap_binary(node, 0, 0, 0)
+
+    def test_operator_rule_places_comment_after_operator(self):
+        self.assertEqual(self._operator_rule(True), "1 +\n  # c\n  2")
+        self.assertEqual(self._operator_rule(False), "1 +\n  # c\n  2")
 
 
 class ShortExpressionCommentTests(WrapBase):
