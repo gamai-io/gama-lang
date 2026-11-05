@@ -74,12 +74,11 @@ offers type parameters that are in scope from an enclosing generic function,
 then the callee's declared type parameters for context, then the built-in type
 names; `fn id<` offers the built-in type names only (type-parameter names are
 chosen by the author and cannot be inferred). The core parser still reads
-`id<Int>(1)` as comparisons and reports `unknown variable Int`; the LSP
-nevertheless recovers explicit arguments for signature help when the base
-name resolves to a generic `fn` declaration. Semantic tokens mark declared
-type-parameter names as types. This recovery is LSP-only: only `id<Int>(` is
-resolved, not nested/dotted type arguments, and the diagnostic remains
-accurate for the unsupported syntax.
+`id<Int>(1)` for locally declared generic functions (count/name checks,
+formatter round-trip); imported/namespaced generic calls and nested type
+arguments are not recognized. LSP signature help also recovers explicit
+arguments when the base name resolves to a generic `fn` declaration, and
+semantic tokens mark declared type-parameter names as types.
 
 The core exposes a module's top-level `let` constants as `alias.name`, typed
 and evaluated at import time, and module functions see the same renamed
@@ -238,6 +237,7 @@ error messages keep the interpreter's text and line/col.
 - `let` with optional type annotation, `:=` assignment
 - `fn` and SPEC `make` with typed parameters, defaults, return type, `effects { ... }`
 - generic type parameters on named functions with type erasure: `fn id<T>(x: T) -> T { return x }`, `fn pair<A, B>(a: A, b: B) -> Text { ... }`. Type parameters are valid in parameter, return and `let` annotations and are erased to `Any` by the checker/runtime, so a call accepts any argument type. The checker infers a call result from the arguments when the return type is a type parameter (`id(5): Int`, `id("x"): Text`) and otherwise erases to `Any`; non-type-parameter positions keep normal arity/type checks. Duplicate type parameters and duplicate parameter names are rejected. Generic functions remain ordinary first-class named functions (recursion, defaults, higher-order use, and IR compilation with erasure all work). Limits: no bounds and no generic lambdas; the IR backend has no named-function-as-value support for either plain or generic functions
+- explicit call type arguments on local generic functions: `id<Int>(5)`, `pair<Int, Text>(...)`; the checker validates type-argument count and names, argument compatibility uses the explicit bindings, and the runtime/IR ignore them (erasure). Imported/namespaced generic calls and nested type arguments are not recognized; formatter round-trips explicit arguments.
 - generic records with type erasure: `record Box<T> { value: T }`, `record Pair<A, B> { first: A, second: B }`, constructors `Box(5)` / `Pair("x", 2)`, annotations `Box<Int>` / `Pair<Text, Int>` (arity checked) and explicit constructor arguments `Box<Int>(5)`. Type parameters are usable in field types and method signatures (`fn get(self: Box<T>) -> T`); they erase to `Any`, while concrete fields keep their type. A `let` annotation binds type parameters for the constructor check (`let b: Box<Int> = Box("x")` is rejected, while erased `Box("x")` is accepted), nested refs (`Box<Box<Int>>`) erase to the nominal base, duplicate type parameters/field names are rejected, namespaced records work (`geo.Box<Int>`, `geo.Box(5)`), and formatter/IR erase explicitly (IR still rejects method-bearing records). Limits: no bounds, no method-level type parameters (methods use only the record's parameters), and no explicit type arguments on namespaced constructors (`geo.Box<Int>(5)`; annotate the binding instead)
 - first-class functions and lambdas: `fn(x: Int) -> Int { ... }`, `let f = ...`, `f(41)`, passing functions as values, named functions as values after definition, IIFE `(fn...)(41)`, and recursive lambdas
 - `if` / `else` blocks, `return`
@@ -317,7 +317,7 @@ samples.
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 1769/1769
+python3 -m unittest discover -s tests -v   # 1875/1875
 python3 gamal2.py doctor --json                # 8/8 checks
 ../../scripts/ci_local.sh                      # py_compile + tests + doctor + VS Code JSON/smoke
 ```
