@@ -1091,7 +1091,10 @@ class Parser:
         raise GamaError(f"unexpected token {x.val!r}", x.line, x.col)
 
 def parse(src: str):
-    return Parser(lex(src)).program()
+    try:
+        return Parser(lex(src)).program()
+    except RecursionError:
+        raise GamaError("source nesting too deep") from None
 
 def _type_ref_parts(t):
     """Split a canonical type reference into ``(base, args)``.

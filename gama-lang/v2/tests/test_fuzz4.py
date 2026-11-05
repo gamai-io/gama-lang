@@ -507,7 +507,6 @@ _BOUNDS_REJECT = (
 )
 
 _EXPORT_INVALID = (
-    "export_enum",
     "duplicate_export",
     "export_across_kinds",
     "export_inside_block",
@@ -655,7 +654,7 @@ for _i, _src in enumerate(_STRUCTURAL_REJECT):
 for _i, _src in enumerate(_INHERIT_CASES):
     setattr(GeneratedInheritanceTests, "test_inherit_%03d" % _i,
             _make_simple_case(
-                lambda t, i, src=_src: _assert_inheritance_ir_unsupported(
+                lambda t, i, src=_src: _assert_parity(
                     t, src, "inheritance case %d" % i),
                 _i, "inheritance"))
 
@@ -857,7 +856,6 @@ class Fuzz4RegressionPins(unittest.TestCase):
     success) once the core is fixed.
     """
 
-    @unittest.expectedFailure
     def test_deep_nesting_parser_should_not_leak_recursionerror(self):
         # ``parse`` recurses per nesting level without a depth guard, so a
         # valid deeply nested expression escapes as ``RecursionError`` instead
