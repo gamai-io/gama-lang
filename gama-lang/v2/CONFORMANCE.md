@@ -76,13 +76,12 @@ These are outside the T1–T10 checks or only partially covered; see
    `tests/test_generic_enums.py`). `p with { x = 3 }`
    returns a new record and leaves the receiver and its aliases untouched;
    unchanged nested record values are shallow-copied (shared) and updating a
-   replaced field does not affect the receiver. Generics on named functions and records
-   are implemented with type erasure (`tests/test_generics.py`,
-   `tests/test_generic_records.py`); bounds, generic lambdas, record methods,
-   and structural subtyping are missing. The IR prototype supports records,
-   nullary, payload and generic enums (type erasure),
-   copy/`with` updates and in-place field assignment (`p.x := 3`, nested,
-   namespaced) with interpreter parity for its documented subset.
+   replaced field does not affect the receiver. Generics on named functions, records and enums are implemented with type
+   erasure; bounds, generic lambdas, record methods and static record functions
+   are implemented; structural subtyping is missing. The IR prototype supports
+   records, enums (nullary, payload, generic erasure), copy/`with`, in-place
+   field assignment and first-class functions/lambdas with interpreter parity
+   for its documented subset.
 5. **Formatter edges.** `fmt` is AST-based; it preserves comments and strings,
    is idempotent, and wraps at a configurable width (default 88,
    `fmt --width`): expressions (list/map/record literals, calls, binary chains,

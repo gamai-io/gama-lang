@@ -148,19 +148,19 @@ class GenericLambdaFormatterTests(unittest.TestCase):
 
 
 class GenericLambdaIRTests(unittest.TestCase):
-    def test_ir_rejects_generic_lambda_explicitly(self):
-        ast = G.check(ID + 'print id(1)\n')
-        with self.assertRaises(gama_ir.IRUnsupported):
-            gama_ir.run_program(ast)
+    def test_ir_runs_generic_lambda_with_erasure(self):
+        src = ID + 'print id(1)\n'
+        self.assertEqual(gama_ir.run_program(G.check(src)).out,
+                         G.run(src).out)
 
-    def test_ir_rejects_lambda_inside_named_function(self):
-        ast = G.check('fn outer() -> Any {\n'
-                      '  let id = fn<T>(x: T) -> T { return x }\n'
-                      '  return id(1)\n'
-                      '}\n'
-                      'print outer()\n')
-        with self.assertRaises(gama_ir.IRUnsupported):
-            gama_ir.run_program(ast)
+    def test_ir_runs_generic_lambda_inside_named_function(self):
+        src = ('fn outer() -> Any {\n'
+               '  let id = fn<T>(x: T) -> T { return x }\n'
+               '  return id(1)\n'
+               '}\n'
+               'print outer()\n')
+        self.assertEqual(gama_ir.run_program(G.check(src)).out,
+                         G.run(src).out)
 
 
 if __name__ == "__main__":

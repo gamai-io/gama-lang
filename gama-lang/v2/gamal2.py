@@ -697,7 +697,7 @@ class Parser:
         return self.peek(k).kind == "OP" and self.peek(k).val == "("
     def lambda_expr(self):
         x = self.take()  # `fn`
-        type_params = self.type_params()
+        type_params, _bounds = self.type_params()
         self.expect("OP", "("); self.skip_nl()
         params = []
         if not self.at("OP", ")"):
