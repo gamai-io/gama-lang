@@ -125,7 +125,15 @@ and restarts with bounded backoff.
 The CLI wrapper is `gama_cli.py`. `release.py build` writes deterministic
 wheel/tar, `SHA256SUMS`, and `RELEASE.json`; `release.py verify` checks them.
 
-### Reproducible release verification
+### PyPI publishing
+
+`scripts/publish_pypi.sh` builds a **PyPI-compatible** wheel and sdist with
+`python -m build`, runs `twine check`, and uploads only after confirmation
+(`--yes` skips the prompt, `--check` builds without uploading). It requires
+`PYPI_TOKEN` (username `__token__`). The deterministic `release.py` sdist is for
+reproducible artifacts; the standard `build` sdist is the one PyPI accepts.
+
+## Reproducible release verification
 
 `scripts/verify_release.sh` runs the whole release smoke test from a clean
 temporary directory (no artifacts are written into the repo):
