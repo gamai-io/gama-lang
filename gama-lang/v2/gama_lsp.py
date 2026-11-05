@@ -2983,7 +2983,6 @@ def _call_context(prefix: str):
                 j = k - 1
                 while j >= 0 and prefix[j] in " \t":
                     j -= 1
->>>>>>> 7e15a11 (feat(lsp): generic function signatures)
     end = j
     while j >= 0 and (prefix[j].isalnum() or prefix[j] in "_."):
         j -= 1
