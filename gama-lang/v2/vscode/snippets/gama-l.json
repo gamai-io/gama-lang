@@ -99,7 +99,7 @@
     "body": [
       "export record ${1:Name} { ${2:field}: ${3:Type} }"
     ],
-    "description": "Export a record type from an imported module (export enum is not supported)."
+    "description": "Export a record type from an imported module (export enum is also supported by the core)."
   },
   "Enum declaration": {
     "prefix": [

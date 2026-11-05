@@ -125,10 +125,17 @@ class ExportTests(unittest.TestCase):
         with self.assertRaisesRegex(G.GamaError, "export is only allowed at top level"):
             G.check_file(str(self.root / "main.gm"))
 
-    def test_export_enum_rejected(self):
-        self._write("main.gm", "export enum Color { Red, Green }\n")
-        with self.assertRaisesRegex(G.GamaError, "export enum is not supported"):
-            G.check_file(str(self.root / "main.gm"))
+    def test_export_enum_is_allowed(self):
+        self._write(
+            "lib.gm",
+            "export enum Color { Red, Green }\n",
+        )
+        self._write(
+            "main.gm",
+            'import "lib.gm" as m\nprint m.Color.Green\n',
+        )
+        self.assertEqual(G.run_file(str(self.root / "main.gm")).out,
+                         ["m.Color.Green"])
 
     def test_export_requires_declaration(self):
         self._write("main.gm", "export 1\n")

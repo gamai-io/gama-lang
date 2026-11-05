@@ -3,9 +3,9 @@
 An enum declared in a module imported with ``import "lib.gm" as geo`` becomes
 ``geo.Enum``; every reference inside the module is renamed too (``Color`` and
 ``Color.Red`` -> ``geo.Color`` / ``geo.Color.Red``), including constructors,
-type annotations and match patterns. Enums stay module-global for explicit
-exports (``export enum`` is still rejected), and plain imports keep flattening
-enums into the local namespace.
+type annotations and match patterns. Explicit exports filter enums like any
+other declaration (``export enum`` exposes ``geo.Enum``), and plain imports
+keep flattening enums into the local namespace.
 """
 import pathlib
 import sys
@@ -150,20 +150,22 @@ class AliasEnumTests(unittest.TestCase):
         it = G.run_file(str(self.main))
         self.assertEqual(it.out, ["Color.Green", "g"])
 
-    def test_enums_stay_visible_with_explicit_exports(self):
+    def test_exported_enums_stay_visible_with_explicit_exports(self):
         it = self._run(
             'import "lib.gm" as geo\n'
             'print geo.pick()\n'
             'print geo.Color.Red\n',
-            'enum Color { Red, Green }\n'
+            'export enum Color { Red, Green }\n'
             'export fn pick() -> Color { return Color.Green }\n',
         )
         self.assertEqual(it.out, ["geo.Color.Green", "geo.Color.Red"])
 
-    def test_export_enum_remains_rejected(self):
-        self._write('main.gm', 'export enum Color { Red }\n')
-        with self.assertRaisesRegex(G.GamaError, "export enum is not supported"):
-            G.check_file(str(self.main))
+    def test_export_enum_is_namespaced(self):
+        it = self._run(
+            'import "lib.gm" as geo\nprint geo.Color.Green\n',
+            'export enum Color { Red, Green }\n',
+        )
+        self.assertEqual(it.out, ["geo.Color.Green"])
 
     # -- formatter and IR -------------------------------------------------
     def test_formatter_keeps_namespaced_enum_references(self):

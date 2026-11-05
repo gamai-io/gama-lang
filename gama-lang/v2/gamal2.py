@@ -322,19 +322,19 @@ class Continue: line: int; col: int
 @dataclass
 class Index: base: Any; index: Any; line: int; col: int
 @dataclass
-class Let: name: str; type_name: str | None; expr: Any; line: int; col: int; exported: bool = False
+class Let: name: str; type_name: str | None; expr: Any; line: int; col: int; exported: bool = False; export_name: str | None = None
 @dataclass
 class Assign: name: str; expr: Any; line: int; col: int
 @dataclass
 class Param: name: str; type_name: str; default: Any = None
 @dataclass
-class Fn: name: str; params: list; ret: str | None; effects: set | None; body: list; line: int; col: int; type_params: list = field(default_factory=list); exported: bool = False; type_param_bounds: dict = field(default_factory=dict)
+class Fn: name: str; params: list; ret: str | None; effects: set | None; body: list; line: int; col: int; type_params: list = field(default_factory=list); exported: bool = False; type_param_bounds: dict = field(default_factory=dict); export_name: str | None = None
 @dataclass
 class Lambda: params: list; ret: str | None; effects: set | None; body: list; line: int; col: int; type_params: list = field(default_factory=list)
 @dataclass
 class Match: expr: Any; arms: list; line: int; col: int
 @dataclass
-class EnumDecl: name: str; variants: list; line: int; col: int; exported: bool = False; type_params: list = field(default_factory=list); type_param_bounds: dict = field(default_factory=dict)
+class EnumDecl: name: str; variants: list; line: int; col: int; exported: bool = False; type_params: list = field(default_factory=list); type_param_bounds: dict = field(default_factory=dict); export_name: str | None = None
 @dataclass
 class If: cond: Any; then: list; other: list | None; line: int; col: int
 @dataclass
@@ -348,7 +348,7 @@ class Try: expr: Any; line: int; col: int
 @dataclass
 class Method: name: str; params: list; ret: str | None; effects: set | None; body: list; line: int; col: int; end_line: int = 0; end_col: int = 0
 @dataclass
-class RecordDecl: name: str; fields: list; line: int; col: int; exported: bool = False; methods: list = field(default_factory=list); type_params: list = field(default_factory=list); type_param_bounds: dict = field(default_factory=dict); parent: str | None = None
+class RecordDecl: name: str; fields: list; line: int; col: int; exported: bool = False; methods: list = field(default_factory=list); type_params: list = field(default_factory=list); type_param_bounds: dict = field(default_factory=dict); parent: str | None = None; export_name: str | None = None
 @dataclass
 class RecordLit: name: str; fields: list; line: int; col: int
 @dataclass
@@ -389,6 +389,10 @@ class Parser:
                             k += 1
                             break
                     k += 1
+            if (k + 1 < len(toks) and toks[k].kind == "IDENT"
+                    and toks[k].val == "as"
+                    and toks[k + 1].kind == "IDENT"):
+                k += 2
             if (k + 1 < len(toks) and toks[k].kind == "IDENT"
                     and toks[k].val == "extends"
                     and toks[k + 1].kind == "IDENT"):
@@ -441,6 +445,10 @@ class Parser:
         self._reject_duplicate_exports(out)
         return out
     def _reject_duplicate_exports(self, stmts):
+        declared = {}
+        for s in stmts:
+            if isinstance(s, (Fn, Let, Assign, Use, RecordDecl, EnumDecl)):
+                declared.setdefault(s.name, s)
         seen = {}
         for s in stmts:
             if not getattr(s, "exported", False):
@@ -448,9 +456,16 @@ class Parser:
             name = getattr(s, "name", None)
             if name is None:
                 continue
-            if name in seen:
-                raise GamaError("duplicate export %r" % name, s.line, s.col)
-            seen[name] = s
+            target = getattr(s, "export_name", None) or name
+            if target in seen:
+                raise GamaError("duplicate export %r" % target, s.line, s.col)
+            seen[target] = s
+            if target != name:
+                other = declared.get(target)
+                if other is not None and other is not s:
+                    raise GamaError(
+                        "export name %r collides with existing top-level name"
+                        % target, s.line, s.col)
     def block(self):
         self.expect("OP", "{"); self.skip_seps(); out = []
         while not self.at("OP", "}"):
@@ -480,9 +495,21 @@ class Parser:
                                 x.line, x.col)
             self.take()
             inner = self.statement(top=True)
-            if isinstance(inner, EnumDecl):
-                raise GamaError("export enum is not supported", x.line, x.col)
-            return replace(inner, exported=True)
+            export_name = getattr(inner, "export_name", None)
+            if self.at("IDENT", "as"):
+                self.take()
+                alias_tok = self.expect("IDENT")
+                if not _ALIAS_IDENT.match(alias_tok.val):
+                    raise GamaError(
+                        "export name must be a simple identifier",
+                        alias_tok.line, alias_tok.col)
+                if export_name is not None and export_name != alias_tok.val:
+                    raise GamaError(
+                        "conflicting export names %r and %r"
+                        % (export_name, alias_tok.val),
+                        alias_tok.line, alias_tok.col)
+                export_name = alias_tok.val
+            return replace(inner, exported=True, export_name=export_name)
         if (x.kind == "IDENT" and x.val == "record"
                 and self.peek(1).kind == "IDENT"
                 and ((self.peek(2).kind == "OP"
@@ -640,8 +667,18 @@ class Parser:
                 effects.add(self.expect("IDENT").val); self.skip_nl()
                 if self.at("OP", ","): self.take(); self.skip_nl()
             self.expect("OP", "}")
+        export_name = None
+        if self.at("IDENT", "as"):
+            self.take()
+            alias_tok = self.expect("IDENT")
+            if not _ALIAS_IDENT.match(alias_tok.val):
+                raise GamaError(
+                    "export name must be a simple identifier",
+                    alias_tok.line, alias_tok.col)
+            export_name = alias_tok.val
         return Fn(name, params, ret, effects, self.block(), x.line, x.col,
-                  type_params, type_param_bounds=type_param_bounds)
+                  type_params, type_param_bounds=type_param_bounds,
+                  export_name=export_name)
     def type_params(self, allow_bounds: bool = False):
         """Optional ``<T>`` / ``<A, B>`` after a function name.
 
@@ -3077,8 +3114,9 @@ _ALIAS_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # and is rejected up front instead of being silently dropped by the bounded
 # namespace MVP. Top-level `let` values are evaluated at import time and
 # exposed as `alias.name`; module functions keep seeing them through the same
-# renamed binding. Enums are namespaced as `alias.Enum` and remain visible
-# regardless of explicit exports (legacy-global enum surface).
+# renamed binding. Enums are namespaced as `alias.Enum`; once a module declares
+# at least one explicit export, unexported enums are private like every other
+# unexported declaration. Renamed exports change only the alias-surface name.
 _ALIAS_ALLOWED_TOPLEVEL = (Fn, Let, Import, Use, RecordDecl, EnumDecl)
 _STMT_KIND = {Let: "let", Assign: "assignment", Print: "print",
               Prove: "prove", Verify: "verify",
@@ -3313,38 +3351,41 @@ def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
                 if ex.src is None:
                     ex.src = str(target)
                 raise
-            # Explicit exports filter the alias surface. Modules without any
-            # `export` keep the legacy behaviour: every top-level fn/let/record
-            # is visible through the alias (backward compatibility). Enums stay
-            # module-global even with explicit exports: they are always exposed
-            # as `alias.Enum` (and `export enum` remains unsupported).
+            # Explicit exports filter the alias surface. A module with at least
+            # one `export` exposes only its exported fn/let/record/enum
+            # declarations; a module without any `export` keeps the legacy
+            # behaviour (every top-level declaration is visible through the
+            # alias). Export renames (`export fn f ... as g`) change only the
+            # name used on the alias surface.
+            def _export_target(st):
+                return getattr(st, "export_name", None) or st.name
+
             exported = {st.name for st in sub
                         if getattr(st, "exported", False)
-                        and isinstance(st, (Fn, Let, RecordDecl))}
+                        and isinstance(st, (Fn, Let, RecordDecl, EnumDecl))}
             if exported:
                 names = {}
                 for st in sub:
-                    if (isinstance(st, (Fn, Let, RecordDecl))
+                    if (isinstance(st, (Fn, Let, RecordDecl, EnumDecl))
                             and st.name in exported):
-                        if st.name in names:
+                        target_name = _export_target(st)
+                        if target_name in names:
                             raise GamaError(
                                 "duplicate export %r in imported module %r"
-                                % (st.name, s.path), st.line, st.col)
-                        names[st.name] = st
+                                % (target_name, s.path), st.line, st.col)
+                        names[target_name] = st
             sub_decls = [st for st in sub
                          if isinstance(st, (Fn, Let, RecordDecl, EnumDecl))]
             mapping = {}
             for st in sub_decls:
-                if isinstance(st, EnumDecl):
-                    mapping[st.name] = s.alias + "." + st.name
-                elif exported and st.name not in exported:
+                if exported and st.name not in exported:
                     # Private declaration: keep it callable inside the module
                     # but unreachable as `alias.name`. A separate character
                     # (`:`) cannot be spelled in a source identifier, so this
                     # internal name cannot collide with user code.
                     mapping[st.name] = "%s::private::%s" % (s.alias, st.name)
                 else:
-                    mapping[st.name] = s.alias + "." + st.name
+                    mapping[st.name] = s.alias + "." + _export_target(st)
             # A static function must stay anchored on its record's mapped name
             # (``Point.origin`` -> ``geo.Point.origin``), otherwise routing it
             # through the generic private-name scheme would detach it from the
@@ -3369,18 +3410,19 @@ def _flatten(path: pathlib.Path, root: pathlib.Path | None = None,
                         and "::private::" not in rec_new):
                     mapping[st.name] = rec_new + "." + method + "::private"
                 else:
-                    mapping[st.name] = rec_new + "." + method
+                    method_name = getattr(st, "export_name", None) or method
+                    mapping[st.name] = rec_new + "." + method_name
             for st in sub_decls:
                 new_name = mapping[st.name]
-                public = (isinstance(st, EnumDecl)
-                          or not exported or st.name in exported)
+                public = (not exported or st.name in exported)
                 if public:
                     if new_name in declared:
                         raise GamaError(
                             "import alias %r produces duplicate name %r"
                             % (s.alias, new_name), s.line, s.col)
                     declared.add(new_name)
-                renamed = replace(_rename_refs(st, mapping), name=new_name)
+                renamed = replace(_rename_refs(st, mapping), name=new_name,
+                                  export_name=None)
                 _mark_src(renamed, getattr(st, "_src", target))
                 if isinstance(renamed, Fn):
                     # A plain module function becomes ``alias.name``.  Mark it

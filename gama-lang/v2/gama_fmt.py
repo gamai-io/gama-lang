@@ -360,6 +360,12 @@ _UNIT = "  "
 
 DEFAULT_WIDTH = 88
 
+
+def _export_alias_text(s) -> str:
+    """Trailing ``as Name`` for a renamed export."""
+    name = getattr(s, "export_name", None)
+    return (" as " + name) if name else ""
+
 _PREC = {"||": 1, "&&": 2, "==": 3, "!=": 3,
          "<": 4, "<=": 4, ">": 4, ">=": 4,
          "+": 5, "-": 5, "*": 6, "/": 6, "%": 6}
@@ -1234,7 +1240,8 @@ class _AstFormatter:
             prev_line = len(lines) - 1
         return "\n".join(lines)
 
-    def _emit_expr_stmt(self, ind, prefix, stmt, indent, semi):
+    def _emit_expr_stmt(self, ind, prefix, stmt, indent, semi,
+                        expr_suffix=""):
         node = stmt.expr
         end_line = self._stmt_end_line(stmt)
         eq_comments, eq_line = self._eq_trailing_comments(stmt)
@@ -1256,11 +1263,14 @@ class _AstFormatter:
             parts = self._wrap(node, cont, cont).split("\n")
             lines.append(" " * cont + parts[0])
             lines.extend(parts[1:])
+            if expr_suffix:
+                lines[-1] += expr_suffix
             self._emit("\n".join(lines), [stmt.line, end_line], suffix=semi)
             return
         base_col = len(ind) + len(prefix)
         text = self._wrap(node, len(ind), base_col)
-        self._emit(ind + prefix + text, [stmt.line, end_line], suffix=semi)
+        self._emit(ind + prefix + text + expr_suffix, [stmt.line, end_line],
+                   suffix=semi)
 
     # --------------------------------------------------------------- output
     def format(self) -> str:
@@ -1305,7 +1315,8 @@ class _AstFormatter:
             tn = (": " + s.type_name) if s.type_name else ""
             prefix = "export " if getattr(s, "exported", False) else ""
             self._emit_expr_stmt(
-                ind, prefix + "let " + s.name + tn + " = ", s, indent, semi)
+                ind, prefix + "let " + s.name + tn + " = ", s, indent, semi,
+                expr_suffix=_export_alias_text(s))
             return
         if isinstance(s, G.Assign):
             self._emit_expr_stmt(ind, s.name + " := ", s, indent, semi)
@@ -1931,7 +1942,7 @@ class _AstFormatter:
         ret = (" -> " + s.ret) if s.ret else ""
         prefix = "export " if getattr(s, "exported", False) else ""
         return prefix + keyword + name + "(" + self._params_text(s.params) + ")" + \
-            ret + self._effects_text(s.effects)
+            ret + self._effects_text(s.effects) + _export_alias_text(s)
 
     def _param_positions(self, s):
         """Token spans ``(start, end)`` for each fn parameter, in order."""
@@ -1995,27 +2006,28 @@ class _AstFormatter:
                 if named else "")
         ret = (" -> " + s.ret) if s.ret else ""
         prefix = "export " if getattr(s, "exported", False) else ""
+        alias = _export_alias_text(s)
         inner = len(ind) + 2
         effects = s.effects
         if not s.params:
             first = prefix + keyword + name + "()" + ret
             if not effects:
                 if self._effects_has_comment(s):
-                    return self._effects_block_text(s, len(ind), first)
+                    return self._effects_block_text(s, len(ind), first) + alias
                 return single
             if self._effects_has_comment(s):
-                return self._effects_block_text(s, len(ind), first)
+                return self._effects_block_text(s, len(ind), first) + alias
             names = sorted(effects)
             one = " effects {" + ", ".join(names) + "}"
-            if self._fits(first + one + " {", len(ind)) or len(names) == 1:
-                return first + one
+            if self._fits(first + one + alias + " {", len(ind)) or len(names) == 1:
+                return first + one + alias
             lines = [first + " effects {"]
             for i, nm in enumerate(names):
                 part = " " * inner + nm
                 if i < len(names) - 1:
                     part += ","
                 lines.append(part)
-            lines.append(" " * len(ind) + "}")
+            lines.append(" " * len(ind) + "}" + alias)
             return "\n".join(lines)
         lines = [prefix + keyword + name + "("]
         texts = []
@@ -2083,6 +2095,8 @@ class _AstFormatter:
                         part += ","
                     lines.append(part)
                 lines.append(" " * len(ind) + "}")
+        if alias:
+            lines[-1] += alias
         return "\n".join(lines)
 
     def _header_expr(self, prefix: str, node, indent: int,
@@ -2102,13 +2116,15 @@ class _AstFormatter:
 
     def _record_text(self, s) -> str:
         prefix = "export " if getattr(s, "exported", False) else ""
+        alias = _export_alias_text(s)
         parts = [fn + ": " + ft for fn, ft in s.fields]
         for m in getattr(s, "methods", []):
             parts.append(self._method_inline_text(m))
         name = self._record_head(s)
         if not parts:
-            return prefix + "record " + name + " { }"
-        return prefix + "record " + name + " { " + ", ".join(parts) + " }"
+            return prefix + "record " + name + " { }" + alias
+        return (prefix + "record " + name + " { " + ", ".join(parts)
+                + " }" + alias)
 
     def _method_inline_text(self, m) -> str:
         header = self._fn_header(m, "fn")
@@ -2169,11 +2185,14 @@ class _AstFormatter:
 
     @classmethod
     def _enum_text(cls, s) -> str:
+        prefix = "export " if getattr(s, "exported", False) else ""
+        alias = _export_alias_text(s)
         parts = [cls._enum_variant_text(v) for v in s.variants]
         name = s.name + cls._type_params_text(s)
         if not parts:
-            return "enum " + name + " { }"
-        return "enum " + name + " { " + ", ".join(parts) + " }"
+            return prefix + "enum " + name + " { }" + alias
+        return (prefix + "enum " + name + " { " + ", ".join(parts)
+                + " }" + alias)
 
     def _record_field_positions(self, s):
         """Token spans ``(start, end)`` for each record field, in order."""
@@ -2262,6 +2281,7 @@ class _AstFormatter:
 
     def _render_record(self, s, indent: int, semi: str):
         ind = _UNIT * indent
+        alias = _export_alias_text(s)
         if getattr(s, "methods", []):
             prefix = "export " if getattr(s, "exported", False) else ""
             self._emit(ind + prefix + "record " + self._record_head(s)
@@ -2270,7 +2290,7 @@ class _AstFormatter:
                 self._emit(_UNIT * (indent + 1) + fn + ": " + ft)
             for m in s.methods:
                 self._render_method(m, indent + 1)
-            self._emit(ind + "}", [self._stmt_end_line(s)], suffix=semi)
+            self._emit(ind + "}" + alias, [self._stmt_end_line(s)], suffix=semi)
             return
         text = self._record_text(s)
         has_comment = self._decl_has_comment(s)
@@ -2284,22 +2304,24 @@ class _AstFormatter:
         self._render_decl_body(
             s, s.fields, self._record_field_positions(s),
             [fn + ": " + ft for fn, ft in s.fields],
-            lines, indent, inner, semi, close_text="}")
+            lines, indent, inner, semi, close_text="}" + alias)
 
     def _render_enum(self, s, indent: int, semi: str):
         ind = _UNIT * indent
+        alias = _export_alias_text(s)
         text = self._enum_text(s)
         has_comment = self._decl_has_comment(s)
         if (not has_comment and not s.variants) or (
                 not has_comment and self._fits(text, len(ind))):
             self._emit(ind + text, [s.line], suffix=semi)
             return
+        prefix = "export " if getattr(s, "exported", False) else ""
         inner = len(ind) + 2
-        lines = ["enum " + s.name + self._type_params_text(s) + " {"]
+        lines = [prefix + "enum " + s.name + self._type_params_text(s) + " {"]
         self._render_decl_body(
             s, s.variants, self._enum_variant_positions(s),
             [self._enum_variant_text(v) for v in s.variants],
-            lines, indent, inner, semi, close_text="}")
+            lines, indent, inner, semi, close_text="}" + alias)
 
     def _separator_text(self, after_pos, before_pos) -> str:
         """Original separator token between two declaration entries.
@@ -2704,7 +2726,8 @@ class _AstFormatter:
         if isinstance(s, G.Let):
             tn = (": " + s.type_name) if s.type_name else ""
             prefix = "export " if getattr(s, "exported", False) else ""
-            return prefix + "let " + s.name + tn + " = " + self._expr(s.expr)
+            return (prefix + "let " + s.name + tn + " = " + self._expr(s.expr)
+                    + _export_alias_text(s))
         if isinstance(s, G.Assign):
             return s.name + " := " + self._expr(s.expr)
         if isinstance(s, G.Return):

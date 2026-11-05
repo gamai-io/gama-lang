@@ -52,11 +52,14 @@ These are outside the T1–T10 checks or only partially covered; see
    no compaction or key rotation (the separate `gama_ledger.py` tool can verify
    and explicitly truncate to a valid prefix, never silently).
 2. **Renamed exports and `export enum`.** Explicit `export fn`/`export let`/
-   `export record` lists are implemented (alias imports show only exported
-   declarations; modules without `export` keep the legacy all-visible alias
-   behaviour, and plain imports always flatten). Renamed exports and
-   `export enum` are not implemented; side-effect top-level statements remain
-   rejected and `use` remains a no-op.
+   `export record`/`export enum` lists are implemented (alias imports show only
+   exported declarations; modules without `export` keep the legacy all-visible
+   alias behaviour, and plain imports always flatten under original names).
+   Renamed exports use `export <decl> ... as <Ident>`: `fn` puts the clause in
+   the header after `effects`, while `let`/`record`/`enum` use a trailing
+   clause; the alias exposes only the new name. Selective re-exports are not
+   implemented; side-effect top-level statements remain rejected and `use`
+   remains a no-op.
 3. **Compiler/IR integration and production resource budget.** A standalone
    bytecode IR prototype (`gama_ir.py`) covers a documented subset and is
    exposed via the opt-in `gamal2 ir run|compile` CLI, but it is not the

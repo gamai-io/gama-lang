@@ -95,12 +95,13 @@ A syntax-only VS Code package is in `vscode/` (TextMate grammar + snippets +
 a dependency-free LSP client). It highlights `import ... as` namespaces,
 `Function`, namespaced calls, lambdas, record `with { ... }` updates,
 payload/multi-payload enums, aliased variants (`geo.Color.Red`), `export
-fn/let/record`, and the postfix `?` operator. Snippets cover those features
+fn/let/record/enum`, and the postfix `?` operator. Snippets cover those features
 (`recordwith`, `payloadenum`, `multipayloadenum`, `payload`, `pair`,
 `aliasvariant`, `matchpayload`, `exportfn`, `exportlet`, `exportrecord`,
 `tryexpr`) plus `impas`, `callns`, `iife`, and `fnlettype`. Grammar limits:
 record-update scopes end at the first `}`, only three-part alias chains are
-scoped, and `export enum` remains unsupported by the core. The extension requires a trusted workspace
+scoped, and the `as Name` clause of renamed exports is not given a dedicated
+scope yet. The extension requires a trusted workspace
 before spawning Python, supports `gama-lsp` from PATH or a configured script,
 and restarts with bounded backoff.
 
@@ -315,8 +316,8 @@ general runtime limits exactly like ordinary statements.
 ## Implemented
 
 - `import "file.gm"` with cycle detection (relative to the importing file)
-- module namespaces: `import "lib.gm" as math`, then `math.add(2,3)` and `math.pi`; plain imports still flatten (including top-level `let`); aliased modules expose top-level `fn` definitions, `let` constants, `record` types and `enum` declarations, evaluated at import time, and reject side-effect top-level statements (`use` is allowed as a harmless no-op). Enums are namespaced (`geo.Color`, `geo.Color.Red`) and stay visible through the alias even when explicit `export` lists exist.
-- explicit module exports: `export fn`, `export let` and `export record` mark the alias-visible surface; other top-level declarations stay private but remain callable inside the module. A module with at least one `export` exposes only exported names through `import ... as`; a module with no `export` keeps the legacy behaviour (all top-level `fn`/`let`/`record` visible). Plain imports always flatten all declarations for compatibility. `export` is only allowed at top level, duplicate export names are rejected, and `export enum` is currently rejected: enums keep the legacy-global surface, so an aliased import always exposes `alias.Enum` regardless of any explicit export list.
+- module namespaces: `import "lib.gm" as math`, then `math.add(2,3)` and `math.pi`; plain imports still flatten (including top-level `let`); aliased modules expose top-level `fn` definitions, `let` constants, `record` types and `enum` declarations, evaluated at import time, and reject side-effect top-level statements (`use` is allowed as a harmless no-op). Enums are namespaced (`geo.Color`, `geo.Color.Red`); a module that declares at least one explicit `export` exposes only its exported enums through the alias.
+- explicit module exports: `export fn`, `export let`, `export record` and `export enum` mark the alias-visible surface; other top-level declarations stay private but remain callable inside the module. A module with at least one `export` exposes only exported names through `import ... as`; a module with no `export` keeps the legacy behaviour (all top-level `fn`/`let`/`record`/`enum` visible). Plain imports always flatten all declarations under their original names for compatibility. `export` is only allowed at top level; duplicate export names and renamed targets that collide with another top-level name are rejected. Renamed exports use `export <decl> ... as <Ident>`: for `fn` the canonical position is in the header after `effects` (`export fn add(a: Int, b: Int) -> Int as plus { ... }`), while `let`/`record`/`enum` use a trailing clause (`export let pi = 3.14 as PI`, `export record Point { ... } as Pt`, `export enum Color { ... } as Hue`). The alias exposes only the new name (`geo.plus`, `geo.PI`, `geo.Pt`, `geo.Hue`); module code keeps using the original names.
 - `let` with optional type annotation, `:=` assignment
 - `fn` and SPEC `make` with typed parameters, defaults, return type, `effects { ... }`
 - generic type parameters on named functions with type erasure: `fn id<T>(x: T) -> T { return x }`, `fn pair<A, B>(a: A, b: B) -> Text { ... }`. Type parameters are valid in parameter, return and `let` annotations and are erased to `Any` by the checker/runtime, so a call accepts any argument type. The checker infers a call result from the arguments when the return type is a type parameter (`id(5): Int`, `id("x"): Text`) and otherwise erases to `Any`; non-type-parameter positions keep normal arity/type checks. Duplicate type parameters and duplicate parameter names are rejected. Generic functions remain ordinary first-class named functions (recursion, defaults, higher-order use, and IR compilation with erasure all work). Limits: no higher-kinded or `&` multi-constraint bounds; union bounds and named-function bounds are supported, and generic record/enum bounds are covered by their declarations. Generic lambdas are covered separately. The IR backend supports named-function-as-value for plain and generic functions (type erasure applies to the latter)
@@ -429,7 +430,7 @@ Conformance: see `CONFORMANCE.md` (SPEC 2.0 T1–T10: **PASS 10/10**, including 
 ## Not implemented yet
 
 - deployed/public package registry (the HTTP server is implemented and testable)
-- renamed exports (`export fn a as b`), `export enum`, and selective re-exports; explicit export lists mark the alias surface, but modules without any `export` keep the legacy all-visible alias behaviour
+- selective re-exports; explicit export lists mark the alias surface, but modules without any `export` keep the legacy all-visible alias behaviour
 - external intent/lease registry with expiry/revocation (env-bound intent/lease receipts are implemented; there is no external registry)
 - full type inference (structural record compatibility is implemented for static checks only); higher-kinded and `&` multi-constraint bounds
 - formatter remaining edges: a comment *before* a binary operator has no legal source position (the grammar only breaks after an operator), so the defensive renderer keeps it after the operator; comments in a commented `fn` effects set use source order (uncommented sets stay sorted); indivisible tokens longer than the width still overflow

@@ -141,9 +141,8 @@ directory, or package it with `vsce` (not included here).
   (`geo.Color.Red`: namespace, enum type, variant)
 - Capitalized payload constructors in expressions and patterns
   (`Some(5)`, `Pair(1, "a")`, `Some(v)`, `Pair(a, b)`)
-- `export fn`, `export let`, and `export record` (the leading `export` gets a
-  keyword scope; `export enum` is rejected by the core and is not highlighted
-  as an export)
+- `export fn`, `export let`, `export record`, and `export enum` (the leading
+  `export` gets a keyword scope)
 - Operators and punctuation
 - Function names after `fn` / `make`, bindings after `let`, and `prove` targets
 - Lambda expressions in expression position: `fn(x: Int) -> Int { ... }`
@@ -192,11 +191,12 @@ conservative:
   the ordinary member-access/type rules.
 - Payload declarations highlight simple identifier payload types only, because
   the core rejects qualified payload types (`Some(geo.Point)`).
-- `export` is highlighted only for `export fn`, `export let`, and
-  `export record`; `export enum` is rejected by the core, so it is not given an
-  export scope.
+- `export` is highlighted for `export fn`, `export let`, `export record`, and
+  `export enum`.
+- Renamed exports (`export ... as Name`) are accepted by the core parser and
+  formatter; highlighting of the `as` clause may lag behind the core.
 - `export make` is accepted by the core parser but is outside the documented
-  `export fn/let/record` surface and is not given its own export scope.
+  `export fn/let/record/enum` surface and is not given its own export scope.
 
 ## Snippets
 
@@ -213,8 +213,9 @@ The latest syntax additions have snippets too: `recordwith` (record copy/update
 `multipayloadenum`/`enumpair` (payload enum declarations), `payload`/`some` and
 `pair`/`payload2` (payload constructors), `aliasvariant`/`aliasenum`
 (`geo.Color.Red`), `matchpayload`/`matchenum` (payload pattern arms), and
-`exportfn`, `exportlet`, `exportrecord` (explicit exports). `export enum` is not
-offered because the core rejects it.
+`exportfn`, `exportlet`, `exportrecord` (explicit exports). `export enum` is
+accepted by the core but has no dedicated snippet, and renamed exports
+(`as Name`) have no dedicated snippet either.
 
 ## License
 

@@ -5,10 +5,9 @@ The core loader flattens ``import "lib.gm" as m`` into dotted top-level names
 same function, global and nominal-type tables it uses for local declarations, so
 aliased calls, constants and records match the reference interpreter.
 
-Aliased ``enum`` declarations are rejected by the core loader itself (before
-either backend runs), so ``geo.Color.Red`` is still unreachable from
-``compile_file``; that rejection is pinned as parity.  A hand-built AST proves
-the VM itself can resolve a dotted enum name if a front end ever provides one.
+Aliased ``enum`` declarations are namespaced by the core loader (``geo.Color``),
+so both backends resolve ``geo.Color.Red`` identically.  A hand-built AST also
+pins that the VM resolves a dotted enum name independently of the front end.
 """
 import dataclasses
 import pathlib
